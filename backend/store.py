@@ -329,9 +329,10 @@ def incr_quota(provider: str, seconds: float) -> float:
         log.warning("store.incr_quota(%s) fast-path failed: %s", provider, exc)
     cur = get_quota(provider)
     nxt = cur + float(seconds)
-    # Best-effort write; ignore NX semantics here.
+    # Best-effort write; never fall back to process memory when Redis is
+    # configured, or different workers would see inconsistent quota counters.
     try:
         rset(key, str(nxt))
-    except Exception:
-        _MEM[key] = (str(nxt), None)
+    except Exception as exc:
+        log.warning("store.incr_quota(%s) write failed: %s", provider, exc)
     return nxt
