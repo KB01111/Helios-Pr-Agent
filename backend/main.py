@@ -27,7 +27,7 @@ from typing import Any, Literal
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Load local .env files before importing store: store snapshots the Redis env
 # vars at import time. Real process env always wins over file values, and
@@ -152,6 +152,12 @@ class AgentConfig(BaseModel):
     trigger: Literal["on_commit", "on_label", "manual"] = "on_commit"
     trigger_label: str | None = None
     runtime_mode: Literal["review_only", "interactive", "ephemeral"] = "review_only"
+
+    @model_validator(mode="after")
+    def _require_trigger_label(self):
+        if self.trigger == "on_label" and not (self.trigger_label or "").strip():
+            raise ValueError("trigger_label is required when trigger is on_label")
+        return self
 
 
 class PRContext(BaseModel):

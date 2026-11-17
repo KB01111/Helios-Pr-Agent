@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 // PR Agent Control — Tauri v2 backend
 // Reads/writes .pr_agent.toml + workflow file next to the app root,
 // and optionally shells out to a local `pr-agent` CLI if installed.
@@ -7,6 +9,12 @@ use std::process::Command;
 
 fn app_root_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
+    // Installed builds may keep resources next to the executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.to_path_buf());
+        }
+    }
     if let Ok(cwd) = std::env::current_dir() {
         out.push(cwd.clone());
         if let Some(p) = cwd.parent() {
@@ -52,6 +60,10 @@ fn config_path_for_write() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".pr_agent.toml"))
 }
 
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn get_val(src: &str, key: &str) -> Option<String> {
     for line in src.lines() {
         let t = line.trim();
@@ -65,7 +77,7 @@ fn get_val(src: &str, key: &str) -> Option<String> {
     None
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_config() -> Result<serde_json::Value, String> {
     let path = find_file(".pr_agent.toml").ok_or("No .pr_agent.toml found next to app")?;
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -112,13 +124,14 @@ fn get_config() -> Result<serde_json::Value, String> {
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_config(cfg: serde_json::Value) -> Result<String, String> {
-    let model = cfg.get("model").and_then(|v| v.as_str()).unwrap_or("openrouter/thinkingmachines/inkling-2-small:free");
+    let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or("openrouter/thinkingmachines/inkling-2-small:free"));
     let fallbacks = cfg.get("fallback_models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let fb: Vec<String> = fallbacks.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", s))).collect();
-    let max_tokens = cfg.get("custom_model_max_tokens").and_then(|v| v.as_str()).unwrap_or("200000");
-    let effort = cfg.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("low");
+    let fb: Vec<String> = fallbacks.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", toml_escape(s)))).collect();
+    let max_tokens_raw = cfg.get("custom_model_max_tokens").and_then(|v| v.as_str()).unwrap_or("200000");
+    let max_tokens: i64 = max_tokens_raw.trim().parse().map_err(|_| "custom_model_max_tokens must be an integer".to_string())?;
+    let effort = toml_escape(cfg.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("low"));
     let b = |k: &str, d: bool| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
     let content = format!(
@@ -152,60 +165,85 @@ auto_improve = {ai}
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    if path.is_file() {
+        let backup = path.with_extension("toml.bak");
+        std::fs::copy(&path, &backup).map_err(|e| format!("failed to back up config: {}", e))?;
+    }
     std::fs::write(&path, &content).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_workflow() -> Result<serde_json::Value, String> {
     let path = find_file(".github/workflows/pr-agent.yml").ok_or("No workflow file found")?;
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "path": path.to_string_lossy(), "raw": raw }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn build_cli_command(pr_url: String, command: String) -> String {
     let cmd = command.trim().trim_start_matches('/').to_string();
     format!("pr-agent --pr_url {} {}", pr_url.trim(), cmd)
 }
 
-#[tauri::command]
+fn render_process_output(out: &std::process::Output) -> String {
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !stderr.is_empty() {
+        s.push_str("\n[stderr]\n");
+        s.push_str(&stderr);
+    }
+    s
+}
+
+fn process_failure(label: &str, out: &std::process::Output) -> String {
+    let body = render_process_output(out);
+    format!(
+        "{} failed (exit {}): {}",
+        label,
+        out.status,
+        if body.trim().is_empty() { "(no output)" } else { body.trim() }
+    )
+}
+
+#[tauri::command(async)]
 fn run_local_review(pr_url: String, command: String, openrouter_key: String) -> Result<String, String> {
     let cmd = command.trim().trim_start_matches('/').to_string();
-    // Try `pr-agent` on PATH first, then `python -m pr_agent`
-    let attempt = Command::new("pr-agent")
-        .args(["--pr_url", pr_url.trim(), &cmd])
-        .env("OPENROUTER__KEY", &openrouter_key)
-        .output();
+    let url = pr_url.trim();
+    let python_fallback = || {
+        Command::new("python")
+            .args(["-m", "pr_agent.cli", "--pr_url", url, &cmd])
+            .env("OPENROUTER__KEY", &openrouter_key)
+            .output()
+    };
 
-    match attempt {
-        Ok(o) if o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty() => {
-            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-            let e = String::from_utf8_lossy(&o.stderr).to_string();
-            if !e.is_empty() {
-                s.push_str("\n[stderr]\n");
-                s.push_str(&e);
+    // Try `pr-agent` on PATH first, then `python -m pr_agent`.
+    match Command::new("pr-agent")
+        .args(["--pr_url", url, &cmd])
+        .env("OPENROUTER__KEY", &openrouter_key)
+        .output()
+    {
+        Ok(out) if out.status.success() => Ok(render_process_output(&out)),
+        Ok(out) => {
+            let first_error = process_failure("pr-agent", &out);
+            match python_fallback() {
+                Ok(py) if py.status.success() => Ok(render_process_output(&py)),
+                Ok(py) => Err(format!("{}; {}", first_error, process_failure("python -m pr_agent", &py))),
+                Err(_) => Err(first_error),
             }
-            Ok(s)
         }
-        _ => {
-            let py = Command::new("python")
-                .args(["-m", "pr_agent.cli", "--pr_url", pr_url.trim(), &cmd])
-                .env("OPENROUTER__KEY", &openrouter_key)
-                .output()
-                .map_err(|e| format!("No local `pr-agent` found ({}). Install: pip install \"pr-agent[github]\" — then retry. CLI would be: pr-agent --pr_url {} {}", e, pr_url.trim(), cmd))?;
-            let mut s = String::from_utf8_lossy(&py.stdout).to_string();
-            let e = String::from_utf8_lossy(&py.stderr).to_string();
-            if !e.is_empty() {
-                s.push_str("\n[stderr]\n");
-                s.push_str(&e);
-            }
-            Ok(s)
-        }
+        Err(first_err) => match python_fallback() {
+            Ok(py) if py.status.success() => Ok(render_process_output(&py)),
+            Ok(py) => Err(process_failure("python -m pr_agent", &py)),
+            Err(_) => Err(format!(
+                "No local `pr-agent` found ({}). Install: pip install \"pr-agent[github]\" — then retry. CLI would be: pr-agent --pr_url {} {}",
+                first_err, url, cmd
+            )),
+        },
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn box_provision(
     box_key: String,
     github_token: String,
@@ -259,7 +297,10 @@ on:
   issue_comment:
 jobs:
   pr_agent_job:
-    if: ${{ github.event.sender.type != 'Bot' }}
+    if: >-
+      ${{ github.event.sender.type != 'Bot' &&
+          (github.event_name != 'issue_comment' ||
+           contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -267,7 +308,8 @@ jobs:
       pull-requests: write
     steps:
       - name: PR Agent action step
-        uses: the-pr-agent/pr-agent@main
+        # Pinned so a compromised upstream branch cannot receive repository secrets.
+        uses: the-pr-agent/pr-agent@dec3e88c029c0a32957bd95aa694cb34d2b256e0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENROUTER__KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -289,7 +331,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: OpenRabbit
-        uses: aryanbrite/openrabbit@main
+        # Pinned so a compromised upstream branch cannot receive repository secrets.
+        uses: aryanbrite/openrabbit@0350c5ff79e6efb3ba92898a46a2e420ae1c526c
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           llm_provider: openrouter
@@ -300,7 +343,7 @@ jobs:
           tone_mode: balanced
 "#;
 
-#[tauri::command]
+#[tauri::command(async)]
 fn check_tool(name: String) -> Result<String, String> {
     let allowed = ["pr-agent", "python", "pip", "node", "gh"];
     if !allowed.contains(&name.as_str()) {
@@ -320,7 +363,7 @@ fn check_tool(name: String) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn install_pr_agent() -> Result<String, String> {
     // Installs the PR-Agent CLI with the GitHub integration into the ambient Python.
     let out = Command::new("python")
@@ -338,7 +381,7 @@ fn install_pr_agent() -> Result<String, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_workflow_template(provider: String) -> Result<String, String> {
     match provider.as_str() {
         "pr-agent" => Ok(PR_AGENT_WORKFLOW.to_string()),
@@ -347,7 +390,7 @@ fn get_workflow_template(provider: String) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn write_workflow(provider: String) -> Result<String, String> {
     let (file, content) = match provider.as_str() {
         "pr-agent" => ("pr-agent.yml", PR_AGENT_WORKFLOW),
@@ -365,6 +408,13 @@ fn write_workflow(provider: String) -> Result<String, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    if path.is_file() {
+        let backup = path.with_extension(format!(
+            "{}.bak",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("yml")
+        ));
+        std::fs::copy(&path, &backup).map_err(|e| format!("failed to back up workflow: {}", e))?;
+    }
     std::fs::write(&path, content).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
@@ -380,7 +430,7 @@ fn gh_client() -> Result<reqwest::blocking::Client, String> {
 
 /// Step 1 of GitHub OAuth device flow: returns device_code + user_code.
 /// Needs only the OAuth App client_id (no secret). Enable Device Flow in the app settings.
-#[tauri::command]
+#[tauri::command(async)]
 fn github_device_start(client_id: String) -> Result<serde_json::Value, String> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
@@ -403,7 +453,7 @@ fn github_device_start(client_id: String) -> Result<serde_json::Value, String> {
 /// Step 2: poll until the user approves (or max_wait_secs elapses -> {status:"pending"}).
 /// Returns {status:"authorized", access_token, login} on success. Token is returned
 /// to the UI only — never written to disk.
-#[tauri::command]
+#[tauri::command(async)]
 fn github_device_poll(
     client_id: String,
     device_code: String,
@@ -452,23 +502,31 @@ fn github_login_inner(
     client: &reqwest::blocking::Client,
     token: &str,
 ) -> Result<String, String> {
-    let res: serde_json::Value = client
+    let res = client
         .get("https://api.github.com/user")
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {}", token))
         .send()
-        .map_err(|e| e.to_string())?
-        .json()
         .map_err(|e| e.to_string())?;
-    Ok(res
+    let status = res.status();
+    let body: serde_json::Value = res.json().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("GitHub rejected the token (HTTP {}): {}", status, body));
+    }
+    let login = body
         .get("login")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .to_string())
+        .trim()
+        .to_string();
+    if login.is_empty() {
+        return Err("GitHub did not return a login for this token".into());
+    }
+    Ok(login)
 }
 
 /// Resolve the login for a token (OAuth or PAT). Used to confirm auth + auto-fill.
-#[tauri::command]
+#[tauri::command(async)]
 fn github_login(token: String) -> Result<String, String> {
     github_login_inner(&gh_client()?, token.trim())
 }
@@ -504,7 +562,7 @@ fn backend_get(url: &str, api_token: Option<&str>) -> Result<String, String> {
 }
 
 /// GET {backend_url}/health — connectivity check.
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_health(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     backend_get(&format!("{}/health", base), api_token.as_deref())
@@ -512,7 +570,7 @@ fn backend_health(backend_url: String, api_token: Option<String>) -> Result<Stri
 
 /// GET {backend_url}/agents — list agents (UI does POST/PUT/DELETE via fetch).
 /// `agents_json` is accepted for API symmetry and currently ignored.
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_sync_agents(
     backend_url: String,
     agents_json: String,
@@ -524,21 +582,21 @@ fn backend_sync_agents(
 }
 
 /// GET {backend_url}/runs?limit=50 — recent background runs.
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_get_runs(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     backend_get(&format!("{}/runs?limit=50", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/quota — Upstash Box / Vercel Sandbox usage.
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_get_quota(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     backend_get(&format!("{}/quota", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/config/status — which providers are configured (booleans only, no secrets).
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_config_status(
     backend_url: String,
     api_token: Option<String>,
@@ -548,7 +606,7 @@ fn backend_config_status(
 }
 
 /// POST {backend_url}/config/test {"provider": ...} — live connectivity check (no secrets echoed).
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_config_test(
     backend_url: String,
     provider: String,
@@ -646,7 +704,7 @@ fn dotenv_render_value(value: &str) -> String {
 /// Write one integration secret into backend/.env (creates the file if needed).
 /// The value is never logged and never touches localStorage — it stays in
 /// Rust + the dotenv file, which is git-ignored.
-#[tauri::command]
+#[tauri::command(async)]
 fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
     let k = key.trim().to_uppercase();
     if !allowed_env_key(&k) {
@@ -674,26 +732,37 @@ fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
     };
     let prefix = format!("{}=", k);
     let replacement = format!("{}={}", k, dotenv_render_value(v));
-    let mut found = false;
-    for line in lines.iter_mut() {
-        if line.starts_with(&prefix) || line.trim_start().starts_with(&prefix) {
-            *line = replacement.clone();
-            found = true;
-            break;
+    // Replace the first occurrence and drop later duplicates so the value that
+    // python-dotenv resolves is unambiguous.
+    let mut replaced = false;
+    lines.retain_mut(|line| {
+        if !(line.starts_with(&prefix) || line.trim_start().starts_with(&prefix)) {
+            return true;
         }
-    }
-    if !found {
+        if replaced {
+            return false;
+        }
+        *line = replacement.clone();
+        replaced = true;
+        true
+    });
+    if !replaced {
         lines.push(replacement);
     }
     let mut content = lines.join("\n");
     content.push('\n');
     std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(path.to_string_lossy().to_string())
 }
 
 /// GET https://api.github.com/user/repos — list repos for the sync picker.
 /// Token is passed in memory only, never stored. Returns raw JSON array text.
-#[tauri::command]
+#[tauri::command(async)]
 fn github_list_repos(token: String) -> Result<String, String> {
     let token = token.trim();
     if token.is_empty() {
@@ -732,7 +801,7 @@ fn github_list_repos(token: String) -> Result<String, String> {
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
 /// with an optional Bearer API token. Keeps secrets out of the webview fetch path
 /// (avoids CORS/preflight issues in Tauri) and never logs tokens.
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_mutate(
     method: String,
     backend_url: String,
@@ -780,7 +849,7 @@ fn backend_mutate(
 }
 
 /// POST {backend_url}/runs/{run_id}/approve — used by the Runs approve buttons.
-#[tauri::command]
+#[tauri::command(async)]
 fn backend_approve_run(
     backend_url: String,
     run_id: String,
