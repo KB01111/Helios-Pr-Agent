@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PR Agent Control</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header>
+  <div>
+    <h1>PR Agent Control</h1>
+    <p class="sub">Tauri control panel · model <code>thinkingmachines/inkling-2-small:free</code> via OpenRouter</p>
+  </div>
+  <div class="row">
+    <button id="btn-load" class="ghost">Reload</button>
+    <button id="btn-save">Save config</button>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1 · Model (OpenRouter free)</h2>
+    <label>Model
+      <select id="model">
+        <option value="openrouter/thinkingmachines/inkling-2-small:free">openrouter/thinkingmachines/inkling-2-small:free (default)</option>
+        <option value="openrouter/free">openrouter/free (router)</option>
+        <option value="openrouter/auto">openrouter/auto (router)</option>
+        <option value="custom">custom…</option>
+      </select>
+    </label>
+    <label id="custom-wrap" class="hidden">Custom model id
+      <input id="custom-model" placeholder="openrouter/org/model:free" />
+    </label>
+    <div class="grid2">
+      <label>Fallback models (comma separated)
+        <input id="fallbacks" value="openrouter/free" />
+      </label>
+      <label>Max tokens
+        <input id="max-tokens" value="200000" inputmode="numeric" />
+      </label>
+    </div>
+    <label>Reasoning effort
+      <select id="effort">
+        <option value="none">none</option>
+        <option value="low" selected>low (fast, free-tier friendly)</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </label>
+    <div class="checks">
+      <label><input type="checkbox" id="auto-describe" checked /> auto_describe</label>
+      <label><input type="checkbox" id="auto-review" checked /> auto_review</label>
+      <label><input type="checkbox" id="auto-improve" /> auto_improve</label>
+    </div>
+    <p class="hint" id="cfg-path">config: …</p>
+  </section>
+
+  <section class="card">
+    <h2>2 · Run a review</h2>
+    <label>PR URL
+      <input id="pr-url" placeholder="https://github.com/owner/repo/pull/123" />
+    </label>
+    <div class="grid2">
+      <label>Command
+        <select id="cmd">
+          <option value="review">review</option>
+          <option value="describe">describe</option>
+          <option value="improve">improve</option>
+          <option value="ask">ask</option>
+        </select>
+      </label>
+      <label>OPENROUTER_API_KEY (never saved to disk, localStorage only)
+        <input id="or-key" type="password" placeholder="sk-or-…" />
+      </label>
+    </div>
+    <label id="ask-wrap" class="hidden">Question (for /ask)
+      <input id="ask-q" placeholder="What does this PR change?" />
+    </label>
+    <div class="row wrap">
+      <button id="btn-cli">Copy CLI command</button>
+      <button id="btn-run" class="ghost">Run locally (needs pr-agent installed)</button>
+      <button id="btn-open-pr" class="ghost">Open PR</button>
+      <button id="btn-open-actions" class="ghost">Open Actions</button>
+    </div>
+    <pre id="out">Ready.</pre>
+  </section>
+
+  <section class="card">
+    <h2>3 · Auto-run on Upstash Box</h2>
+    <p class="hint">Provisions a <code>python</code> box named below, uploads the review loop, and sets a cron schedule. Keys stay in memory — pasted below, never written to disk. If this Box key was shared anywhere, rotate it in the Upstash console.</p>
+    <label>UPSTASH_BOX_API_KEY (box_…, memory only)
+      <input id="box-key" type="password" placeholder="box_…" autocomplete="off" />
+    </label>
+    <label>GITHUB_TOKEN (needs repo scope)
+      <input id="gh-key" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" />
+    </label>
+    <div class="grid2">
+      <label>Box name
+        <input id="box-name" value="pr-agent-runner" />
+      </label>
+      <label>Schedule (UTC cron)
+        <input id="box-cron" value="*/15 * * * *" />
+      </label>
+    </div>
+    <label>Repos to watch (comma separated owner/repo)
+      <input id="box-repos" placeholder="owner/repo, owner/other" />
+    </label>
+    <div class="row wrap">
+      <button id="btn-box-up">Provision + start schedule</button>
+      <button id="btn-box-status" class="ghost">Status</button>
+    </div>
+    <pre id="box-out">Box idle.</pre>
+  </section>
+
+  <section class="card">
+    <h2>4 · GitHub auth (OAuth device flow)</h2>
+    <p class="hint">No backend needed. Create an OAuth App at <code>github.com/settings/developers</code> (enable <b>Device Flow</b>, callback can be <code>http://localhost</code>), paste its Client ID. The token lives in memory only.</p>
+    <label>OAuth App Client ID (memory only)
+      <input id="oauth-client" placeholder="Ov23…" autocomplete="off" />
+    </label>
+    <div class="row wrap">
+      <button id="btn-oauth-start">Start device login</button>
+      <button id="btn-oauth-cancel" class="ghost hidden">Cancel</button>
+      <button id="btn-oauth-open" class="ghost hidden">Open GitHub</button>
+    </div>
+    <div id="oauth-code" class="hidden">
+      <p class="hint">Enter this code on GitHub:</p>
+      <p id="oauth-usercode" class="bigcode">…</p>
+    </div>
+    <div class="row wrap">
+      <input id="oauth-pat" type="password" placeholder="…or paste a PAT (ghp_…, memory only)" autocomplete="off" style="flex:1" />
+      <button id="btn-oauth-pat" class="ghost">Use PAT</button>
+    </div>
+    <pre id="oauth-out">Not authenticated.</pre>
+  </section>
+
+  <section class="card">
+    <h2>5 · Provider: PR-Agent (The-PR-Agent/pr-agent)</h2>
+    <p class="hint">Full review quality. <b>Always online:</b> the Action workflow below runs on every PR event — no PC needed. Local CLI is optional for manual <code>/review</code> runs.</p>
+    <div class="row wrap">
+      <button id="btn-pa-check">Check pr-agent CLI</button>
+      <button id="btn-pa-install" class="ghost">Install CLI (pip)</button>
+      <button id="btn-pa-write" class="ghost">Write Action workflow to this repo</button>
+      <button id="btn-pa-copy" class="ghost">Copy workflow YAML</button>
+    </div>
+    <pre id="pa-out">PR-Agent not checked yet. Needs repo secret OPENROUTER_API_KEY.</pre>
+  </section>
+
+  <section class="card">
+    <h2>6 · Provider: OpenRabbit (aryanbrite/openrabbit)</h2>
+    <p class="hint">Simplest zero-host bot: fully automatic on PR open/sync, posts summary + up to 5 inline suggestions. No config file — everything is workflow inputs. <b>Always online</b> via Actions. Needs repo secret <code>LLM_API_KEY</code> = your OpenRouter key (<code>GITHUB_TOKEN</code> is automatic).</p>
+    <div class="row wrap">
+      <button id="btn-or-write">Write Action workflow to this repo</button>
+      <button id="btn-or-copy" class="ghost">Copy workflow YAML</button>
+    </div>
+    <pre id="or-out">Model pinned: thinkingmachines/inkling-2-small:free (review_mode: both).</pre>
+  </section>
+
+  <section class="card">
+    <h2>7 · Raw .pr_agent.toml</h2>
+    <pre id="raw">…</pre>
+  </section>
+</main>
+
+<script src="main.js"></script>
+</body>
+</html>
