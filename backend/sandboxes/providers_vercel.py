@@ -8,6 +8,7 @@ or API error, degrades gracefully to review-only logic attributed to
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -92,16 +93,16 @@ class VercelSandboxProvider:
                     output = exec_resp.text
             except Exception as exc:
                 logs.append(f"vercel_sandbox: exec error ({type(exc).__name__}).")
-
-            # 3. Teardown (best-effort)
-            if sandbox_id:
-                try:
-                    del_resp = await client.delete(
-                        f"{SANDBOX_API}/{sandbox_id}", headers=headers, params=params
-                    )
-                    logs.append(f"vercel_sandbox: teardown HTTP {del_resp.status_code}.")
-                except Exception as exc:
-                    logs.append(f"vercel_sandbox: teardown error ({type(exc).__name__}).")
+            finally:
+                # 3. Teardown always runs (incl. cancellation); best-effort.
+                if sandbox_id:
+                    try:
+                        del_resp = await asyncio.shield(client.delete(
+                            f"{SANDBOX_API}/{sandbox_id}", headers=headers, params=params
+                        ))
+                        logs.append(f"vercel_sandbox: teardown HTTP {del_resp.status_code}.")
+                    except Exception as exc:
+                        logs.append(f"vercel_sandbox: teardown error ({type(exc).__name__}).")
 
         logs.extend(output.splitlines()[:50])
         return {
