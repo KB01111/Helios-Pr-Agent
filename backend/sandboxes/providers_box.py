@@ -151,13 +151,18 @@ class UpstashBoxProvider:
 
 def _build_script(agent_config: dict, pr_context: dict) -> str:
     repo = safe_repo(pr_context.get("repo", ""))
-    ref = safe_git_ref(pr_context.get("head_ref") or pr_context.get("sha") or "")
+    try:
+        pr_number = int(pr_context.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        pr_number = 0
+    # Fork PRs: head_ref is a branch in the fork, so fetch GitHub's PR ref.
+    ref = f"pull/{pr_number}/head" if pr_number > 0 else safe_git_ref(pr_context.get("sha") or "")
     prompt = (agent_config.get("system_prompt", "") or "")[:2000]
     agent_id = safe_label(agent_config.get("id") or agent_config.get("name"))
     echo_line = f"agent={agent_id} prompt={prompt[:200]}"
     clone_url = f"https://github.com/{repo}.git"
     return (
         f"git clone --depth 50 {shell_quote(clone_url)} work 2>&1; "
-        f"cd work && git fetch origin {shell_quote(ref)} 2>&1 | head -20; "
+        f"cd work && git fetch origin {shell_quote(ref)} 2>&1 | head -20 && git checkout FETCH_HEAD 2>&1 | head -5; "
         f"echo {shell_quote(echo_line)} | head -5"
     )

@@ -91,6 +91,7 @@ function setSecret(name, value) {
   ssSet(SS_KEYS[name], Secrets[name]);
 }
 function clearSecrets() {
+  oauthCancel = true; // stop any pending GitHub device-flow polling
   for (const k of Object.keys(Secrets)) { Secrets[k] = ""; ssSet(SS_KEYS[k], ""); }
   for (const id of [
     "or-key", "sett-or", "gh-key", "sett-gh", "box-key", "oauth-pat", "api-token",
@@ -308,7 +309,7 @@ async function oauthStart() {
     try { await openUrl(d.verification_uri); } catch (_) {}
     $("oauth-out").textContent = "Code shown — approve on GitHub, waiting… (expires in ~" + Math.round((d.expires_in || 900) / 60) + " min)";
     toastOk("GitHub login started", "Approve code " + d.user_code + " on GitHub.");
-    const interval = Math.max(5, d.interval || 5);
+    let interval = Math.max(5, d.interval || 5);
     while (!oauthCancel) {
       let r;
       try {
@@ -320,6 +321,8 @@ async function oauthStart() {
         if (/pending|slow_down/i.test(msg)) continue;
         throw e;
       }
+      if (oauthCancel) break;
+      if (r && r.interval) interval = Math.max(interval, Number(r.interval) || interval);
       if (r && r.status === "authorized") {
         setSecret("github", r.access_token);
         syncSecretInputs();
@@ -543,6 +546,21 @@ function renderRuns(list) {
       v.addEventListener("click", () => openModal(id));
       row.appendChild(v);
     }
+    if (status === "queued" && id) {
+      const a = document.createElement("button");
+      a.className = "btn btn-outline btn-sm";
+      a.type = "button";
+      a.textContent = "Approve";
+      a.addEventListener("click", async () => {
+        a.disabled = true;
+        try {
+          await apiMut("POST", "/runs/" + encodeURIComponent(id) + "/approve", {});
+          toastOk("Run approved", id);
+          syncRuns();
+        } catch (e) { a.disabled = false; toastErr("Approve failed", String(e).slice(0, 200)); }
+      });
+      row.appendChild(a);
+    }
     if (row.children.length) div.appendChild(row);
     box.appendChild(div);
   }
@@ -604,11 +622,21 @@ function toggleStream() {
     $("runs-out").textContent = "Stream stopped.";
     return;
   }
+  startStream(btn);
+}
+async function startStream(btn) {
   const base = backendUrl();
-  // EventSource cannot set headers; the backend only accepts ?token= here.
-  const streamUrl = base + "/events/stream" + (Secrets.api ? "?token=" + encodeURIComponent(Secrets.api) : "");
-  try { evtSrc = new EventSource(streamUrl); }
-  catch (e) { $("runs-out").textContent = "Stream failed: " + e; return; }
+  // EventSource cannot set headers: exchange the API token for a short-lived,
+  // single-use ticket so the long-lived token never appears in a URL.
+  let streamUrl = base + "/events/stream";
+  try {
+    if (Secrets.api) {
+      const t = await apiMut("POST", "/events/ticket", {});
+      if (!t || !t.ticket) throw new Error("no stream ticket returned");
+      streamUrl += "?ticket=" + encodeURIComponent(t.ticket);
+    }
+    evtSrc = new EventSource(streamUrl);
+  } catch (e) { $("runs-out").textContent = "Stream failed: " + e; return; }
   if (btn) btn.textContent = "Live: on";
   $("runs-out").textContent = "Streaming live events…";
   evtSrc.onmessage = (ev) => {
@@ -843,7 +871,7 @@ function wire() {
 
   // agents
   on("btn-agents-save", saveAgent);
-  on("btn-agents-refresh", refreshAgents);
+  on("btn-agents-refresh", () => refreshAgents());
   on("btn-agents-delete", deleteAgent);
   $("agent-trigger").addEventListener("change", () => {
     $("agent-label-wrap").style.display = $("agent-trigger").value === "on_label" ? "" : "none";

@@ -57,6 +57,9 @@ class VercelSandboxProvider:
             params["teamId"] = team_id
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
+        # Validate/build first so bad webhook input never leaves a sandbox behind.
+        script = _build_command(agent_config, pr_context)
+
         sandbox_id = ""
         async with httpx.AsyncClient(timeout=60.0) as client:
             # 1. Create sandbox
@@ -72,7 +75,6 @@ class VercelSandboxProvider:
             logs.append(f"vercel_sandbox: ephemeral sandbox created id={sandbox_id[:12] or '?'}.")
 
             # 2. Exec agent steps
-            script = _build_command(agent_config, pr_context)
             output = ""
             try:
                 exec_resp = await client.post(
@@ -134,6 +136,6 @@ def _build_command(agent_config: dict, pr_context: dict) -> str:
     return (
         f"git clone --depth 50 {shell_quote(clone_url)} work 2>&1 | head -5; "
         f"cd work && git checkout {shell_quote(sha)} 2>&1 | head -5; "
-        f"npm run lint 2>&1 | head -40 || npm test 2>&1 | head -40; "
+        f"{{ npm run lint 2>&1 || npm test 2>&1; }} | head -40; "
         f"echo {shell_quote(f'agent={agent_id} done')}"
     )

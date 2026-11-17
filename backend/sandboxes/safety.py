@@ -12,7 +12,7 @@ import shlex
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 # Covers hex SHAs and ordinary branch/tag names. Reject strings starting
 # with "-" so they can never be parsed as a git option.
-_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/~^-]{0,199}$")
+_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/~^@+#=%-]{0,199}$")
 _LABEL_RE = re.compile(r"[^A-Za-z0-9_.@-]")
 
 

@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -99,13 +101,28 @@ def _auth_ok(request: Request, *, allow_query_token: bool = False) -> bool:
     auth = (request.headers.get("Authorization") or "").strip()
     if auth and _constant_time_equal(auth, f"Bearer {token}"):
         return True
-    # EventSource cannot set headers, so only the SSE endpoint opts into
-    # ?token=. Other endpoints require the Authorization header to keep
-    # long-lived URLs (and proxy logs) free of credentials.
+    # EventSource cannot set headers, so only the SSE endpoint opts into a
+    # short-lived, single-use ?ticket= (never the long-lived API token), which
+    # keeps credentials out of URLs and proxy logs.
     if not allow_query_token:
         return False
-    q = request.query_params.get("token", "")
-    return bool(q) and _constant_time_equal(q, token)
+    return _consume_stream_ticket(request.query_params.get("ticket", ""))
+
+
+_STREAM_TICKET_TTL_S = 60
+_stream_tickets: dict[str, float] = {}
+_stream_ticket_lock = threading.Lock()
+
+
+def _consume_stream_ticket(ticket: str) -> bool:
+    if not ticket:
+        return False
+    now = time.monotonic()
+    with _stream_ticket_lock:
+        for k in [k for k, exp in _stream_tickets.items() if exp < now]:
+            _stream_tickets.pop(k, None)
+        exp = _stream_tickets.pop(ticket, None)
+    return exp is not None and exp >= now
 
 
 def _require_auth(request: Request) -> None:
@@ -244,18 +261,63 @@ _RUN_EXECUTOR = ThreadPoolExecutor(
 )
 
 
-def enqueue_dispatch(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
-    """Enqueue a run without blocking the request or the shared threadpool."""
+_MAX_PENDING_RUNS = int(os.getenv("RUN_QUEUE_MAX", "200") or 200)
+_pending_runs = 0
+_pending_lock = threading.Lock()
+
+
+def _fail_run(run_id: str, message: str) -> None:
     try:
-        _RUN_EXECUTOR.submit(dispatch_run, agent_cfg, pr, run_id)
+        current = store.rget_json(f"run:{run_id}")
+        if not isinstance(current, dict):
+            current = {}
+        logs = current.get("logs")
+        logs = [str(i) for i in logs] if isinstance(logs, list) else []
+        logs.append(f"ERROR: {message}")
+        current.update({"status": "failed", "finished_at": _now_iso(), "logs": logs})
+        store.rset_json(f"run:{run_id}", current)
+    except Exception as exc:
+        log.warning("could not persist failure for run=%s: %s", run_id, exc)
+
+
+def _dispatch_tracked(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
+    global _pending_runs
+    try:
+        dispatch_run(agent_cfg, pr, run_id)
+    finally:
+        with _pending_lock:
+            _pending_runs -= 1
+
+
+def enqueue_dispatch(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
+    """Enqueue a run without blocking the request; the backlog is bounded."""
+    global _pending_runs
+    with _pending_lock:
+        full = _pending_runs >= _MAX_PENDING_RUNS
+        if not full:
+            _pending_runs += 1
+    if full:
+        log.error("dispatch run=%s rejected: queue full (%d)", run_id, _MAX_PENDING_RUNS)
+        _fail_run(run_id, "run queue is full; try again later")
+        return
+    try:
+        _RUN_EXECUTOR.submit(_dispatch_tracked, agent_cfg, pr, run_id)
     except RuntimeError as exc:  # executor already shut down
+        with _pending_lock:
+            _pending_runs -= 1
         log.error("dispatch run=%s could not be queued: %s", run_id, exc)
+        _fail_run(run_id, f"could not be queued: {exc}")
 
 
 def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
     """Run the PR agent synchronously (called via BackgroundTasks)."""
     log.info("dispatch run=%s agent=%s repo=%s pr=%s", run_id, agent_cfg.get("id"), pr.get("repo"), pr.get("pr_number"))
     try:
+        started = store.rget_json(f"run:{run_id}")
+        if isinstance(started, dict):
+            started["status"] = "running"
+            started["started_at"] = _now_iso()
+            store.rset_json(f"run:{run_id}", started)
         result: dict[str, Any] = {}
         try:
             # Prefer the unified SandboxRouter; tolerate both import layouts.
@@ -326,6 +388,8 @@ def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> 
 # Queued runs are held only in this process. After a restart, records older
 # than this deadline are marked failed instead of staying queued forever.
 STALE_QUEUED_S = 15 * 60
+STALE_RUNNING_S = 60 * 60
+REAP_INTERVAL_S = 60
 
 
 def _reap_stale_queued_runs() -> None:
@@ -333,17 +397,20 @@ def _reap_stale_queued_runs() -> None:
     try:
         for k in store.rkeys("run:*"):
             rec = store.rget_json(k)
-            if not isinstance(rec, dict) or rec.get("status") != "queued":
+            if not isinstance(rec, dict) or rec.get("status") not in ("queued", "running"):
                 continue
+            is_running = rec.get("status") == "running"
+            run_cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_RUNNING_S) if is_running else cutoff
+            stamp = rec.get("started_at") if is_running and rec.get("started_at") else rec.get("created_at", "")
             try:
-                created = datetime.fromisoformat(str(rec.get("created_at", "")).replace("Z", "+00:00"))
+                created = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
             except ValueError:
                 created = None
             if created is None:
                 continue
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            if created >= cutoff:
+            if created >= run_cutoff:
                 continue
             rec["status"] = "failed"
             rec["finished_at"] = _now_iso()
@@ -359,9 +426,18 @@ def _reap_stale_queued_runs() -> None:
         log.warning("stale-run reaper failed: %s", exc)
 
 
+async def _reap_loop() -> None:
+    # Runs after startup too, so runs whose dispatch was lost in a restart are
+    # failed once they pass the deadline without needing another restart.
+    while True:
+        await asyncio.sleep(REAP_INTERVAL_S)
+        await asyncio.to_thread(_reap_stale_queued_runs)
+
+
 @app.on_event("startup")
-def _startup_reap() -> None:
+async def _startup_reap() -> None:
     _reap_stale_queued_runs()
+    app.state.reap_task = asyncio.create_task(_reap_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +509,9 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         return JSONResponse({"accepted": True, "runs": [], "matched": 0}, status_code=202)
 
     # Debounce: one trigger per PR/action/label per 45s.
-    debounce_key = f"debounce:{repo}:{pr_number}:{action}:{label or ''}"
+    # Keyed by head SHA so a newer push is never swallowed, while redeliveries
+    # of the same event (same SHA) are still deduplicated.
+    debounce_key = f"debounce:{repo}:{pr_number}:{action}:{label or ''}:{sha}"
     if not await store.arset(debounce_key, "1", ex=DEBOUNCE_TTL_S, nx=True):
         return JSONResponse({"debounced": True}, status_code=202)
 
@@ -447,6 +525,20 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         head_ref=head_ref,
     )
     run_ids: list[str] = []
+    try:
+        await _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks)
+    except Exception:
+        # Release the claim so GitHub's retry can recreate the missing runs.
+        try:
+            await asyncio.to_thread(store.rdelete, debounce_key)
+        except Exception as exc:
+            log.warning("could not release debounce key: %s", exc)
+        raise
+
+    return JSONResponse({"accepted": True, "runs": run_ids}, status_code=202)
+
+
+async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks) -> None:  # type: ignore[no-untyped-def]
     for agent_cfg in matched:
         run_id = uuid.uuid4().hex[:12]
         record = {
@@ -464,8 +556,6 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         tasks.add_task(enqueue_dispatch, agent_cfg, pr_ctx.model_dump(), run_id)
         run_ids.append(run_id)
 
-    return JSONResponse({"accepted": True, "runs": run_ids}, status_code=202)
-
 
 # ---------------------------------------------------------------------------
 # Agent CRUD
@@ -476,20 +566,17 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
 def create_agent(agent: AgentConfig, request: Request) -> dict[str, Any]:
     _require_auth(request)
     data = agent.model_dump()
+    # Atomic create-if-absent (nx) so concurrent creates never overwrite.
     if data["id"]:
-        if isinstance(store.rget_json(f"agent:{data['id']}"), dict):
+        if not store.rset_json(f"agent:{data['id']}", data, nx=True):
             raise HTTPException(status_code=409, detail="agent id already exists")
-    else:
-        # Slug from name, else random. Avoid silently overwriting an existing id.
-        slug = "".join(c.lower() if c.isalnum() else "-" for c in data["name"]).strip("-") or "agent"
-        for _ in range(5):
-            data["id"] = f"{slug}-{uuid.uuid4().hex[:6]}"
-            if not isinstance(store.rget_json(f"agent:{data['id']}"), dict):
-                break
-        else:
-            raise HTTPException(status_code=409, detail="could not allocate a unique agent id")
-    store.rset_json(f"agent:{data['id']}", data)
-    return data
+        return data
+    slug = "".join(c.lower() if c.isalnum() else "-" for c in data["name"]).strip("-") or "agent"
+    for _ in range(5):
+        data["id"] = f"{slug}-{uuid.uuid4().hex[:6]}"
+        if store.rset_json(f"agent:{data['id']}", data, nx=True):
+            return data
+    raise HTTPException(status_code=409, detail="could not allocate a unique agent id")
 
 
 @app.get("/agents")
@@ -855,6 +942,23 @@ async def config_test(body: ConfigTestBody, request: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+@app.post("/events/ticket")
+def events_ticket(request: Request) -> dict[str, Any]:
+    """Mint a 60s single-use ticket for EventSource (which cannot send headers)."""
+    _require_auth(request)
+    ticket = uuid.uuid4().hex + uuid.uuid4().hex
+    with _stream_ticket_lock:
+        if len(_stream_tickets) > 1000:
+            _stream_tickets.clear()
+        _stream_tickets[ticket] = time.monotonic() + _STREAM_TICKET_TTL_S
+    return {"ticket": ticket, "expires_in": _STREAM_TICKET_TTL_S}
+
+
+def _digest(rec: dict[str, Any]) -> str:
+    """Fixed-size fingerprint so open streams don't retain whole run records."""
+    return hashlib.sha1(json.dumps(rec, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+
+
 @app.get("/events/stream")
 async def events_stream(
     request: Request,
@@ -863,7 +967,8 @@ async def events_stream(
     """SSE stream: replay recent runs on connect, then push new/updated runs live.
 
     Auth: if BACKEND_API_TOKEN is set, requires `Authorization: Bearer <token>`
-    or `?token=<token>` (EventSource cannot set headers).
+    or a single-use `?ticket=<ticket>` from POST /events/ticket (EventSource
+    cannot set headers).
     """
     if not _auth_ok(request, allow_query_token=True):
         raise HTTPException(status_code=401, detail="invalid or missing API token")
@@ -883,7 +988,7 @@ async def events_stream(
             for rec in recs:
                 rid = str(rec.get("run_id", ""))
                 if rid:
-                    snapshots[rid] = json.dumps(rec, separators=(",", ":"))
+                    snapshots[rid] = _digest(rec)
             for rec in recs[-limit:]:
                 blob = json.dumps(rec, separators=(",", ":"))
                 yield f"data: {blob}\n\n"
@@ -901,9 +1006,9 @@ async def events_stream(
                         continue
                     rid = str(rec.get("run_id", "") or k.split("run:", 1)[-1])
                     live_ids.add(rid)
-                    blob = json.dumps(rec, separators=(",", ":"))
-                    if snapshots.get(rid) != blob:
-                        snapshots[rid] = blob
+                    digest = _digest(rec)
+                    if snapshots.get(rid) != digest:
+                        snapshots[rid] = digest
                         changed.append(rec)
                 # Keep the snapshot map bounded by the records that still exist.
                 for stale in set(snapshots) - live_ids:

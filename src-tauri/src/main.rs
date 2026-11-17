@@ -61,7 +61,19 @@ fn config_path_for_write() -> PathBuf {
 }
 
 fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn get_val(src: &str, key: &str) -> Option<String> {
@@ -77,8 +89,14 @@ fn get_val(src: &str, key: &str) -> Option<String> {
     None
 }
 
-#[tauri::command(async)]
-fn get_config() -> Result<serde_json::Value, String> {
+#[tauri::command]
+async fn get_config() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || get_config_blocking())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_config_blocking() -> Result<serde_json::Value, String> {
     let path = find_file(".pr_agent.toml").ok_or("No .pr_agent.toml found next to app")?;
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
 
@@ -124,8 +142,14 @@ fn get_config() -> Result<serde_json::Value, String> {
     }))
 }
 
-#[tauri::command(async)]
-fn save_config(cfg: serde_json::Value) -> Result<String, String> {
+#[tauri::command]
+async fn save_config(cfg: serde_json::Value) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || save_config_blocking(cfg))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn save_config_blocking(cfg: serde_json::Value) -> Result<String, String> {
     let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or("openrouter/thinkingmachines/inkling-2-small:free"));
     let fallbacks = cfg.get("fallback_models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let fb: Vec<String> = fallbacks.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", toml_escape(s)))).collect();
@@ -173,17 +197,53 @@ auto_improve = {ai}
     Ok(path.to_string_lossy().to_string())
 }
 
-#[tauri::command(async)]
-fn get_workflow() -> Result<serde_json::Value, String> {
+#[tauri::command]
+async fn get_workflow() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || get_workflow_blocking())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_workflow_blocking() -> Result<serde_json::Value, String> {
     let path = find_file(".github/workflows/pr-agent.yml").ok_or("No workflow file found")?;
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     Ok(serde_json::json!({ "path": path.to_string_lossy(), "raw": raw }))
 }
 
-#[tauri::command(async)]
+#[tauri::command]
 fn build_cli_command(pr_url: String, command: String) -> String {
     let cmd = command.trim().trim_start_matches('/').to_string();
     format!("pr-agent --pr_url {} {}", pr_url.trim(), cmd)
+}
+
+/// Split a command line like `ask "what changed?"` into separate arguments
+/// (whitespace-separated, with single/double quote grouping).
+fn split_cli_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in input.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '"') | (None, '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if started || !cur.is_empty() {
+        args.push(cur);
+    }
+    args
 }
 
 fn render_process_output(out: &std::process::Output) -> String {
@@ -206,20 +266,29 @@ fn process_failure(label: &str, out: &std::process::Output) -> String {
     )
 }
 
-#[tauri::command(async)]
-fn run_local_review(pr_url: String, command: String, openrouter_key: String) -> Result<String, String> {
+#[tauri::command]
+async fn run_local_review(pr_url: String, command: String, openrouter_key: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_local_review_blocking(pr_url, command, openrouter_key))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn run_local_review_blocking(pr_url: String, command: String, openrouter_key: String) -> Result<String, String> {
     let cmd = command.trim().trim_start_matches('/').to_string();
+    let cmd_args = split_cli_args(&cmd);
     let url = pr_url.trim();
     let python_fallback = || {
         Command::new("python")
-            .args(["-m", "pr_agent.cli", "--pr_url", url, &cmd])
+            .args(["-m", "pr_agent.cli", "--pr_url", url])
+            .args(&cmd_args)
             .env("OPENROUTER__KEY", &openrouter_key)
             .output()
     };
 
     // Try `pr-agent` on PATH first, then `python -m pr_agent`.
     match Command::new("pr-agent")
-        .args(["--pr_url", url, &cmd])
+        .args(["--pr_url", url])
+        .args(&cmd_args)
         .env("OPENROUTER__KEY", &openrouter_key)
         .output()
     {
@@ -243,8 +312,23 @@ fn run_local_review(pr_url: String, command: String, openrouter_key: String) -> 
     }
 }
 
-#[tauri::command(async)]
-fn box_provision(
+#[tauri::command]
+async fn box_provision(
+    box_key: String,
+    github_token: String,
+    openrouter_key: String,
+    repos: String,
+    box_name: String,
+    cron: String,
+    model: String,
+    status_only: bool,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || box_provision_blocking(box_key, github_token, openrouter_key, repos, box_name, cron, model, status_only))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn box_provision_blocking(
     box_key: String,
     github_token: String,
     openrouter_key: String,
@@ -343,8 +427,14 @@ jobs:
           tone_mode: balanced
 "#;
 
-#[tauri::command(async)]
-fn check_tool(name: String) -> Result<String, String> {
+#[tauri::command]
+async fn check_tool(name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || check_tool_blocking(name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn check_tool_blocking(name: String) -> Result<String, String> {
     let allowed = ["pr-agent", "python", "pip", "node", "gh"];
     if !allowed.contains(&name.as_str()) {
         return Err("tool not allowed".into());
@@ -363,8 +453,14 @@ fn check_tool(name: String) -> Result<String, String> {
     }
 }
 
-#[tauri::command(async)]
-fn install_pr_agent() -> Result<String, String> {
+#[tauri::command]
+async fn install_pr_agent() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || install_pr_agent_blocking())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn install_pr_agent_blocking() -> Result<String, String> {
     // Installs the PR-Agent CLI with the GitHub integration into the ambient Python.
     let out = Command::new("python")
         .args(["-m", "pip", "install", "pr-agent[github]"])
@@ -381,8 +477,14 @@ fn install_pr_agent() -> Result<String, String> {
     }
 }
 
-#[tauri::command(async)]
-fn get_workflow_template(provider: String) -> Result<String, String> {
+#[tauri::command]
+async fn get_workflow_template(provider: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || get_workflow_template_blocking(provider))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_workflow_template_blocking(provider: String) -> Result<String, String> {
     match provider.as_str() {
         "pr-agent" => Ok(PR_AGENT_WORKFLOW.to_string()),
         "openrabbit" => Ok(OPENRABBIT_WORKFLOW.to_string()),
@@ -390,8 +492,14 @@ fn get_workflow_template(provider: String) -> Result<String, String> {
     }
 }
 
-#[tauri::command(async)]
-fn write_workflow(provider: String) -> Result<String, String> {
+#[tauri::command]
+async fn write_workflow(provider: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || write_workflow_blocking(provider))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn write_workflow_blocking(provider: String) -> Result<String, String> {
     let (file, content) = match provider.as_str() {
         "pr-agent" => ("pr-agent.yml", PR_AGENT_WORKFLOW),
         "openrabbit" => ("openrabbit.yml", OPENRABBIT_WORKFLOW),
@@ -430,8 +538,14 @@ fn gh_client() -> Result<reqwest::blocking::Client, String> {
 
 /// Step 1 of GitHub OAuth device flow: returns device_code + user_code.
 /// Needs only the OAuth App client_id (no secret). Enable Device Flow in the app settings.
-#[tauri::command(async)]
-fn github_device_start(client_id: String) -> Result<serde_json::Value, String> {
+#[tauri::command]
+async fn github_device_start(client_id: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || github_device_start_blocking(client_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_device_start_blocking(client_id: String) -> Result<serde_json::Value, String> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
         return Err("OAuth client_id is required".into());
@@ -453,8 +567,19 @@ fn github_device_start(client_id: String) -> Result<serde_json::Value, String> {
 /// Step 2: poll until the user approves (or max_wait_secs elapses -> {status:"pending"}).
 /// Returns {status:"authorized", access_token, login} on success. Token is returned
 /// to the UI only — never written to disk.
-#[tauri::command(async)]
-fn github_device_poll(
+#[tauri::command]
+async fn github_device_poll(
+    client_id: String,
+    device_code: String,
+    interval_secs: u64,
+    max_wait_secs: u64,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || github_device_poll_blocking(client_id, device_code, interval_secs, max_wait_secs))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_device_poll_blocking(
     client_id: String,
     device_code: String,
     interval_secs: u64,
@@ -493,7 +618,7 @@ fn github_device_poll(
             other => return Err(format!("OAuth error ({}): {}", other, res)),
         }
         if std::time::Instant::now() >= deadline {
-            return Ok(serde_json::json!({ "status": "pending" }));
+            return Ok(serde_json::json!({ "status": "pending", "interval": interval }));
         }
     }
 }
@@ -526,8 +651,14 @@ fn github_login_inner(
 }
 
 /// Resolve the login for a token (OAuth or PAT). Used to confirm auth + auto-fill.
-#[tauri::command(async)]
-fn github_login(token: String) -> Result<String, String> {
+#[tauri::command]
+async fn github_login(token: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || github_login_blocking(token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_login_blocking(token: String) -> Result<String, String> {
     github_login_inner(&gh_client()?, token.trim())
 }
 
@@ -543,7 +674,28 @@ fn backend_base(url: &str) -> Result<String, String> {
     Ok(b)
 }
 
+/// Refuse to send a bearer token over plaintext HTTP to a non-loopback host.
+fn require_secure_for_token(url: &str, has_token: bool) -> Result<(), String> {
+    if !has_token || url.starts_with("https://") {
+        return Ok(());
+    }
+    let rest = url.strip_prefix("http://").unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit('@').next().unwrap_or("").split(':').next().unwrap_or("")
+    };
+    let h = host.to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h == "127.0.0.1" || h == "::1" {
+        Ok(())
+    } else {
+        Err("refusing to send the API token over plain http:// to a non-loopback backend; use https://".into())
+    }
+}
+
 fn backend_get(url: &str, api_token: Option<&str>) -> Result<String, String> {
+    require_secure_for_token(url, api_token.map(str::trim).map_or(false, |t| !t.is_empty()))?;
     let mut req = gh_client()?
         .get(url)
         .header("Accept", "application/json");
@@ -562,16 +714,32 @@ fn backend_get(url: &str, api_token: Option<&str>) -> Result<String, String> {
 }
 
 /// GET {backend_url}/health — connectivity check.
-#[tauri::command(async)]
-fn backend_health(backend_url: String, api_token: Option<String>) -> Result<String, String> {
+#[tauri::command]
+async fn backend_health(backend_url: String, api_token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_health_blocking(backend_url, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_health_blocking(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     backend_get(&format!("{}/health", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/agents — list agents (UI does POST/PUT/DELETE via fetch).
 /// `agents_json` is accepted for API symmetry and currently ignored.
-#[tauri::command(async)]
-fn backend_sync_agents(
+#[tauri::command]
+async fn backend_sync_agents(
+    backend_url: String,
+    agents_json: String,
+    api_token: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_sync_agents_blocking(backend_url, agents_json, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_sync_agents_blocking(
     backend_url: String,
     agents_json: String,
     api_token: Option<String>,
@@ -582,22 +750,43 @@ fn backend_sync_agents(
 }
 
 /// GET {backend_url}/runs?limit=50 — recent background runs.
-#[tauri::command(async)]
-fn backend_get_runs(backend_url: String, api_token: Option<String>) -> Result<String, String> {
+#[tauri::command]
+async fn backend_get_runs(backend_url: String, api_token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_get_runs_blocking(backend_url, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_get_runs_blocking(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     backend_get(&format!("{}/runs?limit=50", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/quota — Upstash Box / Vercel Sandbox usage.
-#[tauri::command(async)]
-fn backend_get_quota(backend_url: String, api_token: Option<String>) -> Result<String, String> {
+#[tauri::command]
+async fn backend_get_quota(backend_url: String, api_token: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_get_quota_blocking(backend_url, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_get_quota_blocking(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     backend_get(&format!("{}/quota", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/config/status — which providers are configured (booleans only, no secrets).
-#[tauri::command(async)]
-fn backend_config_status(
+#[tauri::command]
+async fn backend_config_status(
+    backend_url: String,
+    api_token: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_config_status_blocking(backend_url, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_config_status_blocking(
     backend_url: String,
     api_token: Option<String>,
 ) -> Result<String, String> {
@@ -606,8 +795,18 @@ fn backend_config_status(
 }
 
 /// POST {backend_url}/config/test {"provider": ...} — live connectivity check (no secrets echoed).
-#[tauri::command(async)]
-fn backend_config_test(
+#[tauri::command]
+async fn backend_config_test(
+    backend_url: String,
+    provider: String,
+    api_token: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_config_test_blocking(backend_url, provider, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_config_test_blocking(
     backend_url: String,
     provider: String,
     api_token: String,
@@ -618,6 +817,7 @@ fn backend_config_test(
     if !allowed.contains(&p.as_str()) {
         return Err("unknown provider (use: github, redis, vercel, upstash_box, openrouter)".into());
     }
+    require_secure_for_token(&base, !api_token.trim().is_empty())?;
     let mut req = gh_client()?
         .post(format!("{}/config/test", base))
         .header("Accept", "application/json")
@@ -686,26 +886,41 @@ fn backend_env_for_write() -> PathBuf {
 /// plainly safe; otherwise single-quote (no interpolation is used when the
 /// backend loads the file), falling back to double quotes for values that
 /// contain a single quote.
-fn dotenv_render_value(value: &str) -> String {
+fn dotenv_render_value(value: &str) -> Result<String, String> {
     let safe = !value.is_empty()
         && value.chars().all(|c| {
             c.is_ascii_alphanumeric() || "._~:/?&=+@%*,;!()-[]{}".contains(c)
         });
     if safe {
-        return value.to_string();
+        return Ok(value.to_string());
     }
-    if !value.contains('\'') {
-        return format!("'{}'", value);
+    // python-dotenv decodes backslash escapes even inside single quotes, so
+    // single-quote only values with neither backslashes nor single quotes.
+    if !value.contains('\'') && !value.contains('\\') {
+        return Ok(format!("'{}'", value));
+    }
+    // Double quotes are still interpolated (${VAR}); refuse what we cannot
+    // store faithfully rather than silently corrupt a credential.
+    if value.contains("${") {
+        return Err("value contains '${' together with quotes/backslashes and cannot be stored safely".into());
     }
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{}\"", escaped)
+    Ok(format!("\"{}\"", escaped))
 }
+
+static ENV_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write one integration secret into backend/.env (creates the file if needed).
 /// The value is never logged and never touches localStorage — it stays in
 /// Rust + the dotenv file, which is git-ignored.
-#[tauri::command(async)]
-fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
+#[tauri::command]
+async fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || save_backend_env_var_blocking(key, value))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, String> {
     let k = key.trim().to_uppercase();
     if !allowed_env_key(&k) {
         return Err("refusing to write unknown env key".into());
@@ -717,6 +932,8 @@ fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
     if v.contains('\n') || v.contains('\r') {
         return Err("value must be a single line".into());
     }
+    // Serialize the whole read-modify-write so concurrent saves don't drop keys.
+    let _guard = ENV_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = backend_env_for_write();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -731,7 +948,7 @@ fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
         vec!["# Local only — NEVER commit (gitignored). Managed by PR Agent Control Integrations.".to_string()]
     };
     let prefix = format!("{}=", k);
-    let replacement = format!("{}={}", k, dotenv_render_value(v));
+    let replacement = format!("{}={}", k, dotenv_render_value(v)?);
     // Replace the first occurrence and drop later duplicates so the value that
     // python-dotenv resolves is unambiguous.
     let mut replaced = false;
@@ -762,8 +979,14 @@ fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
 
 /// GET https://api.github.com/user/repos — list repos for the sync picker.
 /// Token is passed in memory only, never stored. Returns raw JSON array text.
-#[tauri::command(async)]
-fn github_list_repos(token: String) -> Result<String, String> {
+#[tauri::command]
+async fn github_list_repos(token: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || github_list_repos_blocking(token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_list_repos_blocking(token: String) -> Result<String, String> {
     let token = token.trim();
     if token.is_empty() {
         return Err("GitHub token is required".into());
@@ -801,8 +1024,20 @@ fn github_list_repos(token: String) -> Result<String, String> {
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
 /// with an optional Bearer API token. Keeps secrets out of the webview fetch path
 /// (avoids CORS/preflight issues in Tauri) and never logs tokens.
-#[tauri::command(async)]
-fn backend_mutate(
+#[tauri::command]
+async fn backend_mutate(
+    method: String,
+    backend_url: String,
+    path: String,
+    body_json: Option<String>,
+    api_token: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_mutate_blocking(method, backend_url, path, body_json, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_mutate_blocking(
     method: String,
     backend_url: String,
     path: String,
@@ -822,6 +1057,7 @@ fn backend_mutate(
         return Err("method not allowed".into());
     }
     let url = format!("{}{}", base, p);
+    require_secure_for_token(&url, api_token.as_deref().map(str::trim).map_or(false, |t| !t.is_empty()))?;
     let client = gh_client()?;
     let mut req = match m.as_str() {
         "POST" => client.post(&url),
@@ -849,8 +1085,18 @@ fn backend_mutate(
 }
 
 /// POST {backend_url}/runs/{run_id}/approve — used by the Runs approve buttons.
-#[tauri::command(async)]
-fn backend_approve_run(
+#[tauri::command]
+async fn backend_approve_run(
+    backend_url: String,
+    run_id: String,
+    api_token: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || backend_approve_run_blocking(backend_url, run_id, api_token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn backend_approve_run_blocking(
     backend_url: String,
     run_id: String,
     api_token: Option<String>,
@@ -862,7 +1108,7 @@ fn backend_approve_run(
     if id.contains('/') || id.contains("..") || id.contains('\\') {
         return Err("invalid run_id".into());
     }
-    backend_mutate(
+    backend_mutate_blocking(
         "POST".into(),
         backend_url,
         format!("/runs/{}/approve", id),
