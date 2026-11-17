@@ -152,10 +152,15 @@ class SandboxRouter:
                     "pr_comment_posted": False,
                 }
 
-        # Merge router logs, track quota.
+        # Merge router logs, track quota (success-only: failed runs cost nothing).
         result["logs"] = logs + result.get("logs", [])
         cpu = float(result.get("cpu_seconds") or 0.0)
-        if result.get("provider") in ("upstash_box", "vercel_sandbox") and cpu > 0:
+        _status = str(result.get("status", ""))
+        if (
+            result.get("provider") in ("upstash_box", "vercel_sandbox")
+            and cpu > 0
+            and _status.startswith("completed")
+        ):
             self._add_usage(result["provider"], cpu)
 
         result.setdefault("provider", provider)

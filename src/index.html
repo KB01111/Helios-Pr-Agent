@@ -1,233 +1,427 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' http://localhost:* http://127.0.0.1:* https://api.github.com https://github.com" />
 <title>PR Agent Control</title>
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-<header>
-  <div>
-    <h1>PR Agent Control</h1>
-    <p class="sub">Tauri control panel · model <code>thinkingmachines/inkling-2-small:free</code> via OpenRouter</p>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <b>PR Agent</b>
+      <span class="badge">control · v0.1</span>
+    </div>
+    <div class="status" id="conn-status">Backend: <b>checking…</b></div>
+    <nav class="nav" aria-label="Primary">
+      <button class="nav-btn active" data-tab="review"><span class="ico">◈</span>Review</button>
+      <button class="nav-btn" data-tab="agents"><span class="ico">⚙</span>Agents &amp; sync</button>
+      <button class="nav-btn" data-tab="runs"><span class="ico">▶</span>Runs</button>
+      <button class="nav-btn" data-tab="quota"><span class="ico">▦</span>Quota</button>
+      <button class="nav-btn" data-tab="providers"><span class="ico">◍</span>Providers</button>
+      <button class="nav-btn" data-tab="integrations"><span class="ico">🔌</span>Integrations</button>
+      <button class="nav-btn" data-tab="settings"><span class="ico">✦</span>Settings</button>
+    </nav>
+    <div class="side-foot">
+      <button id="theme-toggle" class="btn btn-secondary btn-sm" type="button">◐ Toggle theme</button>
+      <button id="btn-clear-secrets" class="btn btn-ghost btn-sm" type="button">Clear session secrets</button>
+    </div>
+  </aside>
+
+  <div class="content">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">Review</h1>
+        <p class="sub" id="page-sub">Model <code>thinkingmachines/inkling-2-small:free</code> via OpenRouter · secrets live in memory/session only</p>
+      </div>
+      <div class="topbar-actions">
+        <span class="badge" id="backend-pill">backend: …</span>
+        <button id="btn-reload-all" class="btn btn-outline btn-sm" type="button">Reload</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- REVIEW -->
+      <section class="tabpane active" id="tab-review" aria-label="Review">
+        <div class="card">
+          <div class="card-head"><h2>1 · Model (OpenRouter free)</h2><span class="badge">.pr_agent.toml</span></div>
+          <div class="field"><span class="lbl">Model</span>
+            <select id="model">
+              <option value="openrouter/thinkingmachines/inkling-2-small:free">openrouter/thinkingmachines/inkling-2-small:free (default)</option>
+              <option value="openrouter/free">openrouter/free (router)</option>
+              <option value="openrouter/auto">openrouter/auto (router)</option>
+              <option value="custom">custom…</option>
+            </select>
+          </div>
+          <div class="field hidden" id="custom-wrap"><span class="lbl">Custom model id</span>
+            <input id="custom-model" placeholder="openrouter/org/model:free" autocomplete="off" />
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Fallback models (comma separated)</span>
+              <input id="fallbacks" value="openrouter/free" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">Max tokens</span>
+              <input id="max-tokens" value="200000" inputmode="numeric" autocomplete="off" />
+            </div>
+          </div>
+          <div class="field"><span class="lbl">Reasoning effort</span>
+            <select id="effort">
+              <option value="none">none</option>
+              <option value="low" selected>low (fast, free-tier friendly)</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </div>
+          <div class="checks">
+            <label><input type="checkbox" id="auto-describe" checked /> auto_describe</label>
+            <label><input type="checkbox" id="auto-review" checked /> auto_review</label>
+            <label><input type="checkbox" id="auto-improve" /> auto_improve</label>
+          </div>
+          <div class="row wrap">
+            <button id="btn-save" class="btn btn-accent" type="button">Save config</button>
+            <button id="btn-load" class="btn btn-outline" type="button">Reload</button>
+          </div>
+          <p class="hint" id="cfg-path">config: …</p>
+          <pre class="out" id="raw">…</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>2 · Run a review</h2><span class="badge">local CLI</span></div>
+          <div class="field"><span class="lbl">PR URL</span>
+            <input id="pr-url" placeholder="https://github.com/owner/repo/pull/123" autocomplete="off" />
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Command</span>
+              <select id="cmd">
+                <option value="review">review</option>
+                <option value="describe">describe</option>
+                <option value="improve">improve</option>
+                <option value="ask">ask</option>
+              </select>
+            </div>
+            <div class="field"><span class="lbl">OPENROUTER_API_KEY (session only — never saved to disk)</span>
+              <input id="or-key" type="password" placeholder="sk-or-…" autocomplete="off" />
+            </div>
+          </div>
+          <div class="field hidden" id="ask-wrap"><span class="lbl">Question (for /ask)</span>
+            <input id="ask-q" placeholder="What does this PR change?" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-cli" class="btn btn-outline" type="button">Copy CLI command</button>
+            <button id="btn-run" class="btn btn-accent" type="button">Run locally</button>
+            <button id="btn-open-pr" class="btn btn-ghost" type="button">Open PR</button>
+            <button id="btn-open-actions" class="btn btn-ghost" type="button">Open Actions</button>
+          </div>
+          <pre class="out" id="out">Ready.</pre>
+        </div>
+      </section>
+
+      <!-- AGENTS -->
+      <section class="tabpane" id="tab-agents" aria-label="Agents">
+        <div class="card">
+          <div class="card-head"><h2>Agents &amp; repo sync</h2><span class="badge" id="agents-count">0 agents</span></div>
+          <p class="hint">Agents live in the backend. Target repos gate which webhooks fire; trigger mode decides when; execution mode decides where code runs.</p>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Agent name</span>
+              <input id="agent-name" placeholder="reviewer-main" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">Existing agents</span>
+              <select id="agent-select"><option value="">— new agent —</option></select>
+            </div>
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Trigger mode</span>
+              <select id="agent-trigger">
+                <option value="on_commit">on_commit — every push / PR sync</option>
+                <option value="on_label">on_label — only on matching label</option>
+                <option value="manual">manual — API dispatch only</option>
+              </select>
+            </div>
+            <div class="field"><span class="lbl">Execution mode</span>
+              <select id="agent-mode">
+                <option value="review_only">review_only — no sandbox</option>
+                <option value="interactive">interactive — Upstash Box</option>
+                <option value="ephemeral">ephemeral — Vercel Sandbox</option>
+              </select>
+            </div>
+          </div>
+          <div class="field" id="agent-label-wrap"><span class="lbl">Trigger label (for on_label)</span>
+            <input id="agent-label" placeholder="review-me" autocomplete="off" />
+          </div>
+          <div class="field"><span class="lbl">Target repos (multi-select — tick to sync)</span>
+            <div class="repo-picker" id="agent-repos-list"><p class="hint">Connect GitHub in Settings to load your repos, or add manually below.</p></div>
+          </div>
+          <div class="row">
+            <input id="agent-repo-add" placeholder="owner/repo" autocomplete="off" style="flex:1" />
+            <button id="btn-agent-repo-add" class="btn btn-outline btn-sm" type="button">Add repo</button>
+            <button id="btn-agent-repos-load" class="btn btn-ghost btn-sm" type="button">Load my repos</button>
+          </div>
+          <div class="field"><span class="lbl">System prompt</span>
+            <textarea id="agent-prompt" rows="4" placeholder="You are a senior reviewer…"></textarea>
+          </div>
+          <div class="row wrap">
+            <button id="btn-agents-save" class="btn btn-accent" type="button">Save agent</button>
+            <button id="btn-agents-refresh" class="btn btn-outline" type="button">Refresh</button>
+            <button id="btn-agents-delete" class="btn btn-destructive" type="button">Delete selected</button>
+          </div>
+          <pre class="out" id="agents-out">Agents not loaded.</pre>
+        </div>
+      </section>
+
+      <!-- RUNS -->
+      <section class="tabpane" id="tab-runs" aria-label="Runs">
+        <div class="card">
+          <div class="card-head"><h2>Background runs</h2><span class="badge">backend</span></div>
+          <p class="hint">Pulls runs recorded while this PC was offline. Approve buttons only appear for runs awaiting approval.</p>
+          <div class="row wrap">
+            <button id="btn-runs-sync" class="btn btn-accent" type="button">Sync runs</button>
+            <button id="btn-stream" class="btn btn-outline" type="button">Live: off</button>
+            <button id="btn-view-diff" class="btn btn-ghost" type="button">Open latest diff</button>
+          </div>
+          <pre class="out" id="runs-out">Runs not synced.</pre>
+          <div id="runs-list"></div>
+        </div>
+      </section>
+
+      <!-- QUOTA -->
+      <section class="tabpane" id="tab-quota" aria-label="Quota">
+        <div class="card">
+          <div class="card-head"><h2>Quota dashboard</h2><button id="btn-quota" class="btn btn-outline btn-sm" type="button">Refresh quota</button></div>
+          <p class="hint" id="quota-text">Quota idle — 18 000 vCPU-seconds per provider per month.</p>
+          <div class="quota-grid">
+            <div class="card quota-card" style="box-shadow:none">
+              <span class="badge">Upstash Box · interactive</span>
+              <div class="big" id="quota-box-num">—</div>
+              <div class="bar" id="quota-box-barwrap"><div id="quota-box-bar"></div></div>
+              <p class="hint" id="quota-box-sub">—</p>
+            </div>
+            <div class="card quota-card" style="box-shadow:none">
+              <span class="badge">Vercel Sandbox · ephemeral</span>
+              <div class="big" id="quota-vercel-num">—</div>
+              <div class="bar" id="quota-vercel-barwrap"><div id="quota-vercel-bar"></div></div>
+              <p class="hint" id="quota-vercel-sub">—</p>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Auto-run on Upstash Box</h2><span class="badge">cron</span></div>
+          <p class="hint">Provisions a <code>python</code> box, uploads the review loop, sets a cron schedule. Keys stay in memory — never written to disk.</p>
+          <div class="grid2">
+            <div class="field"><span class="lbl">UPSTASH_BOX_API_KEY (box_…, session only)</span>
+              <input id="box-key" type="password" placeholder="box_…" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">GITHUB_TOKEN (mirrored from Settings)</span>
+              <input id="gh-key" type="password" placeholder="ghp_… — connect in Settings" autocomplete="off" />
+            </div>
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Box name</span><input id="box-name" value="pr-agent-runner" autocomplete="off" /></div>
+            <div class="field"><span class="lbl">Schedule (UTC cron)</span><input id="box-cron" value="*/15 * * * *" autocomplete="off" /></div>
+          </div>
+          <div class="field"><span class="lbl">Repos to watch (comma separated owner/repo)</span>
+            <input id="box-repos" placeholder="owner/repo, owner/other" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-box-up" class="btn btn-accent" type="button">Provision + start schedule</button>
+            <button id="btn-box-status" class="btn btn-outline" type="button">Status</button>
+          </div>
+          <pre class="out" id="box-out">Box idle.</pre>
+        </div>
+      </section>
+
+      <!-- PROVIDERS -->
+      <section class="tabpane" id="tab-providers" aria-label="Providers">
+        <div class="card">
+          <div class="card-head"><h2>Provider: PR-Agent</h2><span class="badge">always online via Actions</span></div>
+          <p class="hint">Full review quality. The Action workflow below runs on every PR event — no PC needed.</p>
+          <div class="row wrap">
+            <button id="btn-pa-check" class="btn btn-outline" type="button">Check pr-agent CLI</button>
+            <button id="btn-pa-install" class="btn btn-ghost" type="button">Install CLI (pip)</button>
+            <button id="btn-pa-write" class="btn btn-ghost" type="button">Write workflow to this repo</button>
+            <button id="btn-pa-copy" class="btn btn-ghost" type="button">Copy workflow YAML</button>
+          </div>
+          <pre class="out" id="pa-out">Needs repo secret OPENROUTER_API_KEY.</pre>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Provider: OpenRabbit</h2><span class="badge">zero-host bot</span></div>
+          <p class="hint">Simplest zero-host bot: fully automatic on PR open/sync. Needs repo secret <code>LLM_API_KEY</code> (= OpenRouter key).</p>
+          <div class="row wrap">
+            <button id="btn-or-write" class="btn btn-outline" type="button">Write workflow to this repo</button>
+            <button id="btn-or-copy" class="btn btn-ghost" type="button">Copy workflow YAML</button>
+          </div>
+          <pre class="out" id="or-out">Model pinned: thinkingmachines/inkling-2-small:free (review_mode: both).</pre>
+        </div>
+      </section>
+
+      <!-- INTEGRATIONS -->
+      <section class="tabpane" id="tab-integrations" aria-label="Integrations">
+        <div class="card">
+          <div class="card-head"><h2>Connections — 1-click setup</h2><span class="badge" id="int-state">not checked</span></div>
+          <p class="hint">Tokens are written to <code>backend/.env</code> via the Tauri backend (git-ignored) — never to <code>localStorage</code>. Inputs clear on save. Restart or redeploy the backend afterwards so it picks up the new values.</p>
+          <div class="row wrap">
+            <button id="btn-int-refresh" class="btn btn-outline btn-sm" type="button">Refresh status</button>
+          </div>
+          <div class="int-row">
+            <span class="int-name"><span class="dot warn" id="dot-github"></span>GitHub</span>
+            <span class="hint">webhook secret + token (repo scope)</span>
+            <button id="btn-int-gh-test" class="btn btn-ghost btn-sm" type="button">Test</button>
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">PAT (ghp_… / github_pat_…)</span>
+              <input id="int-gh-token" type="password" placeholder="ghp_…" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">Webhook secret (repo Settings → Webhooks → Secret)</span>
+              <input id="int-gh-secret" type="password" placeholder="whsec_…" autocomplete="off" />
+            </div>
+          </div>
+          <div class="row wrap">
+            <button id="btn-int-gh-save" class="btn btn-accent btn-sm" type="button">Connect GitHub</button>
+          </div>
+          <div class="int-row">
+            <span class="int-name"><span class="dot warn" id="dot-vercel"></span>Vercel Sandbox</span>
+            <span class="hint">token (+ optional team id) for ephemeral runs</span>
+            <button id="btn-int-vercel-test" class="btn btn-ghost btn-sm" type="button">Test</button>
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Vercel token</span>
+              <input id="int-vercel-token" type="password" placeholder="vercel_…" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">Team ID (optional)</span>
+              <input id="int-vercel-team" placeholder="team_…" autocomplete="off" />
+            </div>
+          </div>
+          <div class="row wrap">
+            <button id="btn-int-vercel-save" class="btn btn-accent btn-sm" type="button">Connect Vercel</button>
+          </div>
+          <div class="int-row">
+            <span class="int-name"><span class="dot warn" id="dot-box"></span>Upstash Box</span>
+            <span class="hint">Box API key for warm-box runs</span>
+            <button id="btn-int-box-test" class="btn btn-ghost btn-sm" type="button">Test</button>
+          </div>
+          <div class="field"><span class="lbl">Box API key (box_…)</span>
+            <input id="int-box-key" type="password" placeholder="box_…" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-int-box-save" class="btn btn-accent btn-sm" type="button">Connect Box</button>
+          </div>
+          <div class="int-row">
+            <span class="int-name"><span class="dot warn" id="dot-redis"></span>Upstash Redis</span>
+            <span class="hint">shared state: agents, runs, quota</span>
+            <button id="btn-int-redis-test" class="btn btn-ghost btn-sm" type="button">Test</button>
+          </div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">REST URL</span>
+              <input id="int-redis-url" placeholder="https://….upstash.io" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">REST token</span>
+              <input id="int-redis-token" type="password" placeholder="…" autocomplete="off" />
+            </div>
+          </div>
+          <div class="row wrap">
+            <button id="btn-int-redis-save" class="btn btn-accent btn-sm" type="button">Connect Redis</button>
+          </div>
+          <div class="int-row">
+            <span class="int-name"><span class="dot warn" id="dot-openrouter"></span>OpenRouter</span>
+            <span class="hint">LLM key for reviews</span>
+            <button id="btn-int-or-test" class="btn btn-ghost btn-sm" type="button">Test</button>
+          </div>
+          <div class="field"><span class="lbl">API key (sk-or-…)</span>
+            <input id="int-or-key" type="password" placeholder="sk-or-…" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-int-or-save" class="btn btn-accent btn-sm" type="button">Connect OpenRouter</button>
+          </div>
+          <pre class="out" id="int-out">Integrations not checked.</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>GitHub webhook URL</h2><span class="badge">copy-paste</span></div>
+          <p class="hint">Repo Settings → Webhooks → Add webhook: paste the Payload URL below, Content type
+            <code>application/json</code>, Secret = the webhook secret saved above, events = pull requests only.</p>
+          <div class="field"><span class="lbl">Cloud app base URL (e.g. https://your-app.vercel.app)</span>
+            <input id="int-cloud-base" placeholder="https://your-app…" autocomplete="off" />
+          </div>
+          <p class="hint">Payload URL: <code id="int-hook-preview">https://&lt;cloud-app&gt;/webhooks/github</code></p>
+          <div class="row wrap">
+            <button id="btn-int-hook-copy" class="btn btn-outline btn-sm" type="button">Copy webhook URL</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- SETTINGS -->
+      <section class="tabpane" id="tab-settings" aria-label="Settings">
+        <div class="card">
+          <div class="card-head"><h2>Backend connection</h2><span class="badge" id="settings-conn">unknown</span></div>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Backend URL (stored in localStorage — not secret)</span>
+              <input id="backend-url" value="http://localhost:8000" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">Backend API token (session only — cleared on window close)</span>
+              <input id="api-token" type="password" placeholder="optional Bearer token" autocomplete="off" />
+            </div>
+          </div>
+          <div class="row wrap">
+            <button id="btn-backend-test" class="btn btn-accent" type="button">Test connection</button>
+          </div>
+          <p class="secrets-note mt">Secrets (OpenRouter, GitHub, Box, API token) live in <b>memory + sessionStorage</b> only. They never touch localStorage or disk. Closing the window wipes sessionStorage. “Clear session secrets” wipes them immediately.</p>
+          <pre class="out" id="backend-out">Not tested.</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>GitHub — 1-click OAuth connect</h2><span class="badge" id="gh-state">not connected</span></div>
+          <p class="hint">No backend needed. Create an OAuth App at <code>github.com/settings/developers</code> (enable <b>Device Flow</b>, callback <code>http://localhost</code>), paste its Client ID, hit Connect — the browser opens GitHub, you enter the code, done. Token stays in memory/session.</p>
+          <div class="field"><span class="lbl">OAuth App Client ID (not secret — stored in localStorage)</span>
+            <input id="oauth-client" placeholder="Ov23…" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-oauth-start" class="btn btn-accent" type="button">Connect with GitHub</button>
+            <button id="btn-oauth-cancel" class="btn btn-ghost hidden" type="button">Cancel</button>
+            <button id="btn-oauth-open" class="btn btn-outline hidden" type="button">Open GitHub</button>
+          </div>
+          <div id="oauth-code" class="hidden">
+            <p class="hint">Enter this code on GitHub:</p>
+            <p id="oauth-usercode" class="bigcode">…</p>
+          </div>
+          <div class="field"><span class="lbl">…or paste a PAT (ghp_…, session only)</span></div>
+          <div class="row">
+            <input id="oauth-pat" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" style="flex:1" />
+            <button id="btn-oauth-pat" class="btn btn-outline" type="button">Use PAT</button>
+          </div>
+          <div class="field"><span class="lbl">GitHub token (session only — auto-filled by OAuth)</span>
+            <input id="sett-gh" type="password" placeholder="not connected" autocomplete="off" />
+          </div>
+          <pre class="out" id="oauth-out">Not authenticated.</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Keys</h2><span class="badge">session only</span></div>
+          <div class="field"><span class="lbl">OPENROUTER_API_KEY (session only)</span>
+            <input id="sett-or" type="password" placeholder="sk-or-…" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-forget" class="btn btn-destructive" type="button">Forget all session secrets</button>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
-  <div class="row">
-    <button id="btn-load" class="ghost">Reload</button>
-    <button id="btn-save">Save config</button>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<div class="modal-back" id="modal-back">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Diff viewer">
+    <h3 id="modal-title">Diff</h3>
+    <pre class="out" id="modal-body">—</pre>
+    <div class="row wrap">
+      <button id="modal-approve" class="btn btn-accent btn-sm" type="button">Approve run</button>
+      <button id="modal-close" class="btn btn-outline btn-sm" type="button">Close</button>
+    </div>
   </div>
-</header>
-
-<main>
-  <section class="card">
-    <h2>1 · Model (OpenRouter free)</h2>
-    <label>Model
-      <select id="model">
-        <option value="openrouter/thinkingmachines/inkling-2-small:free">openrouter/thinkingmachines/inkling-2-small:free (default)</option>
-        <option value="openrouter/free">openrouter/free (router)</option>
-        <option value="openrouter/auto">openrouter/auto (router)</option>
-        <option value="custom">custom…</option>
-      </select>
-    </label>
-    <label id="custom-wrap" class="hidden">Custom model id
-      <input id="custom-model" placeholder="openrouter/org/model:free" />
-    </label>
-    <div class="grid2">
-      <label>Fallback models (comma separated)
-        <input id="fallbacks" value="openrouter/free" />
-      </label>
-      <label>Max tokens
-        <input id="max-tokens" value="200000" inputmode="numeric" />
-      </label>
-    </div>
-    <label>Reasoning effort
-      <select id="effort">
-        <option value="none">none</option>
-        <option value="low" selected>low (fast, free-tier friendly)</option>
-        <option value="medium">medium</option>
-        <option value="high">high</option>
-      </select>
-    </label>
-    <div class="checks">
-      <label><input type="checkbox" id="auto-describe" checked /> auto_describe</label>
-      <label><input type="checkbox" id="auto-review" checked /> auto_review</label>
-      <label><input type="checkbox" id="auto-improve" /> auto_improve</label>
-    </div>
-    <p class="hint" id="cfg-path">config: …</p>
-  </section>
-
-  <section class="card">
-    <h2>2 · Run a review</h2>
-    <label>PR URL
-      <input id="pr-url" placeholder="https://github.com/owner/repo/pull/123" />
-    </label>
-    <div class="grid2">
-      <label>Command
-        <select id="cmd">
-          <option value="review">review</option>
-          <option value="describe">describe</option>
-          <option value="improve">improve</option>
-          <option value="ask">ask</option>
-        </select>
-      </label>
-      <label>OPENROUTER_API_KEY (never saved to disk, localStorage only)
-        <input id="or-key" type="password" placeholder="sk-or-…" />
-      </label>
-    </div>
-    <label id="ask-wrap" class="hidden">Question (for /ask)
-      <input id="ask-q" placeholder="What does this PR change?" />
-    </label>
-    <div class="row wrap">
-      <button id="btn-cli">Copy CLI command</button>
-      <button id="btn-run" class="ghost">Run locally (needs pr-agent installed)</button>
-      <button id="btn-open-pr" class="ghost">Open PR</button>
-      <button id="btn-open-actions" class="ghost">Open Actions</button>
-    </div>
-    <pre id="out">Ready.</pre>
-  </section>
-
-  <section class="card">
-    <h2>3 · Auto-run on Upstash Box</h2>
-    <p class="hint">Provisions a <code>python</code> box named below, uploads the review loop, and sets a cron schedule. Keys stay in memory — pasted below, never written to disk. If this Box key was shared anywhere, rotate it in the Upstash console.</p>
-    <label>UPSTASH_BOX_API_KEY (box_…, memory only)
-      <input id="box-key" type="password" placeholder="box_…" autocomplete="off" />
-    </label>
-    <label>GITHUB_TOKEN (needs repo scope)
-      <input id="gh-key" type="password" placeholder="ghp_… / github_pat_…" autocomplete="off" />
-    </label>
-    <div class="grid2">
-      <label>Box name
-        <input id="box-name" value="pr-agent-runner" />
-      </label>
-      <label>Schedule (UTC cron)
-        <input id="box-cron" value="*/15 * * * *" />
-      </label>
-    </div>
-    <label>Repos to watch (comma separated owner/repo)
-      <input id="box-repos" placeholder="owner/repo, owner/other" />
-    </label>
-    <div class="row wrap">
-      <button id="btn-box-up">Provision + start schedule</button>
-      <button id="btn-box-status" class="ghost">Status</button>
-    </div>
-    <pre id="box-out">Box idle.</pre>
-  </section>
-
-  <section class="card">
-    <h2>4 · GitHub auth (OAuth device flow)</h2>
-    <p class="hint">No backend needed. Create an OAuth App at <code>github.com/settings/developers</code> (enable <b>Device Flow</b>, callback can be <code>http://localhost</code>), paste its Client ID. The token lives in memory only.</p>
-    <label>OAuth App Client ID (memory only)
-      <input id="oauth-client" placeholder="Ov23…" autocomplete="off" />
-    </label>
-    <div class="row wrap">
-      <button id="btn-oauth-start">Start device login</button>
-      <button id="btn-oauth-cancel" class="ghost hidden">Cancel</button>
-      <button id="btn-oauth-open" class="ghost hidden">Open GitHub</button>
-    </div>
-    <div id="oauth-code" class="hidden">
-      <p class="hint">Enter this code on GitHub:</p>
-      <p id="oauth-usercode" class="bigcode">…</p>
-    </div>
-    <div class="row wrap">
-      <input id="oauth-pat" type="password" placeholder="…or paste a PAT (ghp_…, memory only)" autocomplete="off" style="flex:1" />
-      <button id="btn-oauth-pat" class="ghost">Use PAT</button>
-    </div>
-    <pre id="oauth-out">Not authenticated.</pre>
-  </section>
-
-  <section class="card">
-    <h2>5 · Provider: PR-Agent (The-PR-Agent/pr-agent)</h2>
-    <p class="hint">Full review quality. <b>Always online:</b> the Action workflow below runs on every PR event — no PC needed. Local CLI is optional for manual <code>/review</code> runs.</p>
-    <div class="row wrap">
-      <button id="btn-pa-check">Check pr-agent CLI</button>
-      <button id="btn-pa-install" class="ghost">Install CLI (pip)</button>
-      <button id="btn-pa-write" class="ghost">Write Action workflow to this repo</button>
-      <button id="btn-pa-copy" class="ghost">Copy workflow YAML</button>
-    </div>
-    <pre id="pa-out">PR-Agent not checked yet. Needs repo secret OPENROUTER_API_KEY.</pre>
-  </section>
-
-  <section class="card">
-    <h2>6 · Provider: OpenRabbit (aryanbrite/openrabbit)</h2>
-    <p class="hint">Simplest zero-host bot: fully automatic on PR open/sync, posts summary + up to 5 inline suggestions. No config file — everything is workflow inputs. <b>Always online</b> via Actions. Needs repo secret <code>LLM_API_KEY</code> = your OpenRouter key (<code>GITHUB_TOKEN</code> is automatic).</p>
-    <div class="row wrap">
-      <button id="btn-or-write">Write Action workflow to this repo</button>
-      <button id="btn-or-copy" class="ghost">Copy workflow YAML</button>
-    </div>
-    <pre id="or-out">Model pinned: thinkingmachines/inkling-2-small:free (review_mode: both).</pre>
-  </section>
-
-  <section class="card">
-    <h2>8 · Multi-PR Agents (cloud brain)</h2>
-    <p class="hint">Agents live in the backend (<code>backend/main.py</code>). The desktop app only edits them — no tokens are written to disk, backend URL is kept in localStorage.</p>
-    <label>Backend URL
-      <input id="backend-url" value="http://localhost:8000" placeholder="http://localhost:8000" autocomplete="off" />
-    </label>
-    <div class="grid2">
-      <label>Agent name
-        <input id="agent-name" placeholder="reviewer-main" autocomplete="off" />
-      </label>
-      <label>Trigger
-        <select id="agent-trigger">
-          <option value="on_commit">on_commit</option>
-          <option value="on_label">on_label</option>
-          <option value="manual">manual</option>
-        </select>
-      </label>
-    </div>
-    <label>System prompt
-      <textarea id="agent-prompt" rows="4" placeholder="You are a senior reviewer…"></textarea>
-    </label>
-    <label>Target repos (comma separated owner/repo)
-      <input id="agent-repos" placeholder="owner/repo, owner/other" autocomplete="off" />
-    </label>
-    <div class="grid2">
-      <label id="agent-label-wrap">Trigger label (for on_label)
-        <input id="agent-label" placeholder="review-me" autocomplete="off" />
-      </label>
-      <label>Runtime mode
-        <select id="agent-mode">
-          <option value="review_only">review_only</option>
-          <option value="interactive">interactive [Upstash Box]</option>
-          <option value="ephemeral">ephemeral [Vercel Sandbox]</option>
-        </select>
-      </label>
-    </div>
-    <label>Existing agents
-      <select id="agent-select">
-        <option value="">— new agent —</option>
-      </select>
-    </label>
-    <div class="row wrap">
-      <button id="btn-agents-save">Save agent</button>
-      <button id="btn-agents-refresh" class="ghost">Refresh</button>
-      <button id="btn-agents-delete" class="ghost">Delete selected</button>
-    </div>
-    <pre id="agents-out">Agents not loaded.</pre>
-  </section>
-
-  <section class="card">
-    <h2>9 · Background Runs + Quota (syncs while PC was asleep)</h2>
-    <p class="hint">Pulls runs recorded by the backend while this PC was offline. Approve buttons only appear for runs awaiting approval.</p>
-    <div class="row wrap">
-      <button id="btn-runs-sync">Sync runs</button>
-      <button id="btn-quota" class="ghost">Quota</button>
-      <button id="btn-stream" class="ghost">Live: off</button>
-    </div>
-    <div id="quota-bar" class="quota">
-      <div class="quota-row"><span>Upstash Box</span><div class="bar"><div id="quota-box-bar"></div></div></div>
-      <div class="quota-row"><span>Vercel Sandbox</span><div class="bar"><div id="quota-vercel-bar"></div></div></div>
-      <p class="hint" id="quota-text">Quota idle.</p>
-    </div>
-    <pre id="runs-out">Runs not synced.</pre>
-    <div id="runs-list"></div>
-  </section>
-
-  <section class="card">
-    <h2>7 · Raw .pr_agent.toml</h2>
-    <pre id="raw">…</pre>
-  </section>
-</main>
+</div>
 
 <script src="main.js"></script>
 </body>

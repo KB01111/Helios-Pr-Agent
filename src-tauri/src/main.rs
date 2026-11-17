@@ -525,6 +525,234 @@ fn backend_get_quota(backend_url: String) -> Result<String, String> {
     backend_get(&format!("{}/quota", base))
 }
 
+/// GET {backend_url}/config/status — which providers are configured (booleans only, no secrets).
+#[tauri::command]
+fn backend_config_status(backend_url: String) -> Result<String, String> {
+    let base = backend_base(&backend_url)?;
+    backend_get(&format!("{}/config/status", base))
+}
+
+/// POST {backend_url}/config/test {"provider": ...} — live connectivity check (no secrets echoed).
+#[tauri::command]
+fn backend_config_test(
+    backend_url: String,
+    provider: String,
+    api_token: String,
+) -> Result<String, String> {
+    let base = backend_base(&backend_url)?;
+    let p = provider.trim().to_lowercase();
+    let allowed = ["github", "redis", "vercel", "upstash_box", "openrouter"];
+    if !allowed.contains(&p.as_str()) {
+        return Err("unknown provider (use: github, redis, vercel, upstash_box, openrouter)".into());
+    }
+    let mut req = gh_client()?
+        .post(format!("{}/config/test", base))
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({ "provider": p }));
+    if !api_token.trim().is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_token.trim()));
+    }
+    let res = req.send().map_err(|e| format!("backend unreachable: {}", e))?;
+    let status = res.status();
+    let body = res.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("backend HTTP {}: {}", status, body.chars().take(300).collect::<String>()));
+    }
+    Ok(body)
+}
+
+// ---- Integrations: secrets go to backend/.env via Rust (never localStorage) ----
+
+/// Env vars the Integrations card is allowed to write. Anything else is rejected.
+fn allowed_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "GITHUB_TOKEN"
+            | "GITHUB_WEBHOOK_SECRET"
+            | "UPSTASH_BOX_API_KEY"
+            | "UPSTASH_REDIS_REST_URL"
+            | "UPSTASH_REDIS_REST_TOKEN"
+            | "VERCEL_TOKEN"
+            | "VERCEL_API_TOKEN"
+            | "VERCEL_TEAM_ID"
+            | "OPENROUTER_API_KEY"
+            | "LLM_MODEL"
+            | "ALLOWED_ORIGINS"
+            | "BACKEND_API_TOKEN"
+    )
+}
+
+fn find_backend_env() -> Option<PathBuf> {
+    for root in app_root_candidates() {
+        let direct = root.join("backend").join(".env");
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if let Some(parent) = root.parent() {
+            let up = parent.join("backend").join(".env");
+            if up.is_file() {
+                return Some(up);
+            }
+        }
+    }
+    None
+}
+
+fn backend_env_for_write() -> PathBuf {
+    if let Some(p) = find_backend_env() {
+        return p;
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .map(|p| p.join("backend").join(".env"))
+        .unwrap_or_else(|| PathBuf::from("backend/.env"))
+}
+
+/// Write one integration secret into backend/.env (creates the file if needed).
+/// The value is never logged and never touches localStorage — it stays in
+/// Rust + the dotenv file, which is git-ignored.
+#[tauri::command]
+fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
+    let k = key.trim().to_uppercase();
+    if !allowed_env_key(&k) {
+        return Err("refusing to write unknown env key".into());
+    }
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(format!("{} is empty — nothing written", k));
+    }
+    if v.contains('\n') || v.contains('\r') {
+        return Err("value must be a single line".into());
+    }
+    let path = backend_env_for_write();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut lines: Vec<String> = if path.is_file() {
+        std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())?
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec!["# Local only — NEVER commit (gitignored). Managed by PR Agent Control Integrations.".to_string()]
+    };
+    let prefix = format!("{}=", k);
+    let replacement = format!("{}={}", k, v);
+    let mut found = false;
+    for line in lines.iter_mut() {
+        if line.starts_with(&prefix) || line.trim_start().starts_with(&prefix) {
+            *line = replacement.clone();
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        lines.push(replacement);
+    }
+    let mut content = lines.join("\n");
+    content.push('\n');
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// GET https://api.github.com/user/repos — list repos for the sync picker.
+/// Token is passed in memory only, never stored. Returns raw JSON array text.
+#[tauri::command]
+fn github_list_repos(token: String) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let res = gh_client()?
+        .get("https://api.github.com/user/repos?per_page=100&sort=updated")
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|e| format!("GitHub unreachable: {}", e))?;
+    let status = res.status();
+    let body = res.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("GitHub HTTP {}: {}", status, body.chars().take(300).collect::<String>()));
+    }
+    Ok(body)
+}
+
+/// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
+/// with an optional Bearer API token. Keeps secrets out of the webview fetch path
+/// (avoids CORS/preflight issues in Tauri) and never logs tokens.
+#[tauri::command]
+fn backend_mutate(
+    method: String,
+    backend_url: String,
+    path: String,
+    body_json: Option<String>,
+    api_token: Option<String>,
+) -> Result<String, String> {
+    let base = backend_base(&backend_url)?;
+    let p = path.trim();
+    if !p.starts_with('/') {
+        return Err("path must start with '/'".into());
+    }
+    if p.contains("..") || p.contains('\\') {
+        return Err("invalid path".into());
+    }
+    let m = method.trim().to_uppercase();
+    if !["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&m.as_str()) {
+        return Err("method not allowed".into());
+    }
+    let url = format!("{}{}", base, p);
+    let client = gh_client()?;
+    let mut req = match m.as_str() {
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "PATCH" => client.patch(&url),
+        "DELETE" => client.delete(&url),
+        _ => client.get(&url),
+    };
+    req = req.header("Accept", "application/json");
+    if let Some(t) = api_token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    if let Some(b) = body_json.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let v: serde_json::Value =
+            serde_json::from_str(b).map_err(|e| format!("body_json must be valid JSON: {}", e))?;
+        req = req.header("Content-Type", "application/json").json(&v);
+    }
+    let res = req.send().map_err(|e| format!("backend unreachable: {}", e))?;
+    let status = res.status();
+    let body = res.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("backend HTTP {}: {}", status, body.chars().take(500).collect::<String>()));
+    }
+    Ok(body)
+}
+
+/// POST {backend_url}/runs/{run_id}/approve — used by the Runs approve buttons.
+#[tauri::command]
+fn backend_approve_run(
+    backend_url: String,
+    run_id: String,
+    api_token: Option<String>,
+) -> Result<String, String> {
+    let id = run_id.trim();
+    if id.is_empty() {
+        return Err("run_id is required".into());
+    }
+    if id.contains('/') || id.contains("..") || id.contains('\\') {
+        return Err("invalid run_id".into());
+    }
+    backend_mutate(
+        "POST".into(),
+        backend_url,
+        format!("/runs/{}/approve", id),
+        Some("{}".into()),
+        api_token,
+    )
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -545,7 +773,13 @@ pub fn run() {
             backend_health,
             backend_sync_agents,
             backend_get_runs,
-            backend_get_quota
+            backend_get_quota,
+            backend_config_status,
+            backend_config_test,
+            save_backend_env_var,
+            backend_mutate,
+            backend_approve_run,
+            github_list_repos
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
