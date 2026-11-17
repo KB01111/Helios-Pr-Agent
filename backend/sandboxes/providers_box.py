@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from .safety import safe_git_ref, safe_label, safe_repo, shell_quote
+
 log = logging.getLogger(__name__)
 
 DIFF_TRUNCATE = 24000
@@ -39,7 +41,7 @@ class UpstashBoxProvider:
 
         if not api_key:
             logs.append("upstash_box: UPSTASH_BOX_API_KEY missing — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, 60.0)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
         # Try SDK first (optional dependency).
         try:
@@ -52,14 +54,14 @@ class UpstashBoxProvider:
             logs.append("upstash_box: SDK not installed, trying REST.")
         except Exception as exc:
             logs.append(f"upstash_box: SDK error ({type(exc).__name__}) — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, 60.0)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
         try:
             result = await self._run_via_rest(api_key, box_name, agent_config, pr_context, logs)
             return result
         except Exception as exc:
             logs.append(f"upstash_box: REST error ({type(exc).__name__}) — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, 60.0)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
     async def _run_via_sdk(self, Box: Any, api_key: str, box_name: str,
                            agent_config: dict, pr_context: dict,
@@ -132,14 +134,15 @@ class UpstashBoxProvider:
         raise RuntimeError(f"Box REST exec failed (last HTTP {last_status})")
 
     async def _review_fallback(self, agent_config: dict, pr_context: dict,
-                               logs: list[str], cpu_estimate: float) -> dict:
+                               logs: list[str]) -> dict:
         """Run review-only logic but attribute it to upstash_box."""
         from .providers_review import ReviewOnlyProvider
 
         review = ReviewOnlyProvider()
         result = await review.run(agent_config, pr_context)
         result["provider"] = "upstash_box"
-        result["cpu_seconds"] = cpu_estimate
+        # No sandbox was provisioned: never bill quota for the fallback.
+        result["cpu_seconds"] = 0.0
         result["logs"] = logs + result.get("logs", [])
         if result.get("status") == "completed":
             result["status"] = "completed_fallback"
@@ -147,12 +150,14 @@ class UpstashBoxProvider:
 
 
 def _build_script(agent_config: dict, pr_context: dict) -> str:
-    repo = pr_context.get("repo", "")
-    sha = pr_context.get("sha", "")
-    ref = pr_context.get("head_ref", "")
-    prompt = (agent_config.get("system_prompt", "") or "")[:2000].replace("'", "")
+    repo = safe_repo(pr_context.get("repo", ""))
+    ref = safe_git_ref(pr_context.get("head_ref") or pr_context.get("sha") or "")
+    prompt = (agent_config.get("system_prompt", "") or "")[:2000]
+    agent_id = safe_label(agent_config.get("id") or agent_config.get("name"))
+    echo_line = f"agent={agent_id} prompt={prompt[:200]}"
+    clone_url = f"https://github.com/{repo}.git"
     return (
-        f"git clone --depth 50 https://github.com/{repo}.git work 2>&1; "
-        f"cd work && git fetch origin {ref or sha} 2>&1 | head -20; "
-        f"echo 'agent={agent_config.get('id', '')} prompt={prompt[:200]}' | head -5"
+        f"git clone --depth 50 {shell_quote(clone_url)} work 2>&1; "
+        f"cd work && git fetch origin {shell_quote(ref)} 2>&1 | head -20; "
+        f"echo {shell_quote(echo_line)} | head -5"
     )

@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from .safety import safe_git_ref, safe_label, safe_repo, shell_quote
+
 log = logging.getLogger(__name__)
 
 SANDBOX_API = "https://api.vercel.com/v1/sandboxes"
@@ -31,7 +33,7 @@ class VercelSandboxProvider:
 
         if not token:
             logs.append("vercel_sandbox: VERCEL_TOKEN missing — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, elapsed=30.0)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
         import time
         started = time.monotonic()
@@ -45,7 +47,7 @@ class VercelSandboxProvider:
         except Exception as exc:
             elapsed = time.monotonic() - started
             logs.append(f"vercel_sandbox: API error ({type(exc).__name__}) — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, elapsed=elapsed)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
     async def _run_ephemeral(self, token: str, team_id: str | None, project_id: str | None,
                              agent_config: dict, pr_context: dict,
@@ -110,13 +112,14 @@ class VercelSandboxProvider:
         }
 
     async def _review_fallback(self, agent_config: dict, pr_context: dict,
-                               logs: list[str], elapsed: float) -> dict:
+                               logs: list[str]) -> dict:
         from .providers_review import ReviewOnlyProvider
 
         review = ReviewOnlyProvider()
         result = await review.run(agent_config, pr_context)
         result["provider"] = "vercel_sandbox"
-        result["cpu_seconds"] = round(max(elapsed, 30.0), 2)
+        # No sandbox was provisioned: never bill quota for the fallback.
+        result["cpu_seconds"] = 0.0
         result["logs"] = logs + result.get("logs", [])
         if result.get("status") == "completed":
             result["status"] = "completed_fallback"
@@ -124,11 +127,13 @@ class VercelSandboxProvider:
 
 
 def _build_command(agent_config: dict, pr_context: dict) -> str:
-    repo = pr_context.get("repo", "")
-    sha = pr_context.get("sha", "")
+    repo = safe_repo(pr_context.get("repo", ""))
+    sha = safe_git_ref(pr_context.get("sha", ""))
+    agent_id = safe_label(agent_config.get("id") or agent_config.get("name"))
+    clone_url = f"https://github.com/{repo}.git"
     return (
-        f"git clone --depth 50 https://github.com/{repo}.git work 2>&1 | head -5; "
-        f"cd work && git checkout {sha} 2>&1 | head -5; "
+        f"git clone --depth 50 {shell_quote(clone_url)} work 2>&1 | head -5; "
+        f"cd work && git checkout {shell_quote(sha)} 2>&1 | head -5; "
         f"npm run lint 2>&1 | head -40 || npm test 2>&1 | head -40; "
-        f"echo agent={agent_config.get('id', '')} done"
+        f"echo {shell_quote(f'agent={agent_id} done')}"
     )

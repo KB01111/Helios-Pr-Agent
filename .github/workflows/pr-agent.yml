@@ -16,8 +16,20 @@ jobs:
     if: ${{ github.event.sender.type != 'Bot' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Check for OpenRouter key
+        id: key-check
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::OPENROUTER_API_KEY is not configured; skipping PR Agent review."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: PR Agent review
-        uses: the-pr-agent/pr-agent@main
+        if: steps.key-check.outputs.skip != 'true'
+        uses: the-pr-agent/pr-agent@dec3e88c029c0a32957bd95aa694cb34d2b256e0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Get free key at https://openrouter.ai/settings/keys
