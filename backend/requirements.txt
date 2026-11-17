@@ -1,4 +1,4 @@
-fastapi[standard]>=0.115
+fastapi[standard]>=0.163.0
 upstash-redis>=1.9.0
 httpx>=0.28.1
 pydantic>=2.14.3
