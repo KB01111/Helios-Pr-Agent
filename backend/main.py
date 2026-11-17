@@ -528,7 +528,11 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     try:
         await _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks)
     except Exception:
-        # Release the claim so GitHub's retry can recreate the missing runs.
+        # Partial write: nothing was enqueued, so fail the records already
+        # written (no stuck "queued" runs), then release the claim so GitHub's
+        # retry can recreate every run.
+        for rid in run_ids:
+            await asyncio.to_thread(_fail_run, rid, "webhook processing aborted before dispatch")
         try:
             await asyncio.to_thread(store.rdelete, debounce_key)
         except Exception as exc:
@@ -539,6 +543,7 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
 
 
 async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks) -> None:  # type: ignore[no-untyped-def]
+    pending: list[tuple[dict[str, Any], str]] = []
     for agent_cfg in matched:
         run_id = uuid.uuid4().hex[:12]
         record = {
@@ -553,8 +558,11 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
             "logs": [],
         }
         await store.arset_json(f"run:{run_id}", record)
-        tasks.add_task(enqueue_dispatch, agent_cfg, pr_ctx.model_dump(), run_id)
         run_ids.append(run_id)
+        pending.append((agent_cfg, run_id))
+    # Dispatch only once every record is persisted.
+    for agent_cfg, run_id in pending:
+        tasks.add_task(enqueue_dispatch, agent_cfg, pr_ctx.model_dump(), run_id)
 
 
 # ---------------------------------------------------------------------------
