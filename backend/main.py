@@ -575,7 +575,11 @@ _CLAIM_LEASE_S = 60
 async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks) -> None:  # type: ignore[no-untyped-def]
     pending: list[tuple[dict[str, Any], str]] = []
     for agent_cfg in matched:
-        run_id = uuid.uuid4().hex[:12]
+        # Deterministic per (event, agent): if two handlers overlap (e.g. a
+        # lease expired mid-processing) they target the same record, so the
+        # nx write below keeps each agent's run unique.
+        ident = f"{repo}:{pr_number}:{action}:{pr_ctx.label or ''}:{sha}:{agent_cfg.get('id')}"
+        run_id = hashlib.sha256(ident.encode()).hexdigest()[:12]
         record = {
             "run_id": run_id,
             "agent_id": agent_cfg.get("id"),
@@ -587,7 +591,13 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
             "created_at": _now_iso(),
             "logs": [],
         }
-        await store.arset_json(f"run:{run_id}", record)
+        key = f"run:{run_id}"
+        if not await store.arset_json(key, record, nx=True):
+            existing = await store.arget_json(key)
+            if not (isinstance(existing, dict) and existing.get("status") == "failed"):
+                continue  # already created (and dispatched) by another delivery
+            # A previously aborted attempt: recreate so the retry actually runs.
+            await store.arset_json(key, record)
         run_ids.append(run_id)
         pending.append((agent_cfg, run_id))
     # Dispatch only once every record is persisted.
