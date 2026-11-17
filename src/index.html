@@ -308,9 +308,20 @@
             <button id="btn-int-box-save" class="btn btn-accent btn-sm" type="button">Connect Box</button>
           </div>
           <div class="int-row">
-            <span class="int-name"><span class="dot warn" id="dot-redis"></span>Upstash Redis</span>
-            <span class="hint">shared state: agents, runs, quota</span>
+            <span class="int-name"><span class="dot warn" id="dot-redis"></span>Redis (shared state)</span>
+            <span class="hint">shared state: agents, runs, quota · FastAPI Cloud injects REDIS_URL</span>
             <button id="btn-int-redis-test" class="btn btn-ghost btn-sm" type="button">Test</button>
+          </div>
+          <div class="field"><span class="lbl">REDIS_URL (local/self-hosted)</span>
+            <input id="int-redis-conn-url" placeholder="rediss://default:…@host:port" autocomplete="off" />
+          </div>
+          <div class="row wrap">
+            <button id="btn-int-redis-conn-save" class="btn btn-accent btn-sm" type="button">Connect Redis URL</button>
+          </div>
+          <p class="hint">FastAPI Cloud injects <code>REDIS_URL</code> automatically — use this field only for a local/self-hosted backend. Test verifies the deployed backend.</p>
+          <div class="int-row">
+            <span class="int-name">Upstash REST (legacy/optional)</span>
+            <span class="hint">REST URL + token instead of REDIS_URL</span>
           </div>
           <div class="grid2">
             <div class="field"><span class="lbl">REST URL</span>

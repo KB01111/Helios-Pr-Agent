@@ -409,8 +409,8 @@ REAP_INTERVAL_S = 60
 def _reap_stale_queued_runs() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_QUEUED_S)
     try:
-        for k in store.rkeys("run:*"):
-            rec = store.rget_json(k)
+        keys = store.rkeys("run:*")
+        for k, rec in zip(keys, store.rget_json_many(keys)):
             if not isinstance(rec, dict) or rec.get("status") not in ("queued", "running"):
                 continue
             is_running = rec.get("status") == "running"
@@ -521,11 +521,8 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     # Load agent configs first: don't consume the debounce window for events
     # that match no agent (and scope it to the action/label).
     agent_keys = await store.arkeys("agent:*")
-    agents: list[dict[str, Any]] = []
-    for k in agent_keys:
-        cfg = await store.arget_json(k)
-        if isinstance(cfg, dict):
-            agents.append(cfg)
+    agent_configs = await store.arget_json_many(agent_keys)
+    agents = [cfg for cfg in agent_configs if isinstance(cfg, dict)]
     matched = [a for a in agents if _agent_matches(a, repo, action, label)]
     log.info("webhook %s #%d action=%s: %d agents, %d matched", repo, pr_number, action, len(agents), len(matched))
     if not matched:
@@ -657,11 +654,9 @@ def create_agent(agent: AgentConfig, request: Request) -> dict[str, Any]:
 @app.get("/agents")
 def list_agents(request: Request) -> list[dict[str, Any]]:
     _require_auth(request)
-    out: list[dict[str, Any]] = []
-    for k in store.rkeys("agent:*"):
-        cfg = store.rget_json(k)
-        if isinstance(cfg, dict):
-            out.append(cfg)
+    keys = store.rkeys("agent:*")
+    configs = store.rget_json_many(keys)
+    out = [cfg for cfg in configs if isinstance(cfg, dict)]
     out.sort(key=lambda a: str(a.get("id")))
     return out
 
@@ -704,11 +699,9 @@ def delete_agent(agent_id: str, request: Request) -> dict[str, Any]:
 @app.get("/runs")
 def list_runs(request: Request, limit: int = Query(default=50, ge=1, le=500)) -> list[dict[str, Any]]:
     _require_auth(request)
-    out: list[dict[str, Any]] = []
-    for k in store.rkeys("run:*"):
-        rec = store.rget_json(k)
-        if isinstance(rec, dict):
-            out.append(rec)
+    keys = store.rkeys("run:*")
+    records = store.rget_json_many(keys)
+    out = [rec for rec in records if isinstance(rec, dict)]
     out.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
     return out[:limit]
 
@@ -754,8 +747,6 @@ def _configured(value: str | None, min_len: int = 1) -> bool:
 def config_status(request: Request) -> dict[str, Any]:
     """Which providers are configured. Returns booleans/mode only — never secret values."""
     _require_auth(request)
-    redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "")
-    redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
     vercel_token = os.getenv("VERCEL_TOKEN", "") or os.getenv("VERCEL_API_TOKEN", "")
     return {
         "github": {
@@ -763,8 +754,9 @@ def config_status(request: Request) -> dict[str, Any]:
             "token_set": _configured(os.getenv("GITHUB_TOKEN", "")),
         },
         "redis": {
-            "configured": _configured(redis_url) and _configured(redis_token),
+            "configured": store.redis_configured(),
             "mode": store.backend_mode(),
+            "source": store.redis_source(),
         },
         "upstash_box": {
             "configured": _configured(os.getenv("UPSTASH_BOX_API_KEY", ""), min_len=8),
@@ -835,33 +827,35 @@ async def _test_redis() -> dict[str, Any]:
     import time
 
     started = time.monotonic()
-    key = f"__config_test_ping__:{uuid.uuid4().hex}"
+    mode = store.backend_mode()
+    source = store.redis_source()
+    configured = store.redis_configured()
+    error_type = ""
     try:
-        probe = f"ping:{uuid.uuid4().hex[:8]}"
-        if not await store.arset(key, probe, ex=60):
-            raise RuntimeError("write rejected")
-        if await store.arget(key) != probe:
-            raise RuntimeError("roundtrip mismatch")
-        ms = round((time.monotonic() - started) * 1000)
+        ping_ok = await asyncio.to_thread(store.ping)
+    except Exception as exc:  # defensive: ping() normally never raises
+        ping_ok = False
+        error_type = type(exc).__name__
+    ms = round((time.monotonic() - started) * 1000)
+    target = f"mode={mode}" + (f", source={source}" if source else "")
+    if not configured:
         return {
-            "provider": "redis", "ok": True,
-            "configured": store.backend_mode() != "memory",
-            "details": f"Redis roundtrip ok ({ms} ms, mode={store.backend_mode()})",
-            "mode": store.backend_mode(), "latency_ms": ms,
+            "provider": "redis", "ok": False, "configured": False,
+            "details": f"Redis not configured ({ms} ms, {target}); using in-memory store",
+            "mode": mode, "source": source, "latency_ms": ms,
         }
-    except Exception as exc:
+    if ping_ok:
         return {
-            "provider": "redis", "ok": False,
-            "configured": store.backend_mode() != "memory",
-            "details": f"Redis ping failed ({type(exc).__name__}: {exc}); "
-            "falling back to in-memory store",
-            "mode": store.backend_mode(),
+            "provider": "redis", "ok": True, "configured": True,
+            "details": f"Redis ping ok ({ms} ms, {target})",
+            "mode": mode, "source": source, "latency_ms": ms,
         }
-    finally:
-        try:
-            await store.ardelete(key)
-        except Exception as cleanup_exc:
-            log.debug("could not remove Redis test key: %s", cleanup_exc)
+    hint = "check REDIS_URL connectivity" if source == "REDIS_URL" else "check Upstash connectivity"
+    return {
+        "provider": "redis", "ok": False, "configured": True,
+        "details": f"Redis ping failed ({error_type or 'unavailable'}, {target}); {hint}",
+        "mode": mode, "source": source, "latency_ms": ms,
+    }
 
 
 async def _test_vercel() -> dict[str, Any]:
@@ -1054,11 +1048,8 @@ async def events_stream(
         # changes, then replay just the most recent `limit` records.
         try:
             keys = await store.arkeys("run:*")
-            recs: list[dict[str, Any]] = []
-            for k in keys:
-                rec = await store.arget_json(k)
-                if isinstance(rec, dict):
-                    recs.append(rec)
+            records = await store.arget_json_many(keys)
+            recs = [rec for rec in records if isinstance(rec, dict)]
             recs.sort(key=lambda r: str(r.get("created_at", "")))
             for rec in recs:
                 rid = str(rec.get("run_id", ""))
@@ -1073,10 +1064,10 @@ async def events_stream(
         while True:
             try:
                 keys = await store.arkeys("run:*")
+                records = await store.arget_json_many(keys)
                 changed: list[dict[str, Any]] = []
                 live_ids: set[str] = set()
-                for k in keys:
-                    rec = await store.arget_json(k)
+                for k, rec in zip(keys, records):
                     if not isinstance(rec, dict):
                         continue
                     rid = str(rec.get("run_id", "") or k.split("run:", 1)[-1])
@@ -1138,7 +1129,12 @@ def quota(request: Request) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "store": store.backend_mode(), "model": _get_llm_model()}
+    return {
+        "ok": True,
+        "store": store.backend_mode(),
+        "redis_source": store.redis_source(),
+        "model": _get_llm_model(),
+    }
 
 
 @app.get("/")

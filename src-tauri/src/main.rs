@@ -849,6 +849,7 @@ fn allowed_env_key(key: &str) -> bool {
             | "UPSTASH_BOX_API_KEY"
             | "UPSTASH_REDIS_REST_URL"
             | "UPSTASH_REDIS_REST_TOKEN"
+            | "REDIS_URL"
             | "VERCEL_TOKEN"
             | "VERCEL_API_TOKEN"
             | "VERCEL_TEAM_ID"

@@ -96,7 +96,7 @@ function clearSecrets() {
   for (const id of [
     "or-key", "sett-or", "gh-key", "sett-gh", "box-key", "oauth-pat", "api-token",
     "int-gh-token", "int-gh-secret", "int-vercel-token", "int-box-key",
-    "int-redis-url", "int-redis-token", "int-or-key",
+    "int-redis-conn-url", "int-redis-url", "int-redis-token", "int-or-key",
   ]) {
     const el = $(id);
     if (el) el.value = "";
@@ -717,7 +717,9 @@ async function intRefresh() {
     "github: " + (github.token_set ? "token set" : "token MISSING") + " · " + (github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"),
     "vercel: " + (s.vercel ? "configured" + (vercel.team_set ? " (team scoped)" : "") : "not configured"),
     "upstash_box: " + (s.upstash_box ? "configured" : "not configured"),
-    "redis: " + (s.redis ? "configured (mode=" + (redis.mode || "?") + ")" : "not configured (mode=" + (redis.mode || "?") + ")"),
+    "redis: " + (s.redis
+      ? "configured (mode=" + (redis.mode || "?") + ", source=" + (redis.source || "?") + ")"
+      : "not configured — FastAPI Cloud injects REDIS_URL; for local/self-hosted save a Redis URL (or the Upstash REST pair) then Test"),
     "openrouter: " + (s.openrouter ? "configured" : "not configured"),
     "auth: " + (data && data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"),
   ];
@@ -767,7 +769,7 @@ async function intSave(pairs, label) {
     }
     syncSecretInputs();
     if (todo.some(([key]) => key === "GITHUB_TOKEN")) ghLoadRepos();
-    for (const [, id] of pairs) { const el = $(id); if (el) el.value = (id === "int-vercel-team" || id === "int-redis-url") ? el.value : ""; }
+    for (const [, id] of pairs) { const el = $(id); if (el) el.value = (id === "int-vercel-team" || id === "int-redis-url" || id === "int-redis-conn-url") ? el.value : ""; }
     // Clear even saved non-secret fields that hold sensitive-adjacent data? Keep URL/team visible.
     const savedKeys = todo.map(([k]) => k).join(", ");
     intOut("Saved " + savedKeys + " to " + Array.from(paths).join(", ") + ".\nRestart/redeploy the backend so it picks up the new values, then Test.");
@@ -1556,6 +1558,7 @@ function wire() {
   on("btn-int-gh-save", () => intSave([["GITHUB_TOKEN", "int-gh-token"], ["GITHUB_WEBHOOK_SECRET", "int-gh-secret"]], "GitHub"));
   on("btn-int-vercel-save", () => intSave([["VERCEL_TOKEN", "int-vercel-token"], ["VERCEL_TEAM_ID", "int-vercel-team"]], "Vercel"));
   on("btn-int-box-save", () => intSave([["UPSTASH_BOX_API_KEY", "int-box-key"]], "Upstash Box"));
+  on("btn-int-redis-conn-save", () => intSave([["REDIS_URL", "int-redis-conn-url"]], "Redis URL"));
   on("btn-int-redis-save", () => intSave([["UPSTASH_REDIS_REST_URL", "int-redis-url"], ["UPSTASH_REDIS_REST_TOKEN", "int-redis-token"]], "Redis"));
   on("btn-int-or-save", () => intSave([["OPENROUTER_API_KEY", "int-or-key"]], "OpenRouter"));
   if ($("int-cloud-base")) $("int-cloud-base").addEventListener("input", intHookUrl);

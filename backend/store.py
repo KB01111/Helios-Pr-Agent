@@ -1,9 +1,11 @@
 """Shared Redis helper for the PR-Agent cloud backend.
 
 Priority:
-  1. `upstash_redis` package (if installed AND env configured).
-  2. Raw Upstash REST calls via httpx (sync + async variants).
-  3. In-memory dict fallback (local dev without Redis env vars).
+  1. Generic Redis via `REDIS_URL` (redis:// or rediss://), as injected by
+     FastAPI Cloud's Redis integration.
+  2. `upstash_redis` package (if installed AND Upstash REST env configured).
+  3. Raw Upstash REST calls via httpx (sync + async variants).
+  4. In-memory dict fallback (local dev without Redis env vars).
 
 The rest of the backend (main.py, sandboxes/router.py) should import
 from this module so they share one connection/singleton and one
@@ -20,9 +22,11 @@ import os
 import threading
 import time
 import urllib.parse
+import uuid
 
 log = logging.getLogger("pr-agent.store")
 
+_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 _REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 _REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
@@ -33,7 +37,7 @@ _MEM_LOCK = threading.RLock()
 # If Redis credentials are configured, never silently fall back to process
 # memory for writes: in a multi-worker deployment that creates records only
 # one worker can see and then makes reads fail. Fail closed instead.
-_REDIS_CONFIGURED = bool(_REST_URL and _REST_TOKEN)
+_REDIS_CONFIGURED = bool(_REDIS_URL or (_REST_URL and _REST_TOKEN))
 
 
 def _mem_get(key: str) -> str | None:
@@ -75,11 +79,66 @@ def _mem_purge() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Generic Redis client (preferred when REDIS_URL is set)
+# ---------------------------------------------------------------------------
+_REDIS = None
+
+if _REDIS_URL:
+    try:
+        _parsed_url = urllib.parse.urlparse(_REDIS_URL)
+        _scheme = _parsed_url.scheme.lower()
+        _hostname = _parsed_url.hostname
+    except ValueError:  # e.g. malformed IPv6 URL
+        # Do not chain the parser exception: it may echo the URL (and its
+        # password) into logs.
+        raise RuntimeError(
+            "store: REDIS_URL is set but could not be parsed; expected a "
+            "redis:// or rediss:// URL (refusing to fall back to process memory)"
+        ) from None
+    if _scheme not in ("redis", "rediss") or not _hostname:
+        # Fail closed: silently using process memory here would split state
+        # between workers and make writes invisible across the deployment.
+        raise RuntimeError(
+            "store: REDIS_URL is set but is not a valid redis:// or rediss:// URL; "
+            "refusing to fall back to process memory"
+        )
+    try:
+        import redis as _redis_module  # type: ignore
+    except ImportError:  # pragma: no cover - dependency is declared
+        raise RuntimeError(
+            "store: REDIS_URL is set but the 'redis' package is not installed; "
+            "install redis>=5.0 (refusing to fall back to process memory)"
+        ) from None
+    try:
+        # One module-level client/pool per process, shared by all requests.
+        # redis-py clients are thread-safe. TLS is verified by default for
+        # rediss://; never disable it here.
+        _REDIS = _redis_module.Redis.from_url(
+            _REDIS_URL,
+            decode_responses=True,
+            max_connections=8,  # small free-tier connection budget
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+            health_check_interval=30,
+        )
+    except Exception:  # pragma: no cover - import-time config error
+        # Do not chain the original exception: it can contain the URL and
+        # therefore the Redis password.
+        raise RuntimeError(
+            "store: REDIS_URL is set but the Redis client could not be created; "
+            "check the URL format (redis:// or rediss://) and refusing to "
+            "fall back to process memory"
+        ) from None
+    log.info("store: using generic Redis via REDIS_URL")
+
+
+# ---------------------------------------------------------------------------
 # upstash_redis client (optional)
 # ---------------------------------------------------------------------------
 _SDK = None
 try:
-    if _REST_URL and _REST_TOKEN:
+    if _REDIS is None and _REST_URL and _REST_TOKEN:
         from upstash_redis import Redis  # type: ignore
 
         _SDK = Redis(url=_REST_URL, token=_REST_TOKEN)
@@ -90,7 +149,7 @@ except Exception as exc:  # pragma: no cover - import-time fallback
 
 
 def _use_rest() -> bool:
-    return _SDK is None and bool(_REST_URL and _REST_TOKEN)
+    return _REDIS is None and _SDK is None and bool(_REST_URL and _REST_TOKEN)
 
 
 def _rest_headers() -> dict[str, str]:
@@ -118,6 +177,9 @@ def _rest_cmd(*args: str) -> object:
 def rget(key: str) -> str | None:
     """GET a raw string value (or None)."""
     try:
+        if _REDIS is not None:
+            val = _REDIS.get(key)
+            return None if val is None else (val if isinstance(val, str) else str(val))
         if _SDK is not None:
             val = _SDK.get(key)
             return None if val is None else (val if isinstance(val, str) else str(val))
@@ -126,7 +188,7 @@ def rget(key: str) -> str | None:
             return None if res is None else str(res)
     except Exception as exc:
         log.warning("store.rget(%s) failed: %s", key, exc)
-        if _REST_URL and _REST_TOKEN:
+        if _REDIS_CONFIGURED:
             raise
     return _mem_get(key)
 
@@ -134,6 +196,10 @@ def rget(key: str) -> str | None:
 def rset(key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
     """SET a raw string value. Returns False only when NX blocked the write."""
     try:
+        if _REDIS is not None:
+            res = _REDIS.set(key, value, ex=ex, nx=nx)
+            # redis-py returns True on write and None when NX blocks it.
+            return bool(res)
         if _SDK is not None:
             # upstash-redis: set(key, value, ex=..., nx=...)
             kwargs: dict = {}
@@ -166,6 +232,8 @@ def rset(key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
 
 def rincr(key: str, by: int = 1) -> int:
     try:
+        if _REDIS is not None:
+            return int(_REDIS.incrby(key, by))
         if _SDK is not None:
             if by == 1:
                 return int(_SDK.incr(key))  # type: ignore[attr-defined]
@@ -190,6 +258,8 @@ def rincr(key: str, by: int = 1) -> int:
 
 def rdelete(key: str) -> int:
     try:
+        if _REDIS is not None:
+            return int(_REDIS.delete(key))
         if _SDK is not None:
             return int(_SDK.delete(key))  # type: ignore[attr-defined]
         if _use_rest():
@@ -205,6 +275,10 @@ def rdelete(key: str) -> int:
 def rkeys(pattern: str) -> list[str]:
     """List keys matching a glob pattern (supports trailing *)."""
     try:
+        if _REDIS is not None:
+            # SCAN, never KEYS: safe on small free-tier instances and does
+            # not block Redis while iterating.
+            return list(_REDIS.scan_iter(match=pattern, count=500))
         if _SDK is not None:
             keys = _SDK.keys(pattern)  # type: ignore[attr-defined]
             return list(keys or [])
@@ -225,6 +299,56 @@ def rkeys(pattern: str) -> list[str]:
     return _mem_keys(pattern)
 
 
+_MGET_CHUNK = 100
+
+
+def rget_many(keys: list[str]) -> list[str | None]:
+    """MGET raw values for `keys`, returned in the same order.
+
+    Chunked to keep single commands small on free-tier Redis instances.
+    """
+    if not keys:
+        return []
+    try:
+        if _REDIS is not None:
+            out: list[str | None] = []
+            for start in range(0, len(keys), _MGET_CHUNK):
+                chunk = list(keys[start:start + _MGET_CHUNK])
+                vals = _REDIS.mget(chunk)
+                out.extend(
+                    None if val is None else (val if isinstance(val, str) else str(val))
+                    for val in vals
+                )
+            return out
+        if _SDK is not None:
+            getter = getattr(_SDK, "mget", None)
+            if callable(getter):
+                out = []
+                for start in range(0, len(keys), _MGET_CHUNK):
+                    chunk = list(keys[start:start + _MGET_CHUNK])
+                    vals = getter(*chunk)
+                    if not isinstance(vals, (list, tuple)):
+                        vals = [vals]
+                    out.extend(None if val is None else str(val) for val in vals)
+                return out
+            return [rget(k) for k in keys]
+        if _use_rest():
+            out = []
+            for start in range(0, len(keys), _MGET_CHUNK):
+                chunk = list(keys[start:start + _MGET_CHUNK])
+                vals = _rest_cmd("MGET", *chunk)
+                if isinstance(vals, list) and len(vals) == len(chunk):
+                    out.extend(None if val is None else str(val) for val in vals)
+                else:  # unexpected response shape: keep order with GETs
+                    out.extend(rget(k) for k in chunk)
+            return out
+    except Exception as exc:
+        log.warning("store.rget_many(%d keys) failed: %s", len(keys), exc)
+        if _REDIS_CONFIGURED:
+            raise
+    return [_mem_get(k) for k in keys]
+
+
 # ---------------------------------------------------------------------------
 # JSON convenience helpers (values stored as JSON strings)
 # ---------------------------------------------------------------------------
@@ -237,6 +361,20 @@ def rget_json(key: str) -> object | None:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return raw
+
+
+def rget_json_many(keys: list[str]) -> list[object | None]:
+    """Decoded JSON values for `keys`, in the same order (None if absent)."""
+    out: list[object | None] = []
+    for raw in rget_many(keys):
+        if raw is None:
+            out.append(None)
+            continue
+        try:
+            out.append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            out.append(raw)
+    return out
 
 
 def rset_json(key: str, obj: object, ex: int | None = None, nx: bool = False) -> bool:
@@ -273,6 +411,14 @@ async def arkeys(pattern: str) -> list[str]:
     return await _to_thread(rkeys, pattern)
 
 
+async def arget_many(keys: list[str]) -> list[str | None]:
+    return await _to_thread(rget_many, keys)
+
+
+async def arget_json_many(keys: list[str]) -> list[object | None]:
+    return await _to_thread(rget_json_many, keys)
+
+
 async def arget_json(key: str) -> object | None:
     return await _to_thread(rget_json, key)
 
@@ -281,8 +427,66 @@ async def arset_json(key: str, obj: object, ex: int | None = None, nx: bool = Fa
     return await _to_thread(rset_json, key, obj, ex=ex, nx=nx)
 
 
+def _ping_roundtrip() -> bool:
+    """SET/GET/DEL probe used when the backend has no cheap PING."""
+    key = f"__store_ping__:{uuid.uuid4().hex}"
+    try:
+        if not rset(key, "1", ex=30):
+            return False
+        return rget(key) == "1"
+    finally:
+        try:
+            rdelete(key)
+        except Exception:
+            pass
+
+
+def ping() -> bool:
+    """Liveness check for the active backend. Never raises, never leaks secrets."""
+    try:
+        if _REDIS is not None:
+            return bool(_REDIS.ping())
+        if _SDK is not None:
+            pinger = getattr(_SDK, "ping", None)
+            if callable(pinger):
+                try:
+                    return bool(pinger())
+                except Exception:
+                    pass  # PING unsupported: fall back to a roundtrip probe
+            return _ping_roundtrip()
+        if _use_rest():
+            try:
+                if str(_rest_cmd("PING")).upper() == "PONG":
+                    return True
+            except Exception:
+                pass  # PING unsupported: fall back to a roundtrip probe
+            return _ping_roundtrip()
+        with _MEM_LOCK:
+            _mem_set("__store_ping__", "1", ex=5)
+            return _mem_get("__store_ping__") == "1"
+    except Exception as exc:
+        log.warning("store.ping failed (%s)", type(exc).__name__)
+        return False
+
+
+def redis_source() -> str:
+    """Active Redis config source without exposing the URL/token."""
+    if _REDIS is not None:
+        return "REDIS_URL"
+    if _SDK is not None or _use_rest():
+        return "upstash"
+    return ""
+
+
+def redis_configured() -> bool:
+    """True when a shared Redis backend is configured (not process memory)."""
+    return _REDIS_CONFIGURED
+
+
 def backend_mode() -> str:
     """Return which storage backend is active (for /health diagnostics)."""
+    if _REDIS is not None:
+        return "redis"
     if _SDK is not None:
         return "upstash-sdk"
     if _use_rest():
@@ -320,6 +524,8 @@ def incr_quota(provider: str, seconds: float) -> float:
             return nxt
     # rincr is int-based; keep fractional via read-modify-write fallback.
     try:
+        if _REDIS is not None:
+            return float(_REDIS.incrbyfloat(key, float(seconds)))
         if _SDK is not None and hasattr(_SDK, "incrbyfloat"):
             return float(_SDK.incrbyfloat(key, seconds))  # type: ignore[attr-defined]
         if _use_rest():

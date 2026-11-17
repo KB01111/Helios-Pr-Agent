@@ -17,6 +17,7 @@ Both run on **OpenRouter free models** (default
 |---|---|
 | `src/` | Tauri frontend (tabbed UI: Review, Agents & repo sync, Runs, Quota, Providers, Integrations, Settings) |
 | `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), and the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`) |
+| `backend/` | FastAPI webhook/event brain, agent/run API, quota, and Redis-backed shared state (`REDIS_URL` on FastAPI Cloud, or Upstash REST) |
 | `upstash-box/` | Node provisioner + Python cron script that auto-reviews open PRs on a schedule (runs on Upstash Box free tier) |
 | `.pr_agent.toml` | PR-Agent config for this repo (free OpenRouter model + `openrouter/free` fallback) |
 | `.github/workflows/pr-agent.yml` | PR-Agent GitHub Action for this repo |
@@ -53,7 +54,8 @@ Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11).
 - GitHub OAuth/PAT tokens used by the desktop app stay in memory/sessionStorage only; the
   1-click GitHub setup can opt in to also saving the token to `backend/.env` (see below).
 - The backend loads `backend/.env` (then repo-root `.env`) at startup; real process env vars
-  always win over file values.
+  always win over file values. On FastAPI Cloud, `REDIS_URL` is injected by the Redis Cloud
+  integration and is never written to the repo.
 - After cloning, add the Actions secret `OPENROUTER_API_KEY` (your OpenRouter key) to any
   repo using these workflows, otherwise the Actions fail on missing secrets.
 - `.env` files are git-ignored — copy `.env.example` / `upstash-box/.env.example` to start.
@@ -71,7 +73,7 @@ the new values.
 | GitHub | PAT (`repo` scope) + webhook secret | `GET api.github.com/user` with the token |
 | Vercel Sandbox | `VERCEL_TOKEN` (+ optional `VERCEL_TEAM_ID`) | `GET api.vercel.com/v2/user` |
 | Upstash Box | `UPSTASH_BOX_API_KEY` | key format + non-destructive API reachability probe |
-| Upstash Redis | REST URL + token | write/read roundtrip (`PING`) |
+| Redis | `REDIS_URL` (FastAPI Cloud / Redis Cloud) or Upstash REST URL + token | `PING` (fallback write/read roundtrip) |
 | OpenRouter | `OPENROUTER_API_KEY` | `GET openrouter.ai/api/v1/auth/key` |
 
 `GET /config/status` returns booleans/mode only — secret values are never echoed.
@@ -135,6 +137,32 @@ match the backend's `GITHUB_WEBHOOK_SECRET` — the same one used when creating 
 
 The manual webhook and OAuth instructions below remain valid as a fallback.
 
+### Redis (FastAPI Cloud / Redis Cloud)
+
+For the deployed backend, connect the Redis Cloud integration in the FastAPI Cloud app
+(**Integrations → Redis Cloud** → create or select the free database). FastAPI Cloud
+injects the connection string as `REDIS_URL`; no Redis secret needs to be pasted into the
+desktop app. Redeploy after connecting.
+
+The backend accepts either:
+
+- `REDIS_URL=rediss://default:...@host:port` — FastAPI Cloud, Redis Cloud, or local Redis.
+- `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` — the existing Upstash REST path.
+
+`REDIS_URL` wins when both are present. The generic client uses one connection pool per
+process, `SCAN` instead of `KEYS`, and `MGET` for list/replay reads, which keeps command
+count and connection churn low on the free tier. Use one small database and avoid running
+many backend replicas against the same free database.
+
+Check it with `GET /health` (`"store": "redis"`) or Integrations → Redis → **Test**.
+`GET /config/status` reports `source: "REDIS_URL"` without echoing the URL.
+
+To configure a local or self-hosted backend from the app, paste the URL into
+Integrations → Redis → **Redis URL** and click **Connect Redis URL**. That writes
+`backend/.env` (git-ignored); restart the backend afterwards. For FastAPI Cloud, set
+`REDIS_URL` in the app's environment variables instead — the desktop button only writes a
+local `backend/.env`.
+
 ### GitHub webhook URL (copy-paste)
 
 1. Deploy the backend (see below) to get a public base URL, e.g. `https://your-app.vercel.app`.
@@ -161,6 +189,10 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 # or: fastapi deploy  (entrypoint: backend.main:app, see pyproject.toml)
 ```
 
+On FastAPI Cloud, add the Redis Cloud integration in the app's Integrations tab; the
+platform injects `REDIS_URL` automatically and redeploys the backend. `redis>=5` is
+declared in `pyproject.toml` and `backend/requirements.txt`.
+
 Health: `GET /health` · status: `GET /config/status` (auth when a token is set) · docs: `/docs`.
 
 ### Env vars
@@ -170,7 +202,7 @@ Health: `GET /health` · status: `GET /config/status` (auth when a token is set)
 | `GITHUB_WEBHOOK_SECRET` | verifying `X-Hub-Signature-256` on `/webhooks/github` | empty = dev mode (accepts unsigned, logs warning) |
 | `GITHUB_TOKEN` | fetching diffs + posting review comments | — |
 | `OPENROUTER_API_KEY` / `LLM_MODEL` | reviews | model default `thinkingmachines/inkling-2-small:free` |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | shared state (agents, runs, quota) | unset = in-memory fallback |
+| `REDIS_URL` **or** `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | shared state (agents, runs, quota). `REDIS_URL` wins when both are set; FastAPI Cloud injects it from the Redis Cloud integration | unset = in-memory fallback |
 | `UPSTASH_BOX_API_KEY` | interactive (warm-box) runs | — |
 | `VERCEL_TOKEN` (or `VERCEL_API_TOKEN`), `VERCEL_TEAM_ID` | ephemeral sandbox runs | — |
 | `BACKEND_API_TOKEN` | Bearer auth on agent/run/quota/config-status + `/config/test` endpoints | empty = open (local dev only) |
@@ -179,5 +211,6 @@ Health: `GET /health` · status: `GET /config/status` (auth when a token is set)
 | `PORT` / `LOG_LEVEL` | server | `8000` / `INFO` |
 
 Production checklist: set `BACKEND_API_TOKEN` (long random), set `ALLOWED_ORIGINS`
-to your exact origins, set `GITHUB_WEBHOOK_SECRET`, and never commit `.env`
-(files are git-ignored; CI uses Actions secrets instead).
+to your exact origins, set `GITHUB_WEBHOOK_SECRET`, connect the Redis Cloud integration
+(or set `REDIS_URL` / Upstash REST vars), and never commit `.env` (files are git-ignored;
+CI uses Actions secrets instead).
