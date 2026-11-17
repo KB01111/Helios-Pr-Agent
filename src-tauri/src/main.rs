@@ -469,6 +469,62 @@ fn github_login(token: String) -> Result<String, String> {
     github_login_inner(&gh_client()?, token.trim())
 }
 
+// ---- Cloud-brain backend proxies (no tokens logged, no secrets stored) ----
+fn backend_base(url: &str) -> Result<String, String> {
+    let b = url.trim().trim_end_matches('/').to_string();
+    if b.is_empty() {
+        return Err("backend_url is required".into());
+    }
+    if !(b.starts_with("http://") || b.starts_with("https://")) {
+        return Err("backend_url must start with http(s)://".into());
+    }
+    Ok(b)
+}
+
+fn backend_get(url: &str) -> Result<String, String> {
+    let res = gh_client()?
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|e| format!("backend unreachable: {}", e))?;
+    let status = res.status();
+    let body = res.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("backend HTTP {}: {}", status, body.chars().take(300).collect::<String>()));
+    }
+    Ok(body)
+}
+
+/// GET {backend_url}/health — connectivity check.
+#[tauri::command]
+fn backend_health(backend_url: String) -> Result<String, String> {
+    let base = backend_base(&backend_url)?;
+    backend_get(&format!("{}/health", base))
+}
+
+/// GET {backend_url}/agents — list agents (UI does POST/PUT/DELETE via fetch).
+/// `agents_json` is accepted for API symmetry and currently ignored.
+#[tauri::command]
+fn backend_sync_agents(backend_url: String, agents_json: String) -> Result<String, String> {
+    let _ = agents_json;
+    let base = backend_base(&backend_url)?;
+    backend_get(&format!("{}/agents", base))
+}
+
+/// GET {backend_url}/runs?limit=50 — recent background runs.
+#[tauri::command]
+fn backend_get_runs(backend_url: String) -> Result<String, String> {
+    let base = backend_base(&backend_url)?;
+    backend_get(&format!("{}/runs?limit=50", base))
+}
+
+/// GET {backend_url}/quota — Upstash Box / Vercel Sandbox usage.
+#[tauri::command]
+fn backend_get_quota(backend_url: String) -> Result<String, String> {
+    let base = backend_base(&backend_url)?;
+    backend_get(&format!("{}/quota", base))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -485,7 +541,11 @@ pub fn run() {
             write_workflow,
             github_device_start,
             github_device_poll,
-            github_login
+            github_login,
+            backend_health,
+            backend_sync_agents,
+            backend_get_runs,
+            backend_get_quota
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

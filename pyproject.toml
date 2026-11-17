@@ -1,0 +1,16 @@
+[project]
+name = "helios-pr-agent-backend"
+version = "0.1.0"
+description = "PR-Agent cloud backend (always-on event brain + hybrid sandbox router)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi[standard]>=0.115",
+  "upstash-redis>=1.0",
+  "httpx>=0.27",
+  "pydantic>=2.0",
+  "uvicorn>=0.30",
+]
+
+[tool.fastapi]
+entrypoint = "backend.main:app"

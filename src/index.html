@@ -158,6 +158,72 @@
   </section>
 
   <section class="card">
+    <h2>8 · Multi-PR Agents (cloud brain)</h2>
+    <p class="hint">Agents live in the backend (<code>backend/main.py</code>). The desktop app only edits them — no tokens are written to disk, backend URL is kept in localStorage.</p>
+    <label>Backend URL
+      <input id="backend-url" value="http://localhost:8000" placeholder="http://localhost:8000" autocomplete="off" />
+    </label>
+    <div class="grid2">
+      <label>Agent name
+        <input id="agent-name" placeholder="reviewer-main" autocomplete="off" />
+      </label>
+      <label>Trigger
+        <select id="agent-trigger">
+          <option value="on_commit">on_commit</option>
+          <option value="on_label">on_label</option>
+          <option value="manual">manual</option>
+        </select>
+      </label>
+    </div>
+    <label>System prompt
+      <textarea id="agent-prompt" rows="4" placeholder="You are a senior reviewer…"></textarea>
+    </label>
+    <label>Target repos (comma separated owner/repo)
+      <input id="agent-repos" placeholder="owner/repo, owner/other" autocomplete="off" />
+    </label>
+    <div class="grid2">
+      <label id="agent-label-wrap">Trigger label (for on_label)
+        <input id="agent-label" placeholder="review-me" autocomplete="off" />
+      </label>
+      <label>Runtime mode
+        <select id="agent-mode">
+          <option value="review_only">review_only</option>
+          <option value="interactive">interactive [Upstash Box]</option>
+          <option value="ephemeral">ephemeral [Vercel Sandbox]</option>
+        </select>
+      </label>
+    </div>
+    <label>Existing agents
+      <select id="agent-select">
+        <option value="">— new agent —</option>
+      </select>
+    </label>
+    <div class="row wrap">
+      <button id="btn-agents-save">Save agent</button>
+      <button id="btn-agents-refresh" class="ghost">Refresh</button>
+      <button id="btn-agents-delete" class="ghost">Delete selected</button>
+    </div>
+    <pre id="agents-out">Agents not loaded.</pre>
+  </section>
+
+  <section class="card">
+    <h2>9 · Background Runs + Quota (syncs while PC was asleep)</h2>
+    <p class="hint">Pulls runs recorded by the backend while this PC was offline. Approve buttons only appear for runs awaiting approval.</p>
+    <div class="row wrap">
+      <button id="btn-runs-sync">Sync runs</button>
+      <button id="btn-quota" class="ghost">Quota</button>
+      <button id="btn-stream" class="ghost">Live: off</button>
+    </div>
+    <div id="quota-bar" class="quota">
+      <div class="quota-row"><span>Upstash Box</span><div class="bar"><div id="quota-box-bar"></div></div></div>
+      <div class="quota-row"><span>Vercel Sandbox</span><div class="bar"><div id="quota-vercel-bar"></div></div></div>
+      <p class="hint" id="quota-text">Quota idle.</p>
+    </div>
+    <pre id="runs-out">Runs not synced.</pre>
+    <div id="runs-list"></div>
+  </section>
+
+  <section class="card">
     <h2>7 · Raw .pr_agent.toml</h2>
     <pre id="raw">…</pre>
   </section>
