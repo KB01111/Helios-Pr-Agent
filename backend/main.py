@@ -17,14 +17,32 @@ import hmac
 import json
 import logging
 import os
+import re
 import uuid
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+# Load local .env files before importing store: store snapshots the Redis env
+# vars at import time. Real process env always wins over file values, and
+# backend/.env (written by the desktop Integrations tab) wins over repo-root
+# .env because it is loaded first.
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - dependency is declared in requirements
+    load_dotenv = None  # type: ignore[assignment]
+
+if load_dotenv is not None:
+    _BACKEND_DIR = Path(__file__).resolve().parent
+    for _env_path in (_BACKEND_DIR / ".env", _BACKEND_DIR.parent / ".env"):
+        if _env_path.is_file():
+            load_dotenv(_env_path, override=False, interpolate=False)
 
 try:
     # Works when cwd=backend (`uvicorn main:app`) or with PYTHONPATH=backend.
@@ -66,16 +84,28 @@ def _get_api_token() -> str:
     return os.getenv("BACKEND_API_TOKEN", "").strip() or BACKEND_API_TOKEN
 
 
-def _auth_ok(request: Request) -> bool:
+def _constant_time_equal(left: str, right: str) -> bool:
+    """Compare credentials without raising on non-ASCII input."""
+    try:
+        return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    except (AttributeError, UnicodeEncodeError, TypeError):
+        return False
+
+
+def _auth_ok(request: Request, *, allow_query_token: bool = False) -> bool:
     token = _get_api_token()
     if not token:
         return True
     auth = (request.headers.get("Authorization") or "").strip()
-    if auth and hmac.compare_digest(auth, f"Bearer {token}"):
+    if auth and _constant_time_equal(auth, f"Bearer {token}"):
         return True
-    # EventSource cannot set headers — allow ?token= for the SSE stream.
+    # EventSource cannot set headers, so only the SSE endpoint opts into
+    # ?token=. Other endpoints require the Authorization header to keep
+    # long-lived URLs (and proxy logs) free of credentials.
+    if not allow_query_token:
+        return False
     q = request.query_params.get("token", "")
-    return bool(q) and hmac.compare_digest(q, token)
+    return bool(q) and _constant_time_equal(q, token)
 
 
 def _require_auth(request: Request) -> None:
@@ -103,9 +133,11 @@ QUOTA_LIMIT = 18_000
 DEBOUNCE_TTL_S = 45
 
 # Only these PR actions may trigger runs. Anything else is acked+skipped.
-# NOTE: "reopened" is intentionally excluded — reopen already emits "opened"
-# semantics for our use-case; keeping the allowlist tight reduces surprise runs.
-VALID_PR_ACTIONS = {"opened", "synchronize", "labeled"}
+VALID_PR_ACTIONS = {"opened", "reopened", "synchronize", "labeled"}
+
+# GitHub repository names are `owner/name`; validate before using them in
+# downstream API URLs or sandbox shell commands.
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 
 # ---------------------------------------------------------------------------
 # Models
@@ -128,6 +160,8 @@ class PRContext(BaseModel):
     sha: str
     action: str
     label: str | None = None
+    title: str = ""
+    head_ref: str = ""
 
 
 class ApproveBody(BaseModel):
@@ -166,7 +200,7 @@ def _verify_signature(raw: bytes, signature: str | None) -> bool:
     if not signature:
         return False
     mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={mac}", signature)
+    return _constant_time_equal(f"sha256={mac}", signature)
 
 
 def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | None) -> bool:
@@ -180,7 +214,7 @@ def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | N
         if not label:
             return False
         return trigger == "on_label" and (agent.get("trigger_label") or "") == label
-    if action in ("opened", "synchronize"):
+    if action in ("opened", "reopened", "synchronize"):
         return trigger == "on_commit"
     return False
 
@@ -188,6 +222,28 @@ def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | N
 # ---------------------------------------------------------------------------
 # Background dispatch (lazy router import to avoid startup cycles)
 # ---------------------------------------------------------------------------
+
+
+def _run_worker_count() -> int:
+    try:
+        return max(1, min(int(os.getenv("RUN_WORKERS", "4")), 32))
+    except ValueError:
+        return 4
+
+
+# Dedicated pool: a slow provider must not exhaust Starlette's shared sync
+# threadpool and stall /health, /agents, /runs, etc.
+_RUN_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_run_worker_count(), thread_name_prefix="pr-agent-run"
+)
+
+
+def enqueue_dispatch(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
+    """Enqueue a run without blocking the request or the shared threadpool."""
+    try:
+        _RUN_EXECUTOR.submit(dispatch_run, agent_cfg, pr, run_id)
+    except RuntimeError as exc:  # executor already shut down
+        log.error("dispatch run=%s could not be queued: %s", run_id, exc)
 
 
 def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
@@ -206,7 +262,7 @@ def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> 
                 import store as _store
             except ImportError:
                 from backend import store as _store  # type: ignore[no-redef]
-            router = SandboxRouter(_store)
+            router = SandboxRouter(_store, limit=_get_quota_limit())
         except Exception as exc:
             log.warning("dispatch run=%s: SandboxRouter unavailable (%s); review_only fallback", run_id, exc)
             router = None
@@ -219,32 +275,85 @@ def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> 
         else:
             result = {"status": "completed", "provider": "review_only", "logs": ["router missing; recorded as review_only"]}
 
+        result_logs = result.get("logs")
+        if not isinstance(result_logs, list):
+            result_logs = [str(result_logs)] if result_logs else []
+
+        current = store.rget_json(f"run:{run_id}")
+        if not isinstance(current, dict):
+            current = {}
+        current_logs = current.get("logs")
+        if not isinstance(current_logs, list):
+            current_logs = []
+
         patch = {
-            # NOTE: quota is incremented inside SandboxRouter only on
-            # successful runs (status startswith "completed") — never here,
-            # so failures/retries don't burn quota.
+            # NOTE: quota is incremented inside SandboxRouter only for real
+            # sandbox runs (status == "completed") — never here, so failures,
+            # retries, and review fallbacks don't burn quota.
             "status": result.get("status", "completed"),
             "provider": result.get("provider", agent_cfg.get("runtime_mode", "review_only")),
             "diff": result.get("diff"),
             "cpu_seconds": result.get("cpu_seconds", 0),
             "finished_at": _now_iso(),
-            "logs": (store.rget_json(f"run:{run_id}") or {}).get("logs", []) + list(result.get("logs", [])),
+            "logs": [str(item) for item in current_logs + result_logs],
         }
-        cur = store.rget_json(f"run:{run_id}") or {}
-        cur.update(patch)
-        store.rset_json(f"run:{run_id}", cur)
+        current.update(patch)
+        store.rset_json(f"run:{run_id}", current)
         log.info("dispatch run=%s finished status=%s", run_id, patch["status"])
     except Exception as exc:  # never let background errors go silent
         log.exception("dispatch run=%s failed: %s", run_id, exc)
         try:
-            cur = store.rget_json(f"run:{run_id}") or {}
-            cur.update({"status": "failed", "finished_at": _now_iso()})
-            logs = list(cur.get("logs", []))
+            current = store.rget_json(f"run:{run_id}")
+            if not isinstance(current, dict):
+                current = {}
+            current.update({"status": "failed", "finished_at": _now_iso()})
+            logs = current.get("logs")
+            if not isinstance(logs, list):
+                logs = []
             logs.append(f"ERROR: {exc}")
-            cur["logs"] = logs
-            store.rset_json(f"run:{run_id}", cur)
+            current["logs"] = [str(item) for item in logs]
+            store.rset_json(f"run:{run_id}", current)
         except Exception:
             pass
+
+
+# Queued runs are held only in this process. After a restart, records older
+# than this deadline are marked failed instead of staying queued forever.
+STALE_QUEUED_S = 15 * 60
+
+
+def _reap_stale_queued_runs() -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_QUEUED_S)
+    try:
+        for k in store.rkeys("run:*"):
+            rec = store.rget_json(k)
+            if not isinstance(rec, dict) or rec.get("status") != "queued":
+                continue
+            try:
+                created = datetime.fromisoformat(str(rec.get("created_at", "")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created >= cutoff:
+                continue
+            rec["status"] = "failed"
+            rec["finished_at"] = _now_iso()
+            logs = rec.get("logs")
+            if not isinstance(logs, list):
+                logs = []
+            logs = [str(item) for item in logs]
+            logs.append("ERROR: run was interrupted by a backend restart before dispatch completed")
+            rec["logs"] = logs
+            store.rset_json(k, rec)
+            log.warning("reaped stale queued run=%s", rec.get("run_id"))
+    except Exception as exc:
+        log.warning("stale-run reaper failed: %s", exc)
+
+
+@app.on_event("startup")
+def _startup_reap() -> None:
+    _reap_stale_queued_runs()
 
 
 # ---------------------------------------------------------------------------
@@ -263,41 +372,72 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         payload = json.loads(raw.decode("utf-8") or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(status_code=400, detail="invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid payload")
 
-    sender = payload.get("sender") or {}
-    if sender.get("type") == "Bot":
+    sender = payload.get("sender")
+    if isinstance(sender, dict) and sender.get("type") == "Bot":
         return JSONResponse({"skipped": "bot"}, status_code=202)
 
-    pr = payload.get("pull_request") or {}
-    action = payload.get("action", "")
-    if not pr or action not in VALID_PR_ACTIONS:
+    pr = payload.get("pull_request")
+    raw_action = payload.get("action", "")
+    action = raw_action if isinstance(raw_action, str) else ""
+    if not isinstance(pr, dict) or not pr or action not in VALID_PR_ACTIONS:
         return JSONResponse({"skipped": action or "no-pull_request"}, status_code=202)
 
-    repo = ((payload.get("repository") or {}).get("full_name")) or ""
-    pr_number = int(pr.get("number", 0))
-    sha = (pr.get("head") or {}).get("sha", "")
-    label = (payload.get("label") or {}).get("name") if action == "labeled" else None
+    repository = payload.get("repository")
+    repo = (repository.get("full_name") if isinstance(repository, dict) else "") or ""
+    repo = repo if isinstance(repo, str) else ""
+    try:
+        pr_number = int(pr.get("number", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid pr_number")
+    head = pr.get("head")
+    sha = (head.get("sha") if isinstance(head, dict) else "") or ""
+    sha = sha if isinstance(sha, str) else ""
+    head_ref = (head.get("ref") if isinstance(head, dict) else "") or ""
+    head_ref = head_ref if isinstance(head_ref, str) else ""
+    title = pr.get("title") if isinstance(pr.get("title"), str) else ""
+    label_obj = payload.get("label")
+    label = (label_obj.get("name") if isinstance(label_obj, dict) else None) if action == "labeled" else None
+    label = label if isinstance(label, str) and label else None
     if action == "labeled" and not label:
         return JSONResponse({"skipped": "labeled-without-label"}, status_code=202)
     if not repo or not pr_number:
         raise HTTPException(status_code=400, detail="missing repo/pr_number")
+    if not _REPO_RE.fullmatch(repo):
+        raise HTTPException(status_code=400, detail="invalid repository name")
+    _owner, _name = repo.split("/", 1)
+    if _owner in (".", "..") or _name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid repository name")
 
-    # Debounce: one trigger per PR per 45s.
-    debounce_key = f"debounce:{repo}:{pr_number}"
-    if not store.rset(debounce_key, "1", ex=DEBOUNCE_TTL_S, nx=True):
-        return JSONResponse({"debounced": True}, status_code=202)
-
-    # Load agent configs.
-    agent_keys = store.rkeys("agent:*")
+    # Load agent configs first: don't consume the debounce window for events
+    # that match no agent (and scope it to the action/label).
+    agent_keys = await store.arkeys("agent:*")
     agents: list[dict[str, Any]] = []
     for k in agent_keys:
-        cfg = store.rget_json(k)
+        cfg = await store.arget_json(k)
         if isinstance(cfg, dict):
             agents.append(cfg)
     matched = [a for a in agents if _agent_matches(a, repo, action, label)]
     log.info("webhook %s #%d action=%s: %d agents, %d matched", repo, pr_number, action, len(agents), len(matched))
+    if not matched:
+        return JSONResponse({"accepted": True, "runs": [], "matched": 0}, status_code=202)
 
-    pr_ctx = PRContext(repo=repo, pr_number=pr_number, sha=sha, action=action, label=label)
+    # Debounce: one trigger per PR/action/label per 45s.
+    debounce_key = f"debounce:{repo}:{pr_number}:{action}:{label or ''}"
+    if not await store.arset(debounce_key, "1", ex=DEBOUNCE_TTL_S, nx=True):
+        return JSONResponse({"debounced": True}, status_code=202)
+
+    pr_ctx = PRContext(
+        repo=repo,
+        pr_number=pr_number,
+        sha=sha,
+        action=action,
+        label=label,
+        title=title,
+        head_ref=head_ref,
+    )
     run_ids: list[str] = []
     for agent_cfg in matched:
         run_id = uuid.uuid4().hex[:12]
@@ -312,8 +452,8 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
             "created_at": _now_iso(),
             "logs": [],
         }
-        store.rset_json(f"run:{run_id}", record)
-        tasks.add_task(dispatch_run, agent_cfg, pr_ctx.model_dump(), run_id)
+        await store.arset_json(f"run:{run_id}", record)
+        tasks.add_task(enqueue_dispatch, agent_cfg, pr_ctx.model_dump(), run_id)
         run_ids.append(run_id)
 
     return JSONResponse({"accepted": True, "runs": run_ids}, status_code=202)
@@ -328,10 +468,18 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
 def create_agent(agent: AgentConfig, request: Request) -> dict[str, Any]:
     _require_auth(request)
     data = agent.model_dump()
-    if not data["id"]:
-        # Slug from name, else random.
+    if data["id"]:
+        if isinstance(store.rget_json(f"agent:{data['id']}"), dict):
+            raise HTTPException(status_code=409, detail="agent id already exists")
+    else:
+        # Slug from name, else random. Avoid silently overwriting an existing id.
         slug = "".join(c.lower() if c.isalnum() else "-" for c in data["name"]).strip("-") or "agent"
-        data["id"] = f"{slug}-{uuid.uuid4().hex[:6]}"
+        for _ in range(5):
+            data["id"] = f"{slug}-{uuid.uuid4().hex[:6]}"
+            if not isinstance(store.rget_json(f"agent:{data['id']}"), dict):
+                break
+        else:
+            raise HTTPException(status_code=409, detail="could not allocate a unique agent id")
     store.rset_json(f"agent:{data['id']}", data)
     return data
 
@@ -410,6 +558,8 @@ def approve_run(run_id: str, request: Request, body: ApproveBody = Body(default_
     rec = store.rget_json(f"run:{run_id}")
     if not isinstance(rec, dict):
         raise HTTPException(status_code=404, detail="run not found")
+    if rec.get("status") != "queued":
+        raise HTTPException(status_code=409, detail="only queued runs can be approved")
     rec["status"] = "approved"
     rec["approved_by"] = body.approved_by
     rec["approved_at"] = _now_iso()
@@ -431,8 +581,9 @@ def _configured(value: str | None, min_len: int = 1) -> bool:
 
 
 @app.get("/config/status")
-def config_status() -> dict[str, Any]:
+def config_status(request: Request) -> dict[str, Any]:
     """Which providers are configured. Returns booleans/mode only — never secret values."""
+    _require_auth(request)
     redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "")
     redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
     vercel_token = os.getenv("VERCEL_TOKEN", "") or os.getenv("VERCEL_API_TOKEN", "")
@@ -464,7 +615,7 @@ def config_status() -> dict[str, Any]:
 async def _test_github() -> dict[str, Any]:
     import httpx
 
-    secret_set = _configured(os.getenv("GITHUB_WEBHOOK_SECRET", ""))
+    secret_set = _configured(_get_webhook_secret())
     token = os.getenv("GITHUB_TOKEN", "").strip()
     if not token:
         return {
@@ -514,11 +665,12 @@ async def _test_redis() -> dict[str, Any]:
     import time
 
     started = time.monotonic()
+    key = f"__config_test_ping__:{uuid.uuid4().hex}"
     try:
         probe = f"ping:{uuid.uuid4().hex[:8]}"
-        if not store.rset("__config_test_ping__", probe, ex=60):
+        if not await store.arset(key, probe, ex=60):
             raise RuntimeError("write rejected")
-        if store.rget("__config_test_ping__") != probe:
+        if await store.arget(key) != probe:
             raise RuntimeError("roundtrip mismatch")
         ms = round((time.monotonic() - started) * 1000)
         return {
@@ -535,6 +687,11 @@ async def _test_redis() -> dict[str, Any]:
             "falling back to in-memory store",
             "mode": store.backend_mode(),
         }
+    finally:
+        try:
+            await store.ardelete(key)
+        except Exception:
+            pass
 
 
 async def _test_vercel() -> dict[str, Any]:
@@ -589,34 +746,36 @@ async def _test_upstash_box() -> dict[str, Any]:
             "provider": "upstash_box", "ok": False, "configured": False,
             "details": "UPSTASH_BOX_API_KEY missing — add it on the Integrations card",
         }
-    # Non-destructive probe: any HTTP response proves reachability; 401/403 means bad key.
-    # Never sends the key anywhere except the Box API over TLS, never echoes it back.
-    for url in ("https://api.upstash.com/v2/box", "https://api.upstash.com/v2/boxes"):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+    # Non-destructive probe. Only a 2xx proves the key/endpoint work; never
+    # report healthy just because the host answered with 404/405.
+    # Never sends the key anywhere except the Box API over TLS, never echoes it.
+    last_status: int | None = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for url in ("https://api.upstash.com/v2/box", "https://api.upstash.com/v2/boxes"):
+            try:
                 resp = await client.get(url, headers={"Authorization": f"Bearer {key}"})
-            if resp.status_code == 200:
+            except Exception:
+                continue  # try next endpoint, else fall through to offline verdict
+            last_status = resp.status_code
+            if 200 <= resp.status_code < 300:
                 return {
                     "provider": "upstash_box", "ok": True, "configured": True,
-                    "details": f"Box API reachable ({url} HTTP 200), key accepted",
+                    "details": f"Box API reachable ({url} HTTP {resp.status_code}), key accepted",
                 }
             if resp.status_code in (401, 403):
                 return {
                     "provider": "upstash_box", "ok": False, "configured": True,
                     "details": "Box API rejected the key (HTTP 401/403) — check/rotate it",
                 }
-            # Other statuses (404/405/…) still prove the key format path works at the edge;
-            # fall through to report reachable-but-unverified rather than failing hard.
-            return {
-                "provider": "upstash_box", "ok": True, "configured": True,
-                "details": f"Box API reachable ({url} HTTP {resp.status_code}); "
-                "key present, full check runs at provision time",
-                "reachable": True,
-            }
-        except Exception:
-            continue  # try next endpoint, else fall through to offline verdict
+    if last_status is not None:
+        return {
+            "provider": "upstash_box", "ok": False, "configured": True,
+            "details": f"Box API answered HTTP {last_status} but no probe endpoint "
+            "confirmed the key; check the Box API path/key",
+            "reachable": True,
+        }
     return {
-        "provider": "upstash_box", "ok": True, "configured": True,
+        "provider": "upstash_box", "ok": False, "configured": True,
         "details": "key present (format ok); Box API not reachable from here — "
         "run Status on the Upstash Box card for a live check",
         "reachable": False,
@@ -695,12 +854,13 @@ async def events_stream(
     Auth: if BACKEND_API_TOKEN is set, requires `Authorization: Bearer <token>`
     or `?token=<token>` (EventSource cannot set headers).
     """
-    if not _auth_ok(request):
+    if not _auth_ok(request, allow_query_token=True):
         raise HTTPException(status_code=401, detail="invalid or missing API token")
 
     async def gen():  # type: ignore[no-untyped-def]
         snapshots: dict[str, str] = {}
-        # 1. Replay recent runs so a fresh client catches up.
+        # 1. Seed snapshots with every run so the first poll only emits real
+        # changes, then replay just the most recent `limit` records.
         try:
             keys = await store.arkeys("run:*")
             recs: list[dict[str, Any]] = []
@@ -709,11 +869,12 @@ async def events_stream(
                 if isinstance(rec, dict):
                     recs.append(rec)
             recs.sort(key=lambda r: str(r.get("created_at", "")))
-            for rec in recs[-limit:]:
-                blob = json.dumps(rec, separators=(",", ":"))
+            for rec in recs:
                 rid = str(rec.get("run_id", ""))
                 if rid:
-                    snapshots[rid] = blob
+                    snapshots[rid] = json.dumps(rec, separators=(",", ":"))
+            for rec in recs[-limit:]:
+                blob = json.dumps(rec, separators=(",", ":"))
                 yield f"data: {blob}\n\n"
         except Exception as exc:
             log.warning("sse replay failed: %s", exc)
@@ -722,15 +883,20 @@ async def events_stream(
             try:
                 keys = await store.arkeys("run:*")
                 changed: list[dict[str, Any]] = []
+                live_ids: set[str] = set()
                 for k in keys:
                     rec = await store.arget_json(k)
                     if not isinstance(rec, dict):
                         continue
                     rid = str(rec.get("run_id", "") or k.split("run:", 1)[-1])
+                    live_ids.add(rid)
                     blob = json.dumps(rec, separators=(",", ":"))
                     if snapshots.get(rid) != blob:
                         snapshots[rid] = blob
                         changed.append(rec)
+                # Keep the snapshot map bounded by the records that still exist.
+                for stale in set(snapshots) - live_ids:
+                    snapshots.pop(stale, None)
                 for rec in sorted(changed, key=lambda r: str(r.get("created_at", ""))):
                     yield f"data: {json.dumps(rec, separators=(',', ':'))}\n\n"
                 if not changed:
@@ -742,7 +908,14 @@ async def events_stream(
                 yield ": ping\n\n"
             await asyncio.sleep(2)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

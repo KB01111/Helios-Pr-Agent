@@ -189,7 +189,7 @@ async function checkBackend(showToast) {
   try {
     const base = backendUrl();
     let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_health", { backendUrl: base })); }
+    try { data = parseJsonLoose(await tauriInvoke("backend_health", { backendUrl: base, apiToken: Secrets.api || null })); }
     catch (_) {
       const r = await fetch(base + "/health");
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -392,7 +392,7 @@ async function refreshAgents() {
   $("agents-out").textContent = "Loading agents…";
   try {
     let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_sync_agents", { backendUrl: backendUrl(), agentsJson: "" })); }
+    try { data = parseJsonLoose(await tauriInvoke("backend_sync_agents", { backendUrl: backendUrl(), agentsJson: "", apiToken: Secrets.api || null })); }
     catch (_) { data = await apiGet("/agents"); }
     const list = renderAgents(data) || [];
     $("agents-out").textContent = "Loaded " + list.length + " agent(s).";
@@ -524,7 +524,7 @@ async function syncRuns() {
   $("runs-out").textContent = "Syncing runs…";
   try {
     let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_get_runs", { backendUrl: backendUrl() })); }
+    try { data = parseJsonLoose(await tauriInvoke("backend_get_runs", { backendUrl: backendUrl(), apiToken: Secrets.api || null })); }
     catch (_) { data = await apiGet("/runs?limit=50"); }
     const list = Array.isArray(data) ? data : (data.runs || []);
     renderRuns(list);
@@ -564,7 +564,7 @@ function setBar(barId, wrapId, used, limit) {
 async function fetchQuota() {
   try {
     let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_get_quota", { backendUrl: backendUrl() })); }
+    try { data = parseJsonLoose(await tauriInvoke("backend_get_quota", { backendUrl: backendUrl(), apiToken: Secrets.api || null })); }
     catch (_) { data = await apiGet("/quota"); }
     const box = (data && (data.upstash_box || data.box)) || {};
     const ver = (data && (data.vercel_sandbox || data.vercel)) || {};
@@ -592,7 +592,9 @@ function toggleStream() {
     return;
   }
   const base = backendUrl();
-  try { evtSrc = new EventSource(base + "/events/stream"); }
+  // EventSource cannot set headers; the backend only accepts ?token= here.
+  const streamUrl = base + "/events/stream" + (Secrets.api ? "?token=" + encodeURIComponent(Secrets.api) : "");
+  try { evtSrc = new EventSource(streamUrl); }
   catch (e) { $("runs-out").textContent = "Stream failed: " + e; return; }
   if (btn) btn.textContent = "Live: on";
   $("runs-out").textContent = "Streaming live events…";
@@ -642,7 +644,7 @@ async function intRefresh() {
   intOut("Checking status…");
   let data = null;
   try {
-    try { data = parseJsonLoose(await tauriInvoke("backend_config_status", { backendUrl: backendUrl() })); }
+    try { data = parseJsonLoose(await tauriInvoke("backend_config_status", { backendUrl: backendUrl(), apiToken: Secrets.api || null })); }
     catch (_) { data = await apiGet("/config/status"); }
   } catch (e) {
     intOut("Status failed (is backend up at " + backendUrl() + "?): " + e);
@@ -651,6 +653,9 @@ async function intRefresh() {
     return;
   }
   const s = intStatusData(data);
+  const github = (data && data.github) || {};
+  const vercel = (data && data.vercel) || {};
+  const redis = (data && data.redis) || {};
   setDot(INT_DOTS.github, s.githubFull ? "ok" : "warn");
   setDot(INT_DOTS.vercel, s.vercel ? "ok" : "warn");
   setDot(INT_DOTS.upstash_box, s.upstash_box ? "ok" : "warn");
@@ -659,12 +664,12 @@ async function intRefresh() {
   const n = [s.githubFull, s.vercel, s.upstash_box, s.redis, s.openrouter].filter(Boolean).length;
   intBadge(n + "/5 connected", n === 5);
   const lines = [
-    "github: " + (data.github.token_set ? "token set" : "token MISSING") + " · " + (data.github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"),
-    "vercel: " + (s.vercel ? "configured" + (data.vercel.team_set ? " (team scoped)" : "") : "not configured"),
+    "github: " + (github.token_set ? "token set" : "token MISSING") + " · " + (github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"),
+    "vercel: " + (s.vercel ? "configured" + (vercel.team_set ? " (team scoped)" : "") : "not configured"),
     "upstash_box: " + (s.upstash_box ? "configured" : "not configured"),
-    "redis: " + (s.redis ? "configured (mode=" + data.redis.mode + ")" : "not configured (mode=" + data.redis.mode + ")"),
+    "redis: " + (s.redis ? "configured (mode=" + (redis.mode || "?") + ")" : "not configured (mode=" + (redis.mode || "?") + ")"),
     "openrouter: " + (s.openrouter ? "configured" : "not configured"),
-    "auth: " + (data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"),
+    "auth: " + (data && data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"),
   ];
   intOut(lines.join("\n"));
 }

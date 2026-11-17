@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import urllib.parse
 
@@ -27,40 +28,50 @@ _REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 # In-memory fallback: {key: (value_str, expires_at|None)}
 _MEM: dict[str, tuple[str | None, float | None]] = {}
+_MEM_LOCK = threading.RLock()
+
+# If Redis credentials are configured, never silently fall back to process
+# memory for writes: in a multi-worker deployment that creates records only
+# one worker can see and then makes reads fail. Fail closed instead.
+_REDIS_CONFIGURED = bool(_REST_URL and _REST_TOKEN)
 
 
 def _mem_get(key: str) -> str | None:
-    item = _MEM.get(key)
-    if item is None:
-        return None
-    val, exp = item
-    if exp is not None and time.time() > exp:
-        _MEM.pop(key, None)
-        return None
-    return val
+    with _MEM_LOCK:
+        item = _MEM.get(key)
+        if item is None:
+            return None
+        val, exp = item
+        if exp is not None and time.time() > exp:
+            _MEM.pop(key, None)
+            return None
+        return val
 
 
 def _mem_set(key: str, val: str, ex: int | None = None, nx: bool = False) -> bool:
-    if nx and _mem_get(key) is not None:
-        return False
-    exp = (time.time() + ex) if ex else None
-    _MEM[key] = (val, exp)
-    return True
+    with _MEM_LOCK:
+        if nx and _mem_get(key) is not None:
+            return False
+        exp = (time.time() + ex) if ex else None
+        _MEM[key] = (val, exp)
+        return True
 
 
 def _mem_keys(pattern: str) -> list[str]:
     # Minimal glob: supports trailing "*" only, plus exact match.
-    _mem_purge()
-    if pattern.endswith("*"):
-        prefix = pattern[:-1]
-        return [k for k in _MEM if k.startswith(prefix)]
-    return [pattern] if _mem_get(pattern) is not None else []
+    with _MEM_LOCK:
+        _mem_purge()
+        if pattern.endswith("*"):
+            prefix = pattern[:-1]
+            return [k for k in _MEM if k.startswith(prefix)]
+        return [pattern] if _mem_get(pattern) is not None else []
 
 
 def _mem_purge() -> None:
-    now = time.time()
-    for k in [k for k, (_, exp) in _MEM.items() if exp is not None and now > exp]:
-        _MEM.pop(k, None)
+    with _MEM_LOCK:
+        now = time.time()
+        for k in [k for k, (_, exp) in _MEM.items() if exp is not None and now > exp]:
+            _MEM.pop(k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +142,11 @@ def rset(key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
             if nx:
                 kwargs["nx"] = True
             res = _SDK.set(key, value, **kwargs)  # type: ignore[call-arg]
-            # SDK returns None/"OK" on success, None/False when NX blocked.
-            if nx and (res is None or res is False):
-                # Disambiguate: re-read to see if key exists.
+            # upstash-redis returns True on write and False when NX blocks it.
+            # Older/alternate clients may return None; disambiguate by reading.
+            if res is False:
+                return False
+            if res is None:
                 return _SDK.get(key) == value
             return True
         if _use_rest():
@@ -146,9 +159,8 @@ def rset(key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
             return res == "OK"
     except Exception as exc:
         log.warning("store.rset(%s) failed: %s", key, exc)
-        if _REST_URL and _REST_TOKEN:
-            # Fall through to memory so webhooks still work in degraded mode.
-            pass
+        if _REDIS_CONFIGURED:
+            raise
     return _mem_set(key, value, ex=ex, nx=nx)
 
 
@@ -164,13 +176,16 @@ def rincr(key: str, by: int = 1) -> int:
             return int(_rest_cmd("INCRBY", key, str(by)))  # type: ignore[arg-type]
     except Exception as exc:
         log.warning("store.rincr(%s) failed: %s", key, exc)
-    cur = _mem_get(key)
-    try:
-        nxt = int(cur or 0) + by
-    except ValueError:
-        nxt = by
-    _MEM[key] = (str(nxt), None)
-    return nxt
+        if _REDIS_CONFIGURED:
+            raise
+    with _MEM_LOCK:
+        cur = _mem_get(key)
+        try:
+            nxt = int(cur or 0) + by
+        except ValueError:
+            nxt = by
+        _MEM[key] = (str(nxt), None)
+        return nxt
 
 
 def rdelete(key: str) -> int:
@@ -181,7 +196,10 @@ def rdelete(key: str) -> int:
             return int(_rest_cmd("DEL", key))  # type: ignore[arg-type]
     except Exception as exc:
         log.warning("store.rdelete(%s) failed: %s", key, exc)
-    return 1 if _MEM.pop(key, None) is not None else 0
+        if _REDIS_CONFIGURED:
+            raise
+    with _MEM_LOCK:
+        return 1 if _MEM.pop(key, None) is not None else 0
 
 
 def rkeys(pattern: str) -> list[str]:
@@ -202,6 +220,8 @@ def rkeys(pattern: str) -> list[str]:
             return list(res or [])
     except Exception as exc:
         log.warning("store.rkeys(%s) failed: %s", pattern, exc)
+        if _REDIS_CONFIGURED:
+            raise
     return _mem_keys(pattern)
 
 
@@ -288,6 +308,16 @@ def incr_quota(provider: str, seconds: float) -> float:
 
     ym = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
     key = f"quota:{provider}:{ym}"
+    # In-memory mode: make the read-modify-write atomic for concurrent runs.
+    if not _REDIS_CONFIGURED:
+        with _MEM_LOCK:
+            try:
+                cur = float(_mem_get(key) or 0.0)
+            except (TypeError, ValueError):
+                cur = 0.0
+            nxt = cur + float(seconds)
+            _mem_set(key, str(nxt))
+            return nxt
     # rincr is int-based; keep fractional via read-modify-write fallback.
     try:
         if _SDK is not None and hasattr(_SDK, "incrbyfloat"):

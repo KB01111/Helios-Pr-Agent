@@ -372,6 +372,8 @@ fn write_workflow(provider: String) -> Result<String, String> {
 fn gh_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent("pr-agent-control")
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -409,7 +411,7 @@ fn github_device_poll(
     max_wait_secs: u64,
 ) -> Result<serde_json::Value, String> {
     let client = gh_client()?;
-    let interval = interval_secs.clamp(5, 60);
+    let mut interval = interval_secs.clamp(5, 60);
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(max_wait_secs.clamp(10, 600));
     loop {
@@ -435,7 +437,9 @@ fn github_device_poll(
             }));
         }
         match res.get("error").and_then(|v| v.as_str()).unwrap_or("") {
-            "authorization_pending" | "slow_down" => {}
+            "authorization_pending" => {}
+            // RFC 8628: back off by 5s when GitHub asks us to slow down.
+            "slow_down" => interval = (interval + 5).min(60),
             other => return Err(format!("OAuth error ({}): {}", other, res)),
         }
         if std::time::Instant::now() >= deadline {
@@ -481,10 +485,14 @@ fn backend_base(url: &str) -> Result<String, String> {
     Ok(b)
 }
 
-fn backend_get(url: &str) -> Result<String, String> {
-    let res = gh_client()?
+fn backend_get(url: &str, api_token: Option<&str>) -> Result<String, String> {
+    let mut req = gh_client()?
         .get(url)
-        .header("Accept", "application/json")
+        .header("Accept", "application/json");
+    if let Some(token) = api_token.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    let res = req
         .send()
         .map_err(|e| format!("backend unreachable: {}", e))?;
     let status = res.status();
@@ -497,39 +505,46 @@ fn backend_get(url: &str) -> Result<String, String> {
 
 /// GET {backend_url}/health — connectivity check.
 #[tauri::command]
-fn backend_health(backend_url: String) -> Result<String, String> {
+fn backend_health(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
-    backend_get(&format!("{}/health", base))
+    backend_get(&format!("{}/health", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/agents — list agents (UI does POST/PUT/DELETE via fetch).
 /// `agents_json` is accepted for API symmetry and currently ignored.
 #[tauri::command]
-fn backend_sync_agents(backend_url: String, agents_json: String) -> Result<String, String> {
+fn backend_sync_agents(
+    backend_url: String,
+    agents_json: String,
+    api_token: Option<String>,
+) -> Result<String, String> {
     let _ = agents_json;
     let base = backend_base(&backend_url)?;
-    backend_get(&format!("{}/agents", base))
+    backend_get(&format!("{}/agents", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/runs?limit=50 — recent background runs.
 #[tauri::command]
-fn backend_get_runs(backend_url: String) -> Result<String, String> {
+fn backend_get_runs(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
-    backend_get(&format!("{}/runs?limit=50", base))
+    backend_get(&format!("{}/runs?limit=50", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/quota — Upstash Box / Vercel Sandbox usage.
 #[tauri::command]
-fn backend_get_quota(backend_url: String) -> Result<String, String> {
+fn backend_get_quota(backend_url: String, api_token: Option<String>) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
-    backend_get(&format!("{}/quota", base))
+    backend_get(&format!("{}/quota", base), api_token.as_deref())
 }
 
 /// GET {backend_url}/config/status — which providers are configured (booleans only, no secrets).
 #[tauri::command]
-fn backend_config_status(backend_url: String) -> Result<String, String> {
+fn backend_config_status(
+    backend_url: String,
+    api_token: Option<String>,
+) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
-    backend_get(&format!("{}/config/status", base))
+    backend_get(&format!("{}/config/status", base), api_token.as_deref())
 }
 
 /// POST {backend_url}/config/test {"provider": ...} — live connectivity check (no secrets echoed).
@@ -609,6 +624,25 @@ fn backend_env_for_write() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("backend/.env"))
 }
 
+/// Render one value for a dotenv file. Unquoted values only when they are
+/// plainly safe; otherwise single-quote (no interpolation is used when the
+/// backend loads the file), falling back to double quotes for values that
+/// contain a single quote.
+fn dotenv_render_value(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || "._~:/?&=+@%*,;!()-[]{}".contains(c)
+        });
+    if safe {
+        return value.to_string();
+    }
+    if !value.contains('\'') {
+        return format!("'{}'", value);
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
 /// Write one integration secret into backend/.env (creates the file if needed).
 /// The value is never logged and never touches localStorage — it stays in
 /// Rust + the dotenv file, which is git-ignored.
@@ -639,7 +673,7 @@ fn save_backend_env_var(key: String, value: String) -> Result<String, String> {
         vec!["# Local only — NEVER commit (gitignored). Managed by PR Agent Control Integrations.".to_string()]
     };
     let prefix = format!("{}=", k);
-    let replacement = format!("{}={}", k, v);
+    let replacement = format!("{}={}", k, dotenv_render_value(v));
     let mut found = false;
     for line in lines.iter_mut() {
         if line.starts_with(&prefix) || line.trim_start().starts_with(&prefix) {
@@ -665,19 +699,34 @@ fn github_list_repos(token: String) -> Result<String, String> {
     if token.is_empty() {
         return Err("GitHub token is required".into());
     }
-    let res = gh_client()?
-        .get("https://api.github.com/user/repos?per_page=100&sort=updated")
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .map_err(|e| format!("GitHub unreachable: {}", e))?;
-    let status = res.status();
-    let body = res.text().map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("GitHub HTTP {}: {}", status, body.chars().take(300).collect::<String>()));
+    let client = gh_client()?;
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    // Five pages (500 repos) is plenty for the picker and bounds latency.
+    for page in 1..=5 {
+        let res = client
+            .get(format!(
+                "https://api.github.com/user/repos?per_page=100&sort=updated&page={}",
+                page
+            ))
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .map_err(|e| format!("GitHub unreachable: {}", e))?;
+        let status = res.status();
+        let body = res.text().map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("GitHub HTTP {}: {}", status, body.chars().take(300).collect::<String>()));
+        }
+        let batch: Vec<serde_json::Value> = serde_json::from_str(&body)
+            .map_err(|e| format!("GitHub response was not a JSON array: {}", e))?;
+        let count = batch.len();
+        all.extend(batch);
+        if count < 100 {
+            break;
+        }
     }
-    Ok(body)
+    serde_json::to_string(&all).map_err(|e| e.to_string())
 }
 
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}

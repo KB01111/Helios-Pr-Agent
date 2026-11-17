@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from .safety import safe_repo
+
 log = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
@@ -41,6 +43,14 @@ class ReviewOnlyProvider:
             return _result(logs, "", "failed", False, agent_name)
         if not repo or pr_number is None:
             logs.append("review_only: pr_context missing repo/pr_number.")
+            return _result(logs, "", "failed", False, agent_name)
+        try:
+            repo = safe_repo(repo)
+            pr_number = int(pr_number)
+            if pr_number <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            logs.append("review_only: pr_context has an invalid repo/pr_number.")
             return _result(logs, "", "failed", False, agent_name)
 
         # 1. Fetch diff
