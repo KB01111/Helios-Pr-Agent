@@ -613,7 +613,7 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
             # A previously failed/aborted attempt: exactly one overlapping
             # handler wins the per-attempt nx claim and recreates the run.
             attempt = int(existing.get("attempt", 0) or 0) + 1
-            if not await store.arset(f"runretry:{run_id}:{attempt}", "1", ex=3600, nx=True):
+            if not await store.arset(f"runretry:{run_id}:{attempt}", "1", ex=60, nx=True):
                 continue
             record["attempt"] = attempt
             try:
