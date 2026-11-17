@@ -16,7 +16,7 @@ Both run on **OpenRouter free models** (default
 | Path | What it is |
 |---|---|
 | `src/` | Tauri frontend (tabbed UI: Review, Agents & repo sync, Runs, Quota, Providers, Integrations, Settings) |
-| `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session only, never written to disk) |
+| `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), and the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`) |
 | `upstash-box/` | Node provisioner + Python cron script that auto-reviews open PRs on a schedule (runs on Upstash Box free tier) |
 | `.pr_agent.toml` | PR-Agent config for this repo (free OpenRouter model + `openrouter/free` fallback) |
 | `.github/workflows/pr-agent.yml` | PR-Agent GitHub Action for this repo |
@@ -42,14 +42,16 @@ Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11).
 5. **Providers** — write `.github/workflows/pr-agent.yml` or `openrabbit.yml` into any local
    repo, ready to commit.
 6. **Integrations** — paste provider tokens; **Connect** writes them to `backend/.env` via
-   the Rust backend, then **Test** hits the live provider APIs.
+   the Rust backend, then **Test** hits the live provider APIs. The GitHub card also
+   configures webhooks, secrets, and workflows for selected repos in one click (see below).
 7. **Settings** — backend URL/API token, GitHub OAuth (device flow or PAT), and desktop keys.
 
 ## Secrets & security
 
 - Tokens saved from **Integrations** are written to `backend/.env` (git-ignored) by Rust and
   are never stored in `localStorage`.
-- GitHub OAuth/PAT tokens used by the desktop app stay in memory/sessionStorage only.
+- GitHub OAuth/PAT tokens used by the desktop app stay in memory/sessionStorage only; the
+  1-click GitHub setup can opt in to also saving the token to `backend/.env` (see below).
 - The backend loads `backend/.env` (then repo-root `.env`) at startup; real process env vars
   always win over file values.
 - After cloning, add the Actions secret `OPENROUTER_API_KEY` (your OpenRouter key) to any
@@ -78,6 +80,60 @@ With `BACKEND_API_TOKEN` set, agent CRUD, run history/approval, quota,
 `Authorization: Bearer <token>`. Only the SSE stream
 also accepts `?token=` because `EventSource` cannot set headers; other endpoints
 reject query-string credentials so they cannot leak through proxy logs.
+
+### GitHub repo setup in one click
+
+The GitHub card in **Integrations** signs in, lists your repos, and configures the
+selected ones end to end — no copy-pasting webhook URLs or Actions secrets.
+
+Prerequisites:
+
+- An OAuth App at `github.com/settings/developers` with **Device Flow enabled** (callback
+  can be `http://localhost`). Enter its **Client ID** in Settings → GitHub or in the
+  Integrations card; it is a non-secret value stored in `localStorage`.
+- The `repo` scope, which the device flow requests. It covers webhooks, repository
+  contents, and Actions secrets for private repos.
+- Admin permission on each repo: only repos where the token reports
+  `permissions.admin == true` are configurable; the rest are listed but disabled.
+- A **public HTTPS** backend base URL, reachable as `<base URL>/webhooks/github`.
+  `localhost` will never receive GitHub deliveries.
+
+Flow:
+
+1. **Sign in with GitHub** — the app shows the device code, opens
+   `https://github.com/login/device`, and polls until you approve. The access token stays
+   in memory/session only.
+2. **Pick repos** — up to 500 repos are loaded via `GET /user/repos` (100 per page, sorted
+   by last update) into a searchable checklist; private repos are marked.
+3. **Configure selected** — runs per repo, with the following steps:
+   - **Webhook** — `<base URL>/webhooks/github`, content type `application/json`, events
+     `pull_request` only, active, using the supplied secret. An existing hook with the
+     same URL is PATCHed instead of duplicated.
+   - **Actions secrets** — `OPENROUTER_API_KEY`, plus `LLM_API_KEY` for the OpenRabbit
+     workflow, encrypted with the repo public key (libsodium sealed box).
+   - **Workflow file** — commits `.github/workflows/pr-agent.yml` or
+     `.github/workflows/openrabbit.yml` from the app's built-in template to the default
+     branch. If the file exists with different content it is updated (GET sha, then PUT);
+     identical content is left unchanged.
+   - **Agent** (optional) — creates a backend agent with `target_repos` set to the
+     successful repos, or updates the same-named agent by merging those repos into its
+     existing targets. `trigger` is `"on_commit"` and `runtime_mode` is `"review_only"`, so
+     reviews start on the next PR push.
+
+Each repo shows per-step status (webhook / secrets / workflow); a retry button re-runs
+only the failed repos, and a failure in one repo or step does not block the others. Setup
+is idempotent: re-running updates the existing webhook, upserts the secrets, and commits
+only when the workflow content changed. The card pushes the app's **built-in** templates,
+not this repo's own `.github/workflows/pr-agent.yml`, so every configured repo receives
+the same workflow.
+
+The token stays in memory/sessionStorage, is never logged or written to `localStorage`,
+and only reaches `backend/.env` when you tick the opt-in. That checkbox saves
+`GITHUB_TOKEN`, and another saves `GITHUB_WEBHOOK_SECRET`, via the Rust backend
+(git-ignored); restart the backend afterwards so it picks up the values. The secret must
+match the backend's `GITHUB_WEBHOOK_SECRET` — the same one used when creating the hooks.
+
+The manual webhook and OAuth instructions below remain valid as a fallback.
 
 ### GitHub webhook URL (copy-paste)
 

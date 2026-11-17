@@ -107,6 +107,7 @@ function clearSecrets() {
     const btn = $("btn-stream");
     if (btn) btn.textContent = "Live: off";
   }
+  ghResetUi();
   setGhState(false, "");
   toastOk("Secrets cleared", "Session values and stream tokens wiped.");
 }
@@ -327,6 +328,9 @@ async function oauthStart() {
         setSecret("github", r.access_token);
         syncSecretInputs();
         setGhState(true, r.login);
+        ghSetState(true, r.login);
+        const ghSection = $("gh-repo-section");
+        if (ghSection) ghSection.classList.remove("hidden");
         $("oauth-code").classList.add("hidden");
         $("btn-oauth-cancel").classList.add("hidden");
         $("oauth-out").textContent = "Authenticated as " + (r.login || "(unknown login)") + ". Token in memory/session only.";
@@ -352,6 +356,9 @@ async function oauthPat() {
     $("oauth-pat").value = "";
     syncSecretInputs();
     setGhState(true, login);
+    ghSetState(true, login);
+    const ghSection = $("gh-repo-section");
+    if (ghSection) ghSection.classList.remove("hidden");
     $("oauth-out").textContent = "Authenticated as " + (login || "(unknown login)") + ". Token in memory/session only.";
     toastOk("GitHub connected", login ? "Signed in as " + login : "PAT stored in session.");
     loadReposIntoPicker();
@@ -748,16 +755,24 @@ async function intSave(pairs, label) {
     }
     // Mirror session-usable secrets into memory+sessionStorage (same convention as Settings).
     for (const [key, val] of todo) {
-      if (key === "GITHUB_TOKEN") setSecret("github", val);
+      if (key === "GITHUB_TOKEN") {
+        setSecret("github", val);
+        // Reuse a token saved through the older Connect button in the 1-click card.
+        ghSetState(true, "");
+        const section = $("gh-repo-section");
+        if (section) section.classList.remove("hidden");
+      }
       if (key === "OPENROUTER_API_KEY") setSecret("openrouter", val);
       if (key === "UPSTASH_BOX_API_KEY") setSecret("box", val);
     }
     syncSecretInputs();
+    if (todo.some(([key]) => key === "GITHUB_TOKEN")) ghLoadRepos();
     for (const [, id] of pairs) { const el = $(id); if (el) el.value = (id === "int-vercel-team" || id === "int-redis-url") ? el.value : ""; }
     // Clear even saved non-secret fields that hold sensitive-adjacent data? Keep URL/team visible.
     const savedKeys = todo.map(([k]) => k).join(", ");
     intOut("Saved " + savedKeys + " to " + Array.from(paths).join(", ") + ".\nRestart/redeploy the backend so it picks up the new values, then Test.");
     toastOk("Saved", savedKeys + " → backend/.env");
+    ghKeyHint();
     intRefresh();
   } catch (e) {
     intOut("Save failed: " + e + "\n(Outside the desktop app? Set these env vars where the backend runs instead.)");
@@ -770,6 +785,613 @@ function intHookUrl() {
   const url = base ? base + "/webhooks/github" : "https://<cloud-app>/webhooks/github";
   if (prev) prev.textContent = url;
   return url;
+}
+
+/* ---------- GitHub 1-click repo setup ----------
+ * OAuth token stays in Secrets.github (memory + sessionStorage) and is only
+ * passed to the Rust commands. It is never put in localStorage, the DOM as
+ * markup, or the progress log. The only way it reaches disk is the opt-in
+ * "Save GitHub token to backend/.env" checkbox (Rust save_backend_env_var).
+ */
+let ghOauthCancel = false;
+let ghVerificationUri = "";
+let ghBatchRunning = false;
+let ghBatchCancel = false;
+const ghRepos = [];                    // {full_name, private, default_branch, admin}
+const ghSelected = new Set();          // full_name
+const ghStatus = new Map();            // full_name -> github_repo_status payload
+const ghStatusInflight = new Set();
+const ghFailed = new Set();            // setup failures awaiting retry
+const ghConfiguring = new Set();
+const ghRowEls = new Map();            // full_name -> row element (targeted updates)
+
+function jsonObj(v) {
+  if (typeof v === "string") {
+    const p = parseJsonLoose(v);
+    return p !== null ? p : null;
+  }
+  return v && typeof v === "object" ? v : null;
+}
+function ghErrSuffix(msg) {
+  return msg ? " — " + String(msg).slice(0, 220) : "";
+}
+function ghOut(line) {
+  const el = $("gh-setup-out");
+  if (!el) return;
+  const base = el.textContent && el.textContent !== "Configure log appears here." ? el.textContent + "\n" : "";
+  el.textContent = base + line;
+  el.scrollTop = el.scrollHeight;
+}
+function ghSetState(on, login) {
+  const el = $("gh-oauth-state");
+  if (!el) return;
+  el.textContent = on ? (login ? "Connected as " + login : "Connected (session token)") : "Not connected";
+  el.className = "badge" + (on ? " ok" : "");
+}
+function ghBaseUrl() {
+  const v = ($("int-cloud-base") ? $("int-cloud-base").value : "").trim().replace(/\/+$/, "");
+  return v || backendUrl();
+}
+function ghOpenrouterKey() {
+  return (($("int-or-key") ? $("int-or-key").value : "").trim()) || Secrets.openrouter || "";
+}
+function ghHookHint() {
+  const el = $("gh-hook-target");
+  if (!el) return;
+  const base = ghBaseUrl();
+  let local = false;
+  try {
+    const u = new URL(base);
+    local = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/i.test(u.hostname);
+  } catch (_) {}
+  el.textContent = "Webhook target: " + base + "/webhooks/github" +
+    (local ? " — GitHub cannot deliver webhooks to localhost/127.0.0.1; use a public tunnel or a deployed URL." : "");
+  el.className = "hint" + (local ? " gh-warn" : "");
+}
+function ghKeyHint() {
+  const el = $("gh-or-hint");
+  if (!el) return;
+  el.textContent = ghOpenrouterKey() ? "(key ready)" : "(no OpenRouter key yet)";
+}
+function ghRandomSecret() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function ghPersistClientId() {
+  const el = $("gh-oauth-client");
+  if (!el) return;
+  const v = el.value.trim();
+  try { localStorage.setItem("pragent.oauth_client", v); } catch (_) {}
+  const other = $("oauth-client");
+  if (other && other.value !== el.value) other.value = el.value;
+}
+function ghRestoreClientId() {
+  const el = $("gh-oauth-client");
+  if (!el || el.value) return;
+  let v = "";
+  try { v = localStorage.getItem("pragent.oauth_client") || ""; } catch (_) {}
+  if (!v && $("oauth-client")) v = $("oauth-client").value.trim();
+  if (v) el.value = v;
+}
+
+/* ----- device flow (separate cancel flag from the Settings flow) ----- */
+function ghOauthCancelFlow() {
+  ghOauthCancel = true;
+  const out = $("gh-oauth-out");
+  if (out) out.textContent = "Cancelling…";
+  const btn = $("btn-gh-oauth-cancel");
+  if (btn) btn.disabled = true;
+}
+async function ghOauthStart() {
+  const el = $("gh-oauth-client");
+  const other = $("oauth-client");
+  const clientId = ((el ? el.value : "").trim() || (other ? other.value : "").trim());
+  if (!clientId) {
+    toastErr("GitHub sign-in", "Enter the OAuth App Client ID first (Device Flow must be enabled).");
+    if (el) el.focus();
+    return;
+  }
+  if (el) el.value = clientId;
+  if (other) other.value = clientId;
+  try { localStorage.setItem("pragent.oauth_client", clientId); } catch (_) {}
+  ghOauthCancel = false;
+  ghVerificationUri = "https://github.com/login/device";
+  const startBtn = $("btn-gh-oauth-start");
+  const cancelBtn = $("btn-gh-oauth-cancel");
+  const codeBlock = $("gh-oauth-code");
+  const userCode = $("gh-oauth-usercode");
+  const out = $("gh-oauth-out");
+  if (startBtn) startBtn.disabled = true;
+  if (cancelBtn) { cancelBtn.classList.remove("hidden"); cancelBtn.disabled = false; }
+  if (codeBlock) codeBlock.classList.remove("hidden");
+  if (userCode) userCode.textContent = "…";
+  if (out) out.textContent = "Starting GitHub device flow…";
+  try {
+    const d = jsonObj(await tauriInvoke("github_device_start", { clientId }));
+    if (!d || !d.device_code || !d.user_code) throw new Error("device flow response missing device_code/user_code");
+    if (ghOauthCancel) {
+      if (out) out.textContent = "Login cancelled — no new token was stored.";
+      return;
+    }
+    ghVerificationUri = String(d.verification_uri || "https://github.com/login/device");
+    if (userCode) userCode.textContent = String(d.user_code);
+    if (out) out.textContent = "Approve the code on GitHub — waiting… (expires in ~" +
+      Math.round((Number(d.expires_in) || 900) / 60) + " min)";
+    toastOk("GitHub login started", "Approve code " + d.user_code + " on GitHub.");
+    try { await openUrl(ghVerificationUri); } catch (_) {}
+    let interval = Math.max(5, Number(d.interval) || 5);
+    while (!ghOauthCancel) {
+      let r = null;
+      try {
+        r = jsonObj(await tauriInvoke("github_device_poll", {
+          clientId, deviceCode: d.device_code, intervalSecs: interval, maxWaitSecs: 30,
+        }));
+      } catch (e) {
+        if (ghOauthCancel) break;
+        if (/pending|slow_down|authorization_pending/i.test(String(e))) {
+          if (out) out.textContent = "Waiting for approval…";
+          continue;
+        }
+        throw e;
+      }
+      if (ghOauthCancel) break;
+      if (r && r.interval) interval = Math.max(interval, Number(r.interval) || interval);
+      if (r && r.status === "authorized") {
+        if (!r.access_token) throw new Error("GitHub did not return an access token");
+        setSecret("github", r.access_token); // memory + sessionStorage only
+        syncSecretInputs();
+        ghSetState(true, r.login);
+        setGhState(true, r.login);
+        if (codeBlock) codeBlock.classList.add("hidden");
+        if (cancelBtn) cancelBtn.classList.add("hidden");
+        if (out) out.textContent = "Connected as " + (r.login || "GitHub user") + ".";
+        if (userCode) userCode.textContent = "…";
+        const section = $("gh-repo-section");
+        if (section) section.classList.remove("hidden");
+        toastOk("GitHub connected", r.login ? "Signed in as " + r.login : "Token stored in session.");
+        ghLoadRepos();
+        return;
+      }
+      if (r && r.status && r.status !== "pending" && r.status !== "authorized") {
+        throw new Error("device flow " + r.status);
+      }
+      if (out) out.textContent = "Waiting for approval…";
+    }
+    if (out) out.textContent = "Login cancelled — no new token was stored.";
+    if (userCode) userCode.textContent = "—";
+  } catch (e) {
+    if (codeBlock) codeBlock.classList.remove("hidden");
+    if (userCode) userCode.textContent = "—";
+    if (out) out.textContent = "Sign-in failed: " + String(e).slice(0, 300);
+    toastErr("GitHub sign-in failed", String(e).slice(0, 220));
+  } finally {
+    if (startBtn) startBtn.disabled = false;
+    if (cancelBtn) { cancelBtn.classList.add("hidden"); cancelBtn.disabled = false; }
+  }
+}
+
+/* ----- repo list, selection, status cache ----- */
+function ghFilteredRepos() {
+  const q = ($("gh-repo-search") ? $("gh-repo-search").value : "").trim().toLowerCase();
+  if (!q) return ghRepos.slice();
+  return ghRepos.filter((r) => r.full_name.toLowerCase().includes(q));
+}
+function ghEmptyNote(box, text) {
+  const p = document.createElement("p");
+  p.className = "hint";
+  p.textContent = text;
+  box.appendChild(p);
+}
+function ghStepPill(label, state, title) {
+  const el = document.createElement("span");
+  el.className = "step-pill " + (state || "");
+  const mark = state === "ok" ? "✓" : state === "warn" || state === "err" ? "✕" : "—";
+  el.textContent = label + " " + mark;
+  if (title) el.title = String(title).slice(0, 300);
+  return el;
+}
+function ghRowError(name) {
+  const st = ghStatus.get(name);
+  if (!st) return "";
+  const errs = [];
+  if (st.error) errs.push(String(st.error));
+  for (const k of ["webhook", "workflow", "secrets"]) {
+    if (st[k] && st[k].error) errs.push(k + ": " + String(st[k].error));
+  }
+  return errs.join(" · ").slice(0, 220);
+}
+function ghFillRowStatus(box, name) {
+  if (!box) return;
+  box.textContent = "";
+  const st = ghStatus.get(name);
+  const webhook = (st && st.webhook) || {};
+  const workflow = (st && st.workflow) || {};
+  const secrets = (st && st.secrets) || {};
+  const generic = (st && st.error) || "";
+  box.appendChild(ghStepPill("hook", st ? (webhook.configured ? "ok" : "warn") : "", webhook.error || generic));
+  box.appendChild(ghStepPill("workflow", st ? (workflow.configured ? "ok" : "warn") : "",
+    workflow.error || generic || (workflow.file ? "file: " + workflow.file : "")));
+  let secTitle = secrets.error || generic;
+  if (!secTitle && st && !secrets.configured) {
+    const missing = [];
+    if (!secrets.openrouter_api_key) missing.push("OPENROUTER_API_KEY");
+    // LLM_API_KEY is only required by the OpenRabbit workflow.
+    if (workflow.provider === "openrabbit" && !secrets.llm_api_key) missing.push("LLM_API_KEY");
+    if (missing.length) secTitle = "missing repo secret(s): " + missing.join(", ");
+  }
+  box.appendChild(ghStepPill("secrets", st ? (secrets.configured ? "ok" : "warn") : "", secTitle));
+  const overall = document.createElement("span");
+  overall.className = "pill ok";
+  overall.textContent = "configured ✓";
+  if (!(st && st.configured)) overall.classList.add("hidden");
+  box.appendChild(overall);
+}
+function ghUpdateRow(name) {
+  const row = ghRowEls.get(name);
+  if (!row) return;
+  row.classList.toggle("selected", ghSelected.has(name));
+  row.classList.toggle("configuring", ghConfiguring.has(name));
+  row.classList.toggle("failed", ghFailed.has(name));
+  ghFillRowStatus(row.querySelector(".repo-status"), name);
+  const err = row.querySelector(".repo-err");
+  if (err) {
+    const msg = ghRowError(name);
+    err.textContent = msg;
+    err.classList.toggle("hidden", !msg);
+  }
+}
+function ghBuildRow(r) {
+  const name = r.full_name;
+  const row = document.createElement("div");
+  row.className = "repo-row";
+  row.dataset.repo = name;
+  row.classList.toggle("selected", ghSelected.has(name));
+  row.classList.toggle("locked", r.admin === false);
+  row.classList.toggle("configuring", ghConfiguring.has(name));
+  row.classList.toggle("failed", ghFailed.has(name));
+
+  const label = document.createElement("label");
+  label.className = "repo-check";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = ghSelected.has(name);
+  cb.disabled = r.admin === false;
+  if (cb.disabled) {
+    const why = "Admin access is required to configure webhooks, repo secrets and workflow files.";
+    cb.title = why;
+    label.title = why;
+  }
+  cb.addEventListener("change", () => {
+    if (cb.checked) ghSelected.add(name); else ghSelected.delete(name);
+    ghUpdateRow(name);
+    ghUpdateConfigureBtn();
+    if (cb.checked) ghLoadStatus(name, false);
+  });
+  const nameEl = document.createElement("span");
+  nameEl.className = "repo-name";
+  nameEl.textContent = name;
+  label.appendChild(cb);
+  label.appendChild(nameEl);
+  if (r.private) {
+    const priv = document.createElement("span");
+    priv.className = "badge";
+    priv.textContent = "private";
+    label.appendChild(priv);
+  }
+  if (r.default_branch) {
+    const br = document.createElement("span");
+    br.className = "hint";
+    br.textContent = "default: " + r.default_branch;
+    label.appendChild(br);
+  }
+  row.appendChild(label);
+
+  const status = document.createElement("div");
+  status.className = "repo-status";
+  ghFillRowStatus(status, name);
+  row.appendChild(status);
+
+  const err = document.createElement("span");
+  err.className = "repo-err hint hidden";
+  row.appendChild(err);
+  return row;
+}
+function ghRenderRepos() {
+  const box = $("gh-repo-list");
+  const count = $("gh-repo-count");
+  if (!box) return;
+  const visible = ghFilteredRepos();
+  if (count) count.textContent = visible.length + " of " + ghRepos.length + " repos";
+  box.textContent = "";
+  ghRowEls.clear();
+  if (!ghRepos.length) { ghEmptyNote(box, "No repositories loaded — click Refresh repos."); return; }
+  if (!visible.length) { ghEmptyNote(box, "No repositories match the filter."); return; }
+  for (const r of visible) {
+    const row = ghBuildRow(r);
+    ghRowEls.set(r.full_name, row);
+    box.appendChild(row);
+  }
+}
+function ghUpdateConfigureBtn() {
+  const btn = $("btn-gh-configure");
+  if (btn) {
+    btn.textContent = "Configure selected (" + ghSelected.size + ")";
+    btn.disabled = ghBatchRunning || ghSelected.size === 0;
+  }
+  const retry = $("btn-gh-retry-failed");
+  if (retry) {
+    retry.textContent = "Retry failed (" + ghFailed.size + ")";
+    retry.classList.toggle("hidden", ghBatchRunning || ghFailed.size === 0);
+  }
+}
+async function ghLoadRepos() {
+  if (!Secrets.github) { toastErr("GitHub", "Sign in with GitHub first."); return; }
+  const section = $("gh-repo-section");
+  if (section) section.classList.remove("hidden");
+  const btn = $("btn-gh-repos-refresh");
+  const box = $("gh-repo-list");
+  if (btn) btn.disabled = true;
+  if (box) { box.textContent = ""; ghEmptyNote(box, "Loading repositories…"); }
+  try {
+    const raw = await tauriInvoke("github_list_repos", { token: Secrets.github });
+    if (!Secrets.github) return; // session was cleared while loading
+    const parsed = Array.isArray(raw) ? raw : (jsonObj(raw) || []);
+    const arr = Array.isArray(parsed) ? parsed : [];
+    ghRepos.length = 0;
+    for (const r of arr) {
+      const name = String((r && r.full_name) || "").trim();
+      if (!name) continue;
+      ghRepos.push({
+        full_name: name,
+        private: !!(r && r.private),
+        default_branch: (r && r.default_branch) || "",
+        admin: !(r && r.admin === false),
+      });
+    }
+    const names = new Set(ghRepos.map((r) => r.full_name));
+    const selectable = new Set(ghRepos.filter((r) => r.admin !== false).map((r) => r.full_name));
+    for (const n of Array.from(ghSelected)) if (!names.has(n) || !selectable.has(n)) ghSelected.delete(n);
+    for (const n of Array.from(ghStatus.keys())) if (!names.has(n)) ghStatus.delete(n);
+    for (const n of Array.from(ghFailed)) if (!names.has(n)) ghFailed.delete(n);
+    ghRenderRepos();
+    ghUpdateConfigureBtn();
+    ghOut("Loaded " + ghRepos.length + " repositories.");
+    toastOk("Repos loaded", ghRepos.length + " repositories.");
+  } catch (e) {
+    if (box) { box.textContent = ""; ghEmptyNote(box, "Repo load failed: " + String(e).slice(0, 300)); }
+    ghOut("Repo load failed: " + String(e));
+    toastErr("Repo load failed", String(e).slice(0, 200));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+async function ghLoadStatus(name, force) {
+  if (!Secrets.github || !name) return;
+  if (force) ghStatus.delete(name);
+  else if (ghStatus.has(name)) return;
+  if (ghStatusInflight.has(name)) return;
+  ghStatusInflight.add(name);
+  try {
+    const raw = await tauriInvoke("github_repo_status", { token: Secrets.github, repo: name });
+    if (!Secrets.github) return; // session was cleared while loading
+    const st = jsonObj(raw);
+    if (st && !Array.isArray(st)) ghStatus.set(name, st);
+    else ghStatus.set(name, { repo: name, error: "unexpected status response" });
+  } catch (e) {
+    ghStatus.set(name, { repo: name, error: String(e).slice(0, 300) });
+  } finally {
+    ghStatusInflight.delete(name);
+    ghUpdateRow(name);
+  }
+}
+async function ghLoadStatusMany(names, force) {
+  const queue = names.slice();
+  const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+    while (queue.length) await ghLoadStatus(queue.shift(), !!force);
+  });
+  await Promise.all(workers);
+}
+async function ghCheckStatus() {
+  if (!Secrets.github) { toastErr("GitHub status", "Sign in with GitHub first."); return; }
+  const btn = $("btn-gh-status-refresh");
+  const selected = Array.from(ghSelected);
+  const targets = selected.length
+    ? selected
+    : ghFilteredRepos().filter((r) => r.admin !== false).slice(0, 25).map((r) => r.full_name);
+  if (!targets.length) { toastErr("GitHub status", "No repositories to check."); return; }
+  if (btn) btn.disabled = true;
+  try {
+    await ghLoadStatusMany(targets, true);
+    const ok = targets.filter((n) => ghStatus.get(n) && ghStatus.get(n).configured).length;
+    toastOk("Status checked", ok + " of " + targets.length + " configured.");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ----- configure batch (sequential, failures never abort the batch) ----- */
+async function ghSaveEnv(key, value) {
+  try {
+    const p = await tauriInvoke("save_backend_env_var", { key, value });
+    ghOut("[env] " + key + " saved to " + p);
+  } catch (e) {
+    // GitHub-side setup does not depend on local .env; surface and continue.
+    ghOut("[env] " + key + " save failed: " + String(e).slice(0, 220));
+    toastErr("Env save failed", key + ": " + String(e).slice(0, 180));
+  }
+}
+async function ghUpsertAgent(repos) {
+  const name = ($("gh-agent-name") ? $("gh-agent-name").value.trim() : "") || "pr-agent-control";
+  if (!repos.length) return;
+  ghOut("[agent] syncing backend agent \"" + name + "\"…");
+  try {
+    const data = await apiGet("/agents");
+    const rawList = Array.isArray(data) ? data : ((data && data.agents) || []);
+    const list = Array.isArray(rawList) ? rawList : [];
+    const existing = list.find((a) => a && a.name === name);
+    const uniq = Array.from(new Set(repos));
+    if (existing && existing.id) {
+      const currentTargets = Array.isArray(existing.target_repos) ? existing.target_repos : [];
+      const body = Object.assign({}, existing, {
+        target_repos: Array.from(new Set([...currentTargets, ...uniq])),
+        trigger: "on_commit",
+        runtime_mode: "review_only",
+      });
+      const saved = await apiMut("PUT", "/agents/" + encodeURIComponent(existing.id), body);
+      ghOut("[agent] updated " + ((saved && saved.id) || existing.id) + " (target_repos now " + body.target_repos.length + ")");
+    } else {
+      const saved = await apiMut("POST", "/agents", {
+        name, system_prompt: "", target_repos: uniq, trigger: "on_commit", runtime_mode: "review_only",
+      });
+      ghOut("[agent] created " + ((saved && saved.id) || name));
+    }
+    toastOk("Agent synced", name);
+    try { refreshAgents(); } catch (_) {}
+  } catch (e) {
+    // Agent sync is a convenience: never fail the GitHub setup because of it.
+    ghOut("[agent] failed: " + String(e).slice(0, 300));
+    toastErr("Agent sync failed", String(e).slice(0, 200));
+  }
+}
+async function ghConfigure(retryOnly) {
+  if (ghBatchRunning) return;
+  const token = Secrets.github;
+  if (!token) { toastErr("GitHub setup", "Sign in with GitHub first."); return; }
+  const base = ghBaseUrl();
+  let parsedBase = null;
+  try { parsedBase = new URL(base); } catch (_) {}
+  if (!parsedBase || !/^https?:$/.test(parsedBase.protocol)) {
+    toastErr("GitHub setup", "Set a valid http(s) base URL in the GitHub webhook URL card (or Settings backend URL).");
+    return;
+  }
+  const repos = (retryOnly ? Array.from(ghFailed) : Array.from(ghSelected)).filter(Boolean);
+  if (!repos.length) {
+    toastErr("GitHub setup", retryOnly ? "No failed repositories to retry." : "Select at least one repository.");
+    return;
+  }
+  let secret = ($("gh-webhook-secret") ? $("gh-webhook-secret").value : "").trim();
+  if (!secret) {
+    secret = ghRandomSecret();
+    if ($("gh-webhook-secret")) $("gh-webhook-secret").value = secret;
+    ghOut("[config] generated a 32-byte webhook secret (hex).");
+  }
+  const orKey = ghOpenrouterKey();
+  if (!orKey) {
+    toastErr("GitHub setup", "Add the OpenRouter API key in the OpenRouter row above first.");
+    return;
+  }
+  const provider = ($("gh-workflow-provider") ? $("gh-workflow-provider").value : "pr-agent") || "pr-agent";
+  if (provider !== "pr-agent" && provider !== "openrabbit") {
+    toastErr("GitHub setup", "Choose a workflow provider (pr-agent or openrabbit).");
+    return;
+  }
+  const successful = [];
+  const batchFailed = [];
+  const saveSecret = !!($("gh-secret-save") && $("gh-secret-save").checked);
+  const saveToken = !!($("gh-save-token") && $("gh-save-token").checked);
+
+  ghBatchRunning = true;
+  ghBatchCancel = false;
+  ghUpdateConfigureBtn();
+  if ($("btn-gh-repos-refresh")) $("btn-gh-repos-refresh").disabled = true;
+  if ($("btn-gh-status-refresh")) $("btn-gh-status-refresh").disabled = true;
+  try {
+    ghOut("=== Setup started: " + repos.length + " repo(s) · provider=" + provider + " · webhook base=" + base + " ===");
+    if (saveSecret) {
+      await ghSaveEnv("GITHUB_WEBHOOK_SECRET", secret);
+      ghOut("[env] restart the backend to pick up .env changes.");
+    }
+    if (saveToken) await ghSaveEnv("GITHUB_TOKEN", token);
+
+    for (const repo of repos) {
+      if (ghBatchCancel) {
+        ghOut("[setup] cancelled — session secrets were cleared; remaining repos not touched.");
+        break;
+      }
+      ghConfiguring.add(repo);
+      ghUpdateRow(repo);
+      ghOut("[" + repo + "] starting…");
+      let ok = false;
+      try {
+        const raw = await tauriInvoke("github_setup_repo", {
+          token, repo, backendUrl: base, webhookSecret: secret,
+          openrouterKey: orKey, workflowProvider: provider,
+        });
+        const r = jsonObj(raw);
+        if (!r) throw new Error("unexpected setup response");
+        ghOut("[" + repo + "] webhook: " + (r.webhook || "unknown") + ghErrSuffix(r.errors && r.errors.webhook));
+        ghOut("[" + repo + "] secrets: " + (r.secrets || "unknown") + ghErrSuffix(r.errors && r.errors.secrets));
+        ghOut("[" + repo + "] workflow: " + (r.workflow || "unknown") +
+          ghErrSuffix(r.errors && r.errors.workflow) +
+          (r.workflow_path ? " (" + r.workflow_path + ")" : ""));
+        if (r.webhook_url) ghOut("[" + repo + "] webhook target: " + r.webhook_url);
+        ok = !!r.ok;
+        if (ok) {
+          ghFailed.delete(repo);
+          successful.push(repo);
+          ghOut("[" + repo + "] done.");
+        } else {
+          ghFailed.add(repo);
+          batchFailed.push(repo);
+          ghOut("[" + repo + "] failed — see per-step statuses above.");
+        }
+      } catch (e) {
+        ghFailed.add(repo);
+        batchFailed.push(repo);
+        ghOut("[" + repo + "] error: " + String(e).slice(0, 300));
+      } finally {
+        ghConfiguring.delete(repo);
+      }
+      // Refresh this repo's badges once; a status failure must not abort the batch.
+      await ghLoadStatus(repo, true);
+      ghUpdateRow(repo);
+    }
+
+    ghOut("=== Done: " + successful.length + " succeeded, " + batchFailed.length + " failed ===");
+    if (successful.length) toastOk("GitHub setup", successful.length + " repo(s) configured.");
+    if (batchFailed.length) toastErr("GitHub setup", batchFailed.length + " repo(s) failed — use Retry failed.");
+    if (!ghBatchCancel && $("gh-agent-create") && $("gh-agent-create").checked && successful.length) {
+      await ghUpsertAgent(successful);
+    }
+  } catch (e) {
+    ghOut("[fatal] " + String(e).slice(0, 300));
+    toastErr("GitHub setup", String(e).slice(0, 220));
+  } finally {
+    ghBatchRunning = false;
+    ghConfiguring.clear();
+    for (const n of repos) ghUpdateRow(n);
+    ghUpdateConfigureBtn();
+    if ($("btn-gh-repos-refresh")) $("btn-gh-repos-refresh").disabled = false;
+    if ($("btn-gh-status-refresh")) $("btn-gh-status-refresh").disabled = false;
+  }
+}
+function ghResetUi() {
+  ghOauthCancel = true;
+  ghVerificationUri = "";
+  ghBatchCancel = true;
+  if ($("gh-webhook-secret")) $("gh-webhook-secret").value = "";
+  if ($("gh-oauth-code")) $("gh-oauth-code").classList.add("hidden");
+  if ($("gh-oauth-usercode")) $("gh-oauth-usercode").textContent = "…";
+  if ($("gh-oauth-out")) $("gh-oauth-out").textContent = "";
+  const cancel = $("btn-gh-oauth-cancel");
+  if (cancel) { cancel.classList.add("hidden"); cancel.disabled = false; }
+  if ($("gh-setup-out")) $("gh-setup-out").textContent = "Configure log appears here.";
+  if ($("gh-repo-search")) $("gh-repo-search").value = "";
+  if ($("gh-repo-list")) $("gh-repo-list").textContent = "";
+  if ($("gh-repo-count")) $("gh-repo-count").textContent = "0 of 0 repos";
+  if ($("gh-repo-section")) $("gh-repo-section").classList.add("hidden");
+  ghRepos.length = 0;
+  ghSelected.clear();
+  ghStatus.clear();
+  ghStatusInflight.clear();
+  ghFailed.clear();
+  ghConfiguring.clear();
+  ghRowEls.clear();
+  if ($("gh-repo-list")) ghEmptyNote($("gh-repo-list"), "No repositories loaded — click Refresh repos.");
+  ghSetState(false, "");
+  ghKeyHint();
+  ghUpdateConfigureBtn();
 }
 
 /* ---------- providers / box ---------- */
@@ -826,7 +1448,7 @@ function wire() {
   on("btn-clear-secrets", clearSecrets);
   on("btn-forget", clearSecrets);
 
-  $("backend-url").addEventListener("change", () => { backendUrl(); checkBackend(false); });
+  $("backend-url").addEventListener("change", () => { backendUrl(); ghHookHint(); checkBackend(false); });
   on("btn-backend-test", async () => {
     $("backend-out").textContent = "Testing…";
     const ok = await checkBackend(true);
@@ -868,6 +1490,28 @@ function wire() {
   on("btn-oauth-start", oauthStart);
   on("btn-oauth-cancel", () => { oauthCancel = true; });
   on("btn-oauth-pat", oauthPat);
+
+  // GitHub — 1-click repo setup (separate flow from Settings OAuth above)
+  on("btn-gh-oauth-start", ghOauthStart);
+  on("btn-gh-oauth-cancel", ghOauthCancelFlow);
+  on("gh-oauth-open", () => { if (ghVerificationUri) openUrl(ghVerificationUri); });
+  if ($("gh-oauth-client")) $("gh-oauth-client").addEventListener("input", ghPersistClientId);
+  if ($("oauth-client")) $("oauth-client").addEventListener("input", () => {
+    const src = $("oauth-client");
+    try { localStorage.setItem("pragent.oauth_client", src.value.trim()); } catch (_) {}
+    const other = $("gh-oauth-client");
+    if (other && other.value !== src.value) other.value = src.value;
+  });
+  if ($("gh-repo-search")) $("gh-repo-search").addEventListener("input", ghRenderRepos);
+  on("btn-gh-repos-refresh", ghLoadRepos);
+  on("btn-gh-status-refresh", ghCheckStatus);
+  on("btn-gh-secret-gen", () => {
+    const el = $("gh-webhook-secret");
+    if (el) el.value = ghRandomSecret();
+    toastOk("Webhook secret generated", "Configure will save it to backend/.env only if that option is checked.");
+  });
+  on("btn-gh-configure", () => ghConfigure(false));
+  on("btn-gh-retry-failed", () => ghConfigure(true));
 
   // agents
   on("btn-agents-save", saveAgent);
@@ -915,6 +1559,8 @@ function wire() {
   on("btn-int-redis-save", () => intSave([["UPSTASH_REDIS_REST_URL", "int-redis-url"], ["UPSTASH_REDIS_REST_TOKEN", "int-redis-token"]], "Redis"));
   on("btn-int-or-save", () => intSave([["OPENROUTER_API_KEY", "int-or-key"]], "OpenRouter"));
   if ($("int-cloud-base")) $("int-cloud-base").addEventListener("input", intHookUrl);
+  if ($("int-cloud-base")) $("int-cloud-base").addEventListener("input", ghHookHint);
+  if ($("int-or-key")) $("int-or-key").addEventListener("input", ghKeyHint);
   on("btn-int-hook-copy", async () => {
     const url = intHookUrl();
     if (url.includes("<cloud-app>")) { toastErr("Webhook URL", "Enter your cloud app base URL first."); return; }
@@ -990,17 +1636,29 @@ function wire() {
   } catch (_) {}
   try {
     const oc = localStorage.getItem("pragent.oauth_client");
-    if (oc && $("oauth-client")) $("oauth-client").value = oc;
+    if (oc) {
+      if ($("oauth-client")) $("oauth-client").value = oc;
+      if ($("gh-oauth-client")) $("gh-oauth-client").value = oc;
+    }
   } catch (_) {}
   loadSecrets();
   syncSecretInputs();
-  if (Secrets.github) setGhState(true, "");
+  if (Secrets.github) {
+    setGhState(true, "");
+    ghSetState(true, "");
+    const ghSection = $("gh-repo-section");
+    if (ghSection) ghSection.classList.remove("hidden");
+  }
+  ghRestoreClientId();
   wire();
   try {
     const last = localStorage.getItem("pragent.tab");
     if (last && TAB_TITLES[last]) switchTab(last);
   } catch (_) {}
   backendUrl();
+  ghHookHint();
+  ghKeyHint();
+  ghUpdateConfigureBtn();
   renderRepoPicker([]);
   checkBackend(false);
   loadConfig();

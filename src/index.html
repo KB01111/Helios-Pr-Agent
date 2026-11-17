@@ -337,6 +337,79 @@
           <pre class="out" id="int-out">Integrations not checked.</pre>
         </div>
 
+        <div class="card" id="gh-setup-card">
+          <div class="card-head"><h2>GitHub — 1-click repo setup</h2><span class="badge" id="gh-oauth-state">Not connected</span></div>
+          <p class="hint">Sign in with a GitHub OAuth App. Create one at <code>github.com/settings/developers</code>, enable <b>Device Flow</b> (callback <code>http://localhost</code>), then paste its Client ID here. The token stays in memory/sessionStorage and is only used for the setup calls below — it is never written to <code>localStorage</code>.</p>
+          <div class="grid2">
+            <div class="field"><span class="lbl">OAuth App Client ID (not secret — stored in localStorage)</span>
+              <input id="gh-oauth-client" placeholder="Ov23…" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">GitHub sign-in (device flow)</span>
+              <div class="row wrap">
+                <button id="btn-gh-oauth-start" class="btn btn-accent btn-sm" type="button">Sign in with GitHub</button>
+                <button id="btn-gh-oauth-cancel" class="btn btn-ghost btn-sm hidden" type="button">Cancel</button>
+              </div>
+            </div>
+          </div>
+          <div id="gh-oauth-code" class="hidden">
+            <p class="hint">Enter this code on GitHub (Device Flow must be enabled on the OAuth App):</p>
+            <p id="gh-oauth-usercode" class="bigcode">…</p>
+            <div class="row wrap">
+              <button id="gh-oauth-open" class="btn btn-outline btn-sm" type="button">Open GitHub</button>
+              <span id="gh-oauth-out" class="hint">…</span>
+            </div>
+          </div>
+
+          <div id="gh-repo-section" class="hidden">
+            <div class="card-head mt"><h2>Repositories</h2><span class="badge" id="gh-repo-count">0 of 0 repos</span></div>
+            <p class="hint">Tick repositories to configure. Webhooks, secrets and workflow files require <b>admin</b> access. Statuses load on demand — tick a repo or use “Check status” (never auto-checks every repo).</p>
+            <div class="gh-toolbar">
+              <input id="gh-repo-search" placeholder="Filter repositories…" autocomplete="off" />
+              <button id="btn-gh-repos-refresh" class="btn btn-outline btn-sm" type="button">Refresh repos</button>
+              <button id="btn-gh-status-refresh" class="btn btn-outline btn-sm" type="button">Check status</button>
+            </div>
+            <div class="gh-repo-list" id="gh-repo-list"><p class="hint">No repositories loaded — click Refresh repos.</p></div>
+
+            <div class="grid2">
+              <div class="field"><span class="lbl">Webhook secret (auto-generated when empty)</span>
+                <div class="row">
+                  <input id="gh-webhook-secret" type="password" placeholder="auto-generated 32-byte hex" autocomplete="off" style="flex:1" />
+                  <button id="btn-gh-secret-gen" class="btn btn-outline btn-sm" type="button">Generate</button>
+                </div>
+              </div>
+              <div class="field"><span class="lbl">Workflow provider</span>
+                <select id="gh-workflow-provider">
+                  <option value="pr-agent" selected>PR Agent (Inkling)</option>
+                  <option value="openrabbit">OpenRabbit Reviewer</option>
+                </select>
+              </div>
+            </div>
+            <p class="hint" id="gh-hook-target">Webhook target: …</p>
+            <p class="hint">The base URL comes from “Cloud app base URL” in the GitHub webhook URL card below; it falls back to the Settings backend URL.</p>
+            <div class="checks">
+              <label><input type="checkbox" id="gh-secret-save" checked /> Save webhook secret to <code>backend/.env</code></label>
+              <label><input type="checkbox" id="gh-save-token" /> Save GitHub token to <code>backend/.env</code></label>
+            </div>
+            <p class="hint">Saving to <code>.env</code> requires a backend restart to take effect. The token otherwise stays in memory/sessionStorage only.</p>
+            <p class="hint">OpenRouter key: uses the key saved in the OpenRouter row above, then the session key. <span id="gh-or-hint">(no OpenRouter key yet)</span></p>
+
+            <div class="grid2">
+              <div class="field"><span class="lbl">Backend agent name</span>
+                <input id="gh-agent-name" value="pr-agent-control" autocomplete="off" />
+              </div>
+              <div class="field"><span class="lbl">Agent sync</span>
+                <label class="gh-check-inline"><input type="checkbox" id="gh-agent-create" checked /> Create/update backend agent for these repos</label>
+              </div>
+            </div>
+
+            <div class="row wrap">
+              <button id="btn-gh-configure" class="btn btn-accent" type="button" disabled>Configure selected (0)</button>
+              <button id="btn-gh-retry-failed" class="btn btn-outline hidden" type="button">Retry failed</button>
+            </div>
+            <pre class="out gh-progress" id="gh-setup-out">Configure log appears here.</pre>
+          </div>
+        </div>
+
         <div class="card">
           <div class="card-head"><h2>GitHub webhook URL</h2><span class="badge">copy-paste</span></div>
           <p class="hint">Repo Settings → Webhooks → Add webhook: paste the Payload URL below, Content type

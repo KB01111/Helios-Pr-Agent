@@ -4,6 +4,8 @@
 // Reads/writes .pr_agent.toml + workflow file next to the app root,
 // and optionally shells out to a local `pr-agent` CLI if installed.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -91,7 +93,7 @@ fn get_val(src: &str, key: &str) -> Option<String> {
 
 #[tauri::command]
 async fn get_config() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || get_config_blocking())
+    tauri::async_runtime::spawn_blocking(get_config_blocking)
         .await
         .map_err(|e| e.to_string())?
 }
@@ -199,7 +201,7 @@ auto_improve = {ai}
 
 #[tauri::command]
 async fn get_workflow() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || get_workflow_blocking())
+    tauri::async_runtime::spawn_blocking(get_workflow_blocking)
         .await
         .map_err(|e| e.to_string())?
 }
@@ -313,6 +315,7 @@ fn run_local_review_blocking(pr_url: String, command: String, openrouter_key: St
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn box_provision(
     box_key: String,
     github_token: String,
@@ -328,6 +331,7 @@ async fn box_provision(
         .map_err(|e| e.to_string())?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn box_provision_blocking(
     box_key: String,
     github_token: String,
@@ -455,7 +459,7 @@ fn check_tool_blocking(name: String) -> Result<String, String> {
 
 #[tauri::command]
 async fn install_pr_agent() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || install_pr_agent_blocking())
+    tauri::async_runtime::spawn_blocking(install_pr_agent_blocking)
         .await
         .map_err(|e| e.to_string())?
 }
@@ -695,7 +699,7 @@ fn require_secure_for_token(url: &str, has_token: bool) -> Result<(), String> {
 }
 
 fn backend_get(url: &str, api_token: Option<&str>) -> Result<String, String> {
-    require_secure_for_token(url, api_token.map(str::trim).map_or(false, |t| !t.is_empty()))?;
+    require_secure_for_token(url, api_token.map(str::trim).is_some_and(|t| !t.is_empty()))?;
     let mut req = gh_client()?
         .get(url)
         .header("Accept", "application/json");
@@ -977,8 +981,85 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
     Ok(path.to_string_lossy().to_string())
 }
 
+/// `owner/name`, each part 1-100 chars of [A-Za-z0-9_.-].
+fn valid_repo_name(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) => {
+            let valid = |part: &str| {
+                !part.is_empty()
+                    && part.len() <= 100
+                    && part
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            };
+            valid(owner) && valid(name)
+        }
+        _ => false,
+    }
+}
+
+/// Short single-line excerpt of an error body for UI messages (never headers).
+fn gh_snippet(body: &str) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(300).collect();
+    if flat.chars().count() > 300 {
+        out.push('…');
+    }
+    out
+}
+
+fn gh_error_text(status: u16, body: &str) -> String {
+    let snippet = gh_snippet(body);
+    if snippet.is_empty() {
+        format!("HTTP {}", status)
+    } else {
+        format!("HTTP {}: {}", status, snippet)
+    }
+}
+
+/// One authenticated GitHub API call. `query` is encoded by reqwest (branch
+/// names may contain '/'). Returns (status, body) without interpreting either.
+fn gh_request_json(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    method: reqwest::Method,
+    url: &str,
+    query: &[(&str, &str)],
+    body: Option<serde_json::Value>,
+) -> Result<(u16, String), String> {
+    let mut req = client
+        .request(method, url)
+        .query(query)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(value) = body {
+        req = req.json(&value);
+    }
+    let res = req.send().map_err(|e| format!("GitHub unreachable: {}", e))?;
+    let status = res.status().as_u16();
+    let text = res.text().map_err(|e| e.to_string())?;
+    Ok((status, text))
+}
+
+fn hook_url(hook: &serde_json::Value) -> Option<&str> {
+    hook.get("config")
+        .and_then(|c| c.get("url"))
+        .and_then(|u| u.as_str())
+}
+
+/// First hook (id, url) whose URL satisfies `matches`.
+fn find_hook(body: &str, matches: impl Fn(&str) -> bool) -> Option<(u64, String)> {
+    let hooks: serde_json::Value = serde_json::from_str(body).ok()?;
+    hooks.as_array()?.iter().find_map(|hook| {
+        let url = hook_url(hook).filter(|u| matches(u))?;
+        Some((hook.get("id").and_then(|id| id.as_u64())?, url.to_string()))
+    })
+}
+
 /// GET https://api.github.com/user/repos — list repos for the sync picker.
-/// Token is passed in memory only, never stored. Returns raw JSON array text.
+/// Token is passed in memory only, never stored. Returns compact repo objects.
 #[tauri::command]
 async fn github_list_repos(token: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || github_list_repos_blocking(token))
@@ -995,30 +1076,700 @@ fn github_list_repos_blocking(token: String) -> Result<String, String> {
     let mut all: Vec<serde_json::Value> = Vec::new();
     // Five pages (500 repos) is plenty for the picker and bounds latency.
     for page in 1..=5 {
-        let res = client
-            .get(format!(
-                "https://api.github.com/user/repos?per_page=100&sort=updated&page={}",
-                page
-            ))
-            .header("Accept", "application/vnd.github+json")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .map_err(|e| format!("GitHub unreachable: {}", e))?;
-        let status = res.status();
-        let body = res.text().map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(format!("GitHub HTTP {}: {}", status, body.chars().take(300).collect::<String>()));
+        let url = format!(
+            "https://api.github.com/user/repos?per_page=100&sort=updated&page={}",
+            page
+        );
+        let (status, body) = gh_request_json(&client, token, reqwest::Method::GET, &url, &[], None)?;
+        if status != 200 {
+            return Err(format!("GitHub {}", gh_error_text(status, &body)));
         }
         let batch: Vec<serde_json::Value> = serde_json::from_str(&body)
             .map_err(|e| format!("GitHub response was not a JSON array: {}", e))?;
         let count = batch.len();
-        all.extend(batch);
+        for repo in batch {
+            let full_name = repo
+                .get("full_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if full_name.is_empty() {
+                continue;
+            }
+            let admin = repo
+                .get("permissions")
+                .and_then(|p| p.get("admin"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            all.push(serde_json::json!({
+                "full_name": full_name,
+                "private": repo.get("private").and_then(|v| v.as_bool()).unwrap_or(false),
+                "default_branch": repo
+                    .get("default_branch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("main"),
+                "admin": admin,
+                "permissions": { "admin": admin },
+            }));
+        }
         if count < 100 {
             break;
         }
     }
     serde_json::to_string(&all).map_err(|e| e.to_string())
+}
+
+/// Inspect a repo: webhook, workflow file and Actions secret names (no values).
+#[tauri::command]
+async fn github_repo_status(token: String, repo: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || github_repo_status_blocking(token, repo))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_repo_status_blocking(token: String, repo: String) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+
+    let (status, body) =
+        gh_request_json(&client, token, reqwest::Method::GET, &repo_api, &[], None)?;
+    match status {
+        200 => {}
+        401 => return Err("GitHub rejected the token (HTTP 401)".into()),
+        404 => return Err(format!("repository {} was not found or is not accessible", repo)),
+        _ => return Err(format!("repository lookup {}", gh_error_text(status, &body))),
+    }
+    let repo_json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("repository response was not JSON: {}", e))?;
+    let default_branch = repo_json
+        .get("default_branch")
+        .and_then(|v| v.as_str())
+        .filter(|b| !b.is_empty())
+        .unwrap_or("main")
+        .to_string();
+
+    let mut webhook = serde_json::json!({"configured": false, "id": null, "url": ""});
+    let hooks_url = format!("{}/hooks?per_page=100", repo_api);
+    match gh_request_json(&client, token, reqwest::Method::GET, &hooks_url, &[], None) {
+        Ok((200, hooks_body)) => {
+            if let Some((id, url)) = find_hook(&hooks_body, |u| {
+                u.trim_end_matches('/').ends_with("/webhooks/github")
+            }) {
+                webhook = serde_json::json!({"configured": true, "id": id, "url": url});
+            }
+        }
+        Ok((status, hooks_body)) => {
+            webhook = serde_json::json!({
+                "configured": false,
+                "id": null,
+                "url": "",
+                "error": gh_error_text(status, &hooks_body),
+            });
+        }
+        Err(e) => {
+            webhook = serde_json::json!({"configured": false, "id": null, "url": "", "error": e});
+        }
+    }
+
+    let mut workflow = serde_json::json!({
+        "configured": false,
+        "file": null,
+        "path": null,
+        "provider": null,
+    });
+    let mut workflow_error: Option<String> = None;
+    for (provider, path) in [
+        ("pr-agent", ".github/workflows/pr-agent.yml"),
+        ("openrabbit", ".github/workflows/openrabbit.yml"),
+    ] {
+        let url = format!("{}/contents/{}", repo_api, path);
+        match gh_request_json(
+            &client,
+            token,
+            reqwest::Method::GET,
+            &url,
+            &[("ref", default_branch.as_str())],
+            None,
+        ) {
+            Ok((200, _)) => {
+                let file = path.rsplit('/').next().unwrap_or(path);
+                workflow = serde_json::json!({
+                    "configured": true,
+                    "file": file,
+                    "path": path,
+                    "provider": provider,
+                });
+                break;
+            }
+            Ok((404, _)) => {}
+            Ok((status, body)) => {
+                workflow_error = Some(gh_error_text(status, &body));
+                break;
+            }
+            Err(e) => {
+                workflow_error = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(error) = workflow_error {
+        if let Some(map) = workflow.as_object_mut() {
+            map.insert("error".to_string(), serde_json::Value::String(error));
+        }
+    }
+
+    let mut secrets = serde_json::json!({
+        "configured": false,
+        "openrouter_api_key": false,
+        "llm_api_key": false,
+        "names": [],
+    });
+    let secrets_url = format!("{}/actions/secrets?per_page=100", repo_api);
+    match gh_request_json(&client, token, reqwest::Method::GET, &secrets_url, &[], None) {
+        Ok((200, secrets_body)) => match serde_json::from_str::<serde_json::Value>(&secrets_body) {
+            Ok(value) => {
+                let names: Vec<String> = value
+                    .get("secrets")
+                    .and_then(|s| s.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("name").and_then(|n| n.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let has_openrouter = names.iter().any(|n| n == "OPENROUTER_API_KEY");
+                let has_llm = names.iter().any(|n| n == "LLM_API_KEY");
+                // OpenRabbit needs both keys; the PR Agent workflow only needs
+                // OPENROUTER_API_KEY. If no workflow is present, require the
+                // key that every setup writes.
+                let needs_llm = workflow
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|p| p == "openrabbit");
+                let secrets_ok = has_openrouter && (!needs_llm || has_llm);
+                secrets = serde_json::json!({
+                    "configured": secrets_ok,
+                    "openrouter_api_key": has_openrouter,
+                    "llm_api_key": has_llm,
+                    "names": names,
+                });
+            }
+            Err(_) => {
+                secrets = serde_json::json!({
+                    "configured": false,
+                    "openrouter_api_key": false,
+                    "llm_api_key": false,
+                    "names": [],
+                    "error": "secrets response was not JSON",
+                });
+            }
+        },
+        Ok((status, secrets_body)) => {
+            secrets = serde_json::json!({
+                "configured": false,
+                "openrouter_api_key": false,
+                "llm_api_key": false,
+                "names": [],
+                "error": gh_error_text(status, &secrets_body),
+            });
+        }
+        Err(e) => {
+            secrets = serde_json::json!({
+                "configured": false,
+                "openrouter_api_key": false,
+                "llm_api_key": false,
+                "names": [],
+                "error": e,
+            });
+        }
+    }
+
+    let webhook_ok = webhook
+        .get("configured")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let workflow_ok = workflow
+        .get("configured")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let secrets_ok = secrets
+        .get("configured")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    serde_json::to_string(&serde_json::json!({
+        "repo": repo,
+        "webhook": webhook,
+        "workflow": workflow,
+        "secrets": secrets,
+        "configured": webhook_ok && workflow_ok && secrets_ok,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+static SODIUM_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+
+fn ensure_sodium() -> Result<(), String> {
+    SODIUM_INIT
+        .get_or_init(|| sodiumoxide::init().map_err(|_| "failed to initialize libsodium".to_string()))
+        .clone()
+}
+
+/// Create or update the pull_request webhook pointing at the backend.
+fn gh_setup_webhook(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    target_url: &str,
+    secret: &str,
+) -> (&'static str, Option<String>) {
+    let hooks_url = format!("{}/hooks?per_page=100", repo_api);
+    let update_body = serde_json::json!({
+        "config": {"url": target_url, "content_type": "json", "secret": secret},
+        "events": ["pull_request"],
+        "active": true,
+    });
+    let mut create_body = update_body.clone();
+    if let Some(map) = create_body.as_object_mut() {
+        map.insert("name".to_string(), serde_json::Value::String("web".to_string()));
+    }
+
+    let existing_url_matches = |u: &str| u.trim_end_matches('/') == target_url;
+    let existing = match gh_request_json(client, token, reqwest::Method::GET, &hooks_url, &[], None) {
+        Ok((200, body)) => find_hook(&body, existing_url_matches).map(|(id, _)| id),
+        _ => None,
+    };
+    if let Some(id) = existing {
+        return match gh_request_json(
+            client,
+            token,
+            reqwest::Method::PATCH,
+            &format!("{}/hooks/{}", repo_api, id),
+            &[],
+            Some(update_body),
+        ) {
+            Ok((200, _)) => ("updated", None),
+            Ok((status, body)) => (
+                "failed",
+                Some(format!("update webhook: {}", gh_error_text(status, &body))),
+            ),
+            Err(e) => ("failed", Some(format!("update webhook: {}", e))),
+        };
+    }
+
+    match gh_request_json(
+        client,
+        token,
+        reqwest::Method::POST,
+        &hooks_url,
+        &[],
+        Some(create_body),
+    ) {
+        Ok((200, _)) | Ok((201, _)) => ("created", None),
+        Ok((422, _)) => {
+            // GitHub rejects a duplicate hook URL; patch the existing hook instead.
+            let existing = match gh_request_json(
+                client,
+                token,
+                reqwest::Method::GET,
+                &hooks_url,
+                &[],
+                None,
+            ) {
+                Ok((200, body)) => find_hook(&body, existing_url_matches).map(|(id, _)| id),
+                _ => None,
+            };
+            match existing {
+                Some(id) => match gh_request_json(
+                    client,
+                    token,
+                    reqwest::Method::PATCH,
+                    &format!("{}/hooks/{}", repo_api, id),
+                    &[],
+                    Some(update_body),
+                ) {
+                    Ok((200, _)) => ("updated", None),
+                    Ok((status, body)) => (
+                        "failed",
+                        Some(format!("update webhook: {}", gh_error_text(status, &body))),
+                    ),
+                    Err(e) => ("failed", Some(format!("update webhook: {}", e))),
+                },
+                None => (
+                    "failed",
+                    Some("create webhook: HTTP 422 and no matching hook was found".into()),
+                ),
+            }
+        }
+        Ok((status, body)) => (
+            "failed",
+            Some(format!("create webhook: {}", gh_error_text(status, &body))),
+        ),
+        Err(e) => ("failed", Some(format!("create webhook: {}", e))),
+    }
+}
+
+/// Upsert Actions secrets with GitHub's sealed-box public key.
+fn gh_setup_secrets(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    provider: &str,
+    openrouter_key: &str,
+) -> (&'static str, Option<String>) {
+    if let Err(e) = ensure_sodium() {
+        return ("failed", Some(e));
+    }
+    let key_url = format!("{}/actions/secrets/public-key", repo_api);
+    let (status, body) =
+        match gh_request_json(client, token, reqwest::Method::GET, &key_url, &[], None) {
+            Ok(response) => response,
+            Err(e) => return ("failed", Some(format!("actions public key: {}", e))),
+        };
+    if status != 200 {
+        return (
+            "failed",
+            Some(format!("actions public key: {}", gh_error_text(status, &body))),
+        );
+    }
+    let public_key_json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => return ("failed", Some("actions public key: response was not JSON".into())),
+    };
+    let key_id = match public_key_json.get("key_id").and_then(|v| v.as_str()) {
+        Some(key_id) => key_id.to_string(),
+        None => return ("failed", Some("actions public key: missing key_id".into())),
+    };
+    let key_b64 = match public_key_json.get("key").and_then(|v| v.as_str()) {
+        Some(key) => key,
+        None => return ("failed", Some("actions public key: missing key".into())),
+    };
+    let raw_key = match STANDARD.decode(key_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => return ("failed", Some("actions public key: key was not valid base64".into())),
+    };
+    let public_key = match sodiumoxide::crypto::box_::PublicKey::from_slice(&raw_key) {
+        Some(key) => key,
+        None => return ("failed", Some("actions public key: expected 32 bytes".into())),
+    };
+
+    let secrets: &[(&str, &str)] = match provider {
+        "openrabbit" => &[
+            ("OPENROUTER_API_KEY", openrouter_key),
+            ("LLM_API_KEY", openrouter_key),
+        ],
+        _ => &[("OPENROUTER_API_KEY", openrouter_key)],
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for &(name, value) in secrets {
+        let sealed = sodiumoxide::crypto::sealedbox::seal(value.as_bytes(), &public_key);
+        let secret_url = format!("{}/actions/secrets/{}", repo_api, name);
+        let payload = serde_json::json!({
+            "encrypted_value": STANDARD.encode(sealed),
+            "key_id": key_id.as_str(),
+        });
+        match gh_request_json(client, token, reqwest::Method::PUT, &secret_url, &[], Some(payload)) {
+            Ok((status, _)) if (200..300).contains(&status) => {}
+            Ok((status, body)) => failures.push(format!("{}: {}", name, gh_error_text(status, &body))),
+            Err(e) => failures.push(format!("{}: {}", name, e)),
+        }
+    }
+    if failures.is_empty() {
+        ("updated", None)
+    } else {
+        ("failed", Some(format!("actions secrets: {}", failures.join("; "))))
+    }
+}
+
+/// Create, update or leave alone the workflow file on the default branch.
+fn gh_commit_workflow(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    branch: &str,
+    provider: &str,
+) -> (&'static str, Option<String>) {
+    let (path, template, message) = match provider {
+        "openrabbit" => (
+            ".github/workflows/openrabbit.yml",
+            OPENRABBIT_WORKFLOW,
+            "chore: add OpenRabbit reviewer workflow (PR Agent Control)",
+        ),
+        _ => (
+            ".github/workflows/pr-agent.yml",
+            PR_AGENT_WORKFLOW,
+            "chore: add PR Agent workflow (PR Agent Control)",
+        ),
+    };
+    let url = format!("{}/contents/{}", repo_api, path);
+    let (status, body) =
+        match gh_request_json(client, token, reqwest::Method::GET, &url, &[("ref", branch)], None) {
+            Ok(response) => response,
+            Err(e) => return ("failed", Some(format!("workflow: {}", e))),
+        };
+    let mut sha: Option<String> = None;
+    match status {
+        200 => {
+            let file_json: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(value) => value,
+                Err(_) => {
+                    return (
+                        "failed",
+                        Some("workflow: existing file response was not JSON".into()),
+                    )
+                }
+            };
+            sha = file_json
+                .get("sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let encoded = file_json
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let cleaned: String = encoded
+                .chars()
+                .filter(|c| !matches!(c, '\n' | '\r'))
+                .collect();
+            let current = match STANDARD.decode(cleaned) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return (
+                        "failed",
+                        Some("workflow: existing file content was not valid base64".into()),
+                    )
+                }
+            };
+            if current == template.as_bytes() {
+                return ("unchanged", None);
+            }
+        }
+        404 => {}
+        _ => {
+            return (
+                "failed",
+                Some(format!("workflow: {}", gh_error_text(status, &body))),
+            )
+        }
+    }
+
+    let make_body = |sha: Option<&str>| {
+        let mut value = serde_json::json!({
+            "message": message,
+            "content": STANDARD.encode(template.as_bytes()),
+            "branch": branch,
+        });
+        if let Some(sha) = sha {
+            if let Some(map) = value.as_object_mut() {
+                map.insert("sha".to_string(), serde_json::Value::String(sha.to_string()));
+            }
+        }
+        value
+    };
+
+    match gh_request_json(
+        client,
+        token,
+        reqwest::Method::PUT,
+        &url,
+        &[],
+        Some(make_body(sha.as_deref())),
+    ) {
+        Ok((201, _)) => ("created", None),
+        Ok((200, _)) => ("updated", None),
+        Ok((409, _)) => {
+            // Race: re-read the fresh sha and retry the same PUT once.
+            match gh_request_json(client, token, reqwest::Method::GET, &url, &[("ref", branch)], None)
+            {
+                Ok((200, fresh_body)) => {
+                    let fresh_sha = serde_json::from_str::<serde_json::Value>(&fresh_body)
+                        .ok()
+                        .and_then(|v| v.get("sha").and_then(|s| s.as_str()).map(str::to_string));
+                    match fresh_sha {
+                        Some(fresh_sha) => match gh_request_json(
+                            client,
+                            token,
+                            reqwest::Method::PUT,
+                            &url,
+                            &[],
+                            Some(make_body(Some(fresh_sha.as_str()))),
+                        ) {
+                            Ok((200, _)) | Ok((201, _)) => ("updated", None),
+                            Ok((status, body)) => (
+                                "failed",
+                                Some(format!("workflow: {}", gh_error_text(status, &body))),
+                            ),
+                            Err(e) => ("failed", Some(format!("workflow: {}", e))),
+                        },
+                        None => (
+                            "failed",
+                            Some("workflow: conflict and no file sha was returned".into()),
+                        ),
+                    }
+                }
+                Ok((status, body)) => (
+                    "failed",
+                    Some(format!(
+                        "workflow: conflict; re-read failed: {}",
+                        gh_error_text(status, &body)
+                    )),
+                ),
+                Err(e) => (
+                    "failed",
+                    Some(format!("workflow: conflict; re-read failed: {}", e)),
+                ),
+            }
+        }
+        Ok((status, body)) => (
+            "failed",
+            Some(format!("workflow: {}", gh_error_text(status, &body))),
+        ),
+        Err(e) => ("failed", Some(format!("workflow: {}", e))),
+    }
+}
+
+/// One-click repo setup: webhook + Actions secrets + workflow file.
+/// Each step runs independently and reports its own status. The token,
+/// webhook secret and API key are never returned or logged.
+#[tauri::command]
+async fn github_setup_repo(
+    token: String,
+    repo: String,
+    backend_url: String,
+    webhook_secret: String,
+    openrouter_key: String,
+    workflow_provider: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_setup_repo_blocking(
+            token,
+            repo,
+            backend_url,
+            webhook_secret,
+            openrouter_key,
+            workflow_provider,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn github_setup_repo_blocking(
+    token: String,
+    repo: String,
+    backend_url: String,
+    webhook_secret: String,
+    openrouter_key: String,
+    workflow_provider: String,
+) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let backend = backend_url.trim().trim_end_matches('/').to_string();
+    if !(backend.starts_with("http://") || backend.starts_with("https://")) {
+        return Err("backend_url must start with http(s)://".into());
+    }
+    if webhook_secret.trim().is_empty() {
+        return Err("webhook_secret is required".into());
+    }
+    if webhook_secret.contains('\r') || webhook_secret.contains('\n') {
+        return Err("webhook_secret must be a single line".into());
+    }
+    if openrouter_key.trim().is_empty() {
+        return Err("openrouter_key is required".into());
+    }
+    if openrouter_key.contains('\r') || openrouter_key.contains('\n') {
+        return Err("openrouter_key must be a single line".into());
+    }
+    // backend/.env stores trimmed values, so trim here too or webhook
+    // signatures and API keys would not match what the backend loads.
+    let webhook_secret = webhook_secret.trim();
+    let openrouter_key = openrouter_key.trim();
+    if webhook_secret.len() > 512 {
+        return Err("webhook_secret is too long (max 512 bytes)".into());
+    }
+    let provider = workflow_provider.trim();
+    let workflow_path = match provider {
+        "pr-agent" => ".github/workflows/pr-agent.yml",
+        "openrabbit" => ".github/workflows/openrabbit.yml",
+        _ => return Err("workflow_provider must be 'pr-agent' or 'openrabbit'".into()),
+    };
+
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+    let webhook_url = format!("{}/webhooks/github", backend);
+
+    let (webhook_status, webhook_error) =
+        gh_setup_webhook(&client, token, &repo_api, &webhook_url, webhook_secret);
+    let (secrets_status, secrets_error) =
+        gh_setup_secrets(&client, token, &repo_api, provider, openrouter_key);
+
+    let (default_branch, workflow_status, workflow_error): (String, &'static str, Option<String>) =
+        match gh_request_json(&client, token, reqwest::Method::GET, &repo_api, &[], None) {
+            Ok((200, body)) => {
+                let repo_json: serde_json::Value =
+                    serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                let default_branch = repo_json
+                    .get("default_branch")
+                    .and_then(|v| v.as_str())
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or("main")
+                    .to_string();
+                let (status, error) =
+                    gh_commit_workflow(&client, token, &repo_api, &default_branch, provider);
+                (default_branch, status, error)
+            }
+            Ok((status, body)) => (
+                String::new(),
+                "failed",
+                Some(format!("repo lookup: {}", gh_error_text(status, &body))),
+            ),
+            Err(e) => (String::new(), "failed", Some(format!("repo lookup: {}", e))),
+        };
+
+    let mut errors = serde_json::Map::new();
+    if let Some(error) = webhook_error {
+        errors.insert("webhook".to_string(), serde_json::Value::String(error));
+    }
+    if let Some(error) = secrets_error {
+        errors.insert("secrets".to_string(), serde_json::Value::String(error));
+    }
+    if let Some(error) = workflow_error {
+        errors.insert("workflow".to_string(), serde_json::Value::String(error));
+    }
+
+    let mut result = serde_json::json!({
+        "repo": repo,
+        "ok": webhook_status != "failed" && secrets_status != "failed" && workflow_status != "failed",
+        "webhook": webhook_status,
+        "secrets": secrets_status,
+        "workflow": workflow_status,
+        "default_branch": default_branch,
+        "workflow_path": workflow_path,
+        "workflow_provider": provider,
+        "webhook_url": webhook_url,
+    });
+    if !errors.is_empty() {
+        if let Some(map) = result.as_object_mut() {
+            map.insert("errors".to_string(), serde_json::Value::Object(errors));
+        }
+    }
+    serde_json::to_string(&result).map_err(|e| e.to_string())
 }
 
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
@@ -1057,7 +1808,7 @@ fn backend_mutate_blocking(
         return Err("method not allowed".into());
     }
     let url = format!("{}{}", base, p);
-    require_secure_for_token(&url, api_token.as_deref().map(str::trim).map_or(false, |t| !t.is_empty()))?;
+    require_secure_for_token(&url, api_token.as_deref().map(str::trim).is_some_and(|t| !t.is_empty()))?;
     let client = gh_client()?;
     let mut req = match m.as_str() {
         "POST" => client.post(&url),
@@ -1143,7 +1894,9 @@ pub fn run() {
             save_backend_env_var,
             backend_mutate,
             backend_approve_run,
-            github_list_repos
+            github_list_repos,
+            github_repo_status,
+            github_setup_repo
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
