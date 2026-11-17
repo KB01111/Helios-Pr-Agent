@@ -332,6 +332,8 @@ def _reap_stale_queued_runs() -> None:
             try:
                 created = datetime.fromisoformat(str(rec.get("created_at", "")).replace("Z", "+00:00"))
             except ValueError:
+                created = None
+            if created is None:
                 continue
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
@@ -752,10 +754,13 @@ async def _test_upstash_box() -> dict[str, Any]:
     last_status: int | None = None
     async with httpx.AsyncClient(timeout=10.0) as client:
         for url in ("https://api.upstash.com/v2/box", "https://api.upstash.com/v2/boxes"):
+            resp = None
             try:
                 resp = await client.get(url, headers={"Authorization": f"Bearer {key}"})
-            except Exception:
-                continue  # try next endpoint, else fall through to offline verdict
+            except Exception as exc:
+                log.debug("upstash box probe %s failed: %s", url, exc)
+            if resp is None:
+                continue  # try the next endpoint, else report offline
             last_status = resp.status_code
             if 200 <= resp.status_code < 300:
                 return {
