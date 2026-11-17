@@ -266,7 +266,19 @@ _pending_runs = 0
 _pending_lock = threading.Lock()
 
 
-def _fail_run(run_id: str, message: str) -> None:
+def _fail_run(run_id: str, message: str, retries: int = 3) -> None:
+    for attempt in range(retries):
+        if _fail_run_once(run_id, message):
+            return
+        time.sleep(0.2 * (attempt + 1))
+    # Last resort so an undispatched record can't linger as "queued".
+    try:
+        store.rdelete(f"run:{run_id}")
+    except Exception as exc:
+        log.warning("could not remove undispatched run=%s: %s (reaper will fail it)", run_id, exc)
+
+
+def _fail_run_once(run_id: str, message: str) -> bool:
     try:
         current = store.rget_json(f"run:{run_id}")
         if not isinstance(current, dict):
@@ -276,8 +288,10 @@ def _fail_run(run_id: str, message: str) -> None:
         logs.append(f"ERROR: {message}")
         current.update({"status": "failed", "finished_at": _now_iso(), "logs": logs})
         store.rset_json(f"run:{run_id}", current)
+        return True
     except Exception as exc:
         log.warning("could not persist failure for run=%s: %s", run_id, exc)
+        return False
 
 
 def _dispatch_tracked(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
@@ -596,7 +610,12 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
             existing = await store.arget_json(key)
             if not (isinstance(existing, dict) and existing.get("status") == "failed"):
                 continue  # already created (and dispatched) by another delivery
-            # A previously aborted attempt: recreate so the retry actually runs.
+            # A previously failed/aborted attempt: exactly one overlapping
+            # handler wins the per-attempt nx claim and recreates the run.
+            attempt = int(existing.get("attempt", 0) or 0) + 1
+            if not await store.arset(f"runretry:{run_id}:{attempt}", "1", ex=3600, nx=True):
+                continue
+            record["attempt"] = attempt
             await store.arset_json(key, record)
         run_ids.append(run_id)
         pending.append((agent_cfg, run_id))
