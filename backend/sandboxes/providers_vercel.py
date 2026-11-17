@@ -8,11 +8,14 @@ or API error, degrades gracefully to review-only logic attributed to
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
 
 import httpx
+
+from .safety import safe_git_ref, safe_label, safe_repo, shell_quote
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +34,7 @@ class VercelSandboxProvider:
 
         if not token:
             logs.append("vercel_sandbox: VERCEL_TOKEN missing — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, elapsed=30.0)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
         import time
         started = time.monotonic()
@@ -45,7 +48,7 @@ class VercelSandboxProvider:
         except Exception as exc:
             elapsed = time.monotonic() - started
             logs.append(f"vercel_sandbox: API error ({type(exc).__name__}) — review fallback.")
-            return await self._review_fallback(agent_config, pr_context, logs, elapsed=elapsed)
+            return await self._review_fallback(agent_config, pr_context, logs)
 
     async def _run_ephemeral(self, token: str, team_id: str | None, project_id: str | None,
                              agent_config: dict, pr_context: dict,
@@ -54,6 +57,9 @@ class VercelSandboxProvider:
         if team_id:
             params["teamId"] = team_id
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        # Validate/build first so bad webhook input never leaves a sandbox behind.
+        script = _build_command(agent_config, pr_context)
 
         sandbox_id = ""
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -70,7 +76,6 @@ class VercelSandboxProvider:
             logs.append(f"vercel_sandbox: ephemeral sandbox created id={sandbox_id[:12] or '?'}.")
 
             # 2. Exec agent steps
-            script = _build_command(agent_config, pr_context)
             output = ""
             try:
                 exec_resp = await client.post(
@@ -88,16 +93,18 @@ class VercelSandboxProvider:
                     output = exec_resp.text
             except Exception as exc:
                 logs.append(f"vercel_sandbox: exec error ({type(exc).__name__}).")
-
-            # 3. Teardown (best-effort)
-            if sandbox_id:
-                try:
-                    del_resp = await client.delete(
-                        f"{SANDBOX_API}/{sandbox_id}", headers=headers, params=params
+            finally:
+                # 3. Teardown always runs, on its own client and task, so
+                # cancellation (or closing this client) can't interrupt it.
+                if sandbox_id:
+                    task = asyncio.ensure_future(
+                        _teardown(sandbox_id, headers, params, logs)
                     )
-                    logs.append(f"vercel_sandbox: teardown HTTP {del_resp.status_code}.")
-                except Exception as exc:
-                    logs.append(f"vercel_sandbox: teardown error ({type(exc).__name__}).")
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        await asyncio.wait({task}, timeout=20)
+                        raise
 
         logs.extend(output.splitlines()[:50])
         return {
@@ -110,25 +117,37 @@ class VercelSandboxProvider:
         }
 
     async def _review_fallback(self, agent_config: dict, pr_context: dict,
-                               logs: list[str], elapsed: float) -> dict:
+                               logs: list[str]) -> dict:
         from .providers_review import ReviewOnlyProvider
 
         review = ReviewOnlyProvider()
         result = await review.run(agent_config, pr_context)
         result["provider"] = "vercel_sandbox"
-        result["cpu_seconds"] = round(max(elapsed, 30.0), 2)
+        # No sandbox was provisioned: never bill quota for the fallback.
+        result["cpu_seconds"] = 0.0
         result["logs"] = logs + result.get("logs", [])
         if result.get("status") == "completed":
             result["status"] = "completed_fallback"
         return result
 
 
+async def _teardown(sandbox_id: str, headers: dict, params: dict, logs: list[str]) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.delete(f"{SANDBOX_API}/{sandbox_id}", headers=headers, params=params)
+        logs.append(f"vercel_sandbox: teardown HTTP {r.status_code}.")
+    except Exception as exc:
+        logs.append(f"vercel_sandbox: teardown error ({type(exc).__name__}).")
+
+
 def _build_command(agent_config: dict, pr_context: dict) -> str:
-    repo = pr_context.get("repo", "")
-    sha = pr_context.get("sha", "")
+    repo = safe_repo(pr_context.get("repo", ""))
+    sha = safe_git_ref(pr_context.get("sha", ""))
+    agent_id = safe_label(agent_config.get("id") or agent_config.get("name"))
+    clone_url = f"https://github.com/{repo}.git"
     return (
-        f"git clone --depth 50 https://github.com/{repo}.git work 2>&1 | head -5; "
-        f"cd work && git checkout {sha} 2>&1 | head -5; "
-        f"npm run lint 2>&1 | head -40 || npm test 2>&1 | head -40; "
-        f"echo agent={agent_config.get('id', '')} done"
+        f"git clone --depth 50 {shell_quote(clone_url)} work 2>&1 | head -5; "
+        f"cd work && git checkout {shell_quote(sha)} 2>&1 | head -5; "
+        f"{{ npm run lint 2>&1 || npm test 2>&1; }} | head -40; "
+        f"echo {shell_quote(f'agent={agent_id} done')}"
     )

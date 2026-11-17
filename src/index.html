@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' http://localhost:* http://127.0.0.1:* https://api.github.com https://github.com" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://localhost:* http://127.0.0.1:* ws://localhost:* https://api.github.com https://github.com https://*.upstash.io https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'" />
 <title>PR Agent Control</title>
 <link rel="stylesheet" href="styles.css" />
 </head>
@@ -151,7 +151,7 @@
           <div class="field" id="agent-label-wrap"><span class="lbl">Trigger label (for on_label)</span>
             <input id="agent-label" placeholder="review-me" autocomplete="off" />
           </div>
-          <div class="field"><span class="lbl">Target repos (multi-select — tick to sync)</span>
+          <div class="field"><span class="lbl">Target repos (multi-select — leave empty to match every repository)</span>
             <div class="repo-picker" id="agent-repos-list"><p class="hint">Connect GitHub in Settings to load your repos, or add manually below.</p></div>
           </div>
           <div class="row">
@@ -366,7 +366,7 @@
           <div class="row wrap">
             <button id="btn-backend-test" class="btn btn-accent" type="button">Test connection</button>
           </div>
-          <p class="secrets-note mt">Secrets (OpenRouter, GitHub, Box, API token) live in <b>memory + sessionStorage</b> only. They never touch localStorage or disk. Closing the window wipes sessionStorage. “Clear session secrets” wipes them immediately.</p>
+          <p class="secrets-note mt">Session secrets (OpenRouter, GitHub, Box, API token) live in <b>memory + sessionStorage</b> only and never touch localStorage. Credentials you explicitly save in the Integrations tab are written to <code>backend/.env</code> (git-ignored) by the Rust backend. Closing the window wipes sessionStorage; “Clear session secrets” wipes it immediately.</p>
           <pre class="out" id="backend-out">Not tested.</pre>
         </div>
 
@@ -417,7 +417,6 @@
     <h3 id="modal-title">Diff</h3>
     <pre class="out" id="modal-body">—</pre>
     <div class="row wrap">
-      <button id="modal-approve" class="btn btn-accent btn-sm" type="button">Approve run</button>
       <button id="modal-close" class="btn btn-outline btn-sm" type="button">Close</button>
     </div>
   </div>

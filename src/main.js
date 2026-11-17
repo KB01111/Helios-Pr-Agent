@@ -1,7 +1,8 @@
 /* PR Agent Control — vanilla JS, CSP-safe (no eval, no inline handlers).
- * Secrets (OpenRouter / GitHub / Box / API token) live in MEMORY + sessionStorage
- * only — never localStorage, never disk. Backend URL + theme + OAuth client id
- * are non-secret and may persist in localStorage.
+ * Session secrets (OpenRouter / GitHub / Box / API token) live in MEMORY +
+ * sessionStorage only — never localStorage. Integration credentials may also be
+ * written to backend/.env by the Rust backend when the user explicitly saves
+ * them. Backend URL + theme + OAuth client id are non-secret and may persist.
  */
 "use strict";
 
@@ -63,6 +64,7 @@ async function openUrl(url) {
 
 /* ---------- secrets: memory + sessionStorage (NEVER localStorage) ---------- */
 const Secrets = { openrouter: "", github: "", box: "", api: "" };
+let evtSrc = null;
 const SS_KEYS = {
   openrouter: "pragent.openrouter",
   github: "pragent.github",
@@ -89,13 +91,24 @@ function setSecret(name, value) {
   ssSet(SS_KEYS[name], Secrets[name]);
 }
 function clearSecrets() {
+  oauthCancel = true; // stop any pending GitHub device-flow polling
   for (const k of Object.keys(Secrets)) { Secrets[k] = ""; ssSet(SS_KEYS[k], ""); }
-  for (const id of ["or-key", "sett-or", "gh-key", "sett-gh", "box-key", "oauth-pat", "api-token"]) {
+  for (const id of [
+    "or-key", "sett-or", "gh-key", "sett-gh", "box-key", "oauth-pat", "api-token",
+    "int-gh-token", "int-gh-secret", "int-vercel-token", "int-box-key",
+    "int-redis-url", "int-redis-token", "int-or-key",
+  ]) {
     const el = $(id);
     if (el) el.value = "";
   }
+  if (evtSrc) {
+    evtSrc.close();
+    evtSrc = null;
+    const btn = $("btn-stream");
+    if (btn) btn.textContent = "Live: off";
+  }
   setGhState(false, "");
-  toastOk("Secrets cleared", "Memory + sessionStorage wiped.");
+  toastOk("Secrets cleared", "Session values and stream tokens wiped.");
 }
 function syncSecretInputs() {
   const map = {
@@ -146,33 +159,56 @@ function authHeaders() {
   if (Secrets.api) h["Authorization"] = "Bearer " + Secrets.api;
   return h;
 }
+function tauriUnavailable(err) {
+  return /tauri-invoke-unavailable/.test(String((err && err.message) || err));
+}
+function fetchOptions(extra) {
+  const opts = Object.assign({}, extra || {});
+  if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opts.signal = AbortSignal.timeout(15000);
+  return opts;
+}
 async function apiGet(path) {
   const base = backendUrl();
+  let raw;
   try {
-    const raw = await tauriInvoke("backend_mutate", {
+    raw = await tauriInvoke("backend_mutate", {
       method: "GET", backendUrl: base, path, bodyJson: null,
       apiToken: Secrets.api || null,
     });
+  } catch (e) {
+    if (!tauriUnavailable(e)) throw e;
+  }
+  if (raw !== undefined) {
     const d = parseJsonLoose(raw);
     if (d !== null) return d;
-  } catch (_) {}
-  const r = await fetch(base + path, { headers: Secrets.api ? { Authorization: "Bearer " + Secrets.api } : {} });
+    throw new Error("backend returned a non-JSON response");
+  }
+  const headers = Secrets.api ? { Authorization: "Bearer " + Secrets.api } : {};
+  const r = await fetch(base + path, fetchOptions({ headers }));
   if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 300));
   return r.json();
 }
 async function apiMut(method, path, body) {
   const base = backendUrl();
+  let raw;
   try {
-    const raw = await tauriInvoke("backend_mutate", {
+    raw = await tauriInvoke("backend_mutate", {
       method, backendUrl: base, path,
       bodyJson: body === undefined ? null : JSON.stringify(body || {}),
       apiToken: Secrets.api || null,
     });
+  } catch (e) {
+    if (!tauriUnavailable(e)) throw e;
+  }
+  if (raw !== undefined) {
     const d = parseJsonLoose(raw);
-    if (d !== null) return d;
-    return raw;
-  } catch (_) {}
-  const r = await fetch(base + path, { method, headers: authHeaders(), body: body === undefined ? undefined : JSON.stringify(body || {}) });
+    return d !== null ? d : raw;
+  }
+  const r = await fetch(base + path, fetchOptions({
+    method,
+    headers: authHeaders(),
+    body: body === undefined ? undefined : JSON.stringify(body || {}),
+  }));
   if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 300));
   const t = await r.text();
   return t ? parseJsonLoose(t) : {};
@@ -188,13 +224,7 @@ async function checkBackend(showToast) {
   };
   try {
     const base = backendUrl();
-    let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_health", { backendUrl: base })); }
-    catch (_) {
-      const r = await fetch(base + "/health");
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      data = await r.json();
-    }
+    const data = await apiGet("/health");
     const mode = (data && (data.store || data.mode)) || "up";
     set(true, "online (" + mode + ")");
     if (showToast) toastOk("Backend reachable", base + " · store=" + mode);
@@ -279,7 +309,7 @@ async function oauthStart() {
     try { await openUrl(d.verification_uri); } catch (_) {}
     $("oauth-out").textContent = "Code shown — approve on GitHub, waiting… (expires in ~" + Math.round((d.expires_in || 900) / 60) + " min)";
     toastOk("GitHub login started", "Approve code " + d.user_code + " on GitHub.");
-    const interval = Math.max(5, d.interval || 5);
+    let interval = Math.max(5, d.interval || 5);
     while (!oauthCancel) {
       let r;
       try {
@@ -291,6 +321,8 @@ async function oauthStart() {
         if (/pending|slow_down/i.test(msg)) continue;
         throw e;
       }
+      if (oauthCancel) break;
+      if (r && r.interval) interval = Math.max(interval, Number(r.interval) || interval);
       if (r && r.status === "authorized") {
         setSecret("github", r.access_token);
         syncSecretInputs();
@@ -373,10 +405,11 @@ async function loadReposIntoPicker() {
 }
 
 /* ---------- agents CRUD ---------- */
-function renderAgents(data) {
+function renderAgents(data, preferredId) {
   const sel = $("agent-select");
   if (!sel) return;
   const list = Array.isArray(data) ? data : (data.agents || []);
+  const keep = preferredId !== undefined ? String(preferredId || "") : (sel.value || "");
   sel.innerHTML = '<option value="">— new agent —</option>';
   for (const a of list) {
     const o = document.createElement("option");
@@ -384,17 +417,16 @@ function renderAgents(data) {
     o.textContent = (a.name || a.id || "agent") + (a.id ? " (" + a.id.slice(0, 8) + ")" : "");
     sel.appendChild(o);
   }
+  if (keep && Array.from(sel.options).some((o) => o.value === keep)) sel.value = keep;
   const c = $("agents-count");
   if (c) c.textContent = list.length + " agent(s)";
   return list;
 }
-async function refreshAgents() {
+async function refreshAgents(preferredId) {
   $("agents-out").textContent = "Loading agents…";
   try {
-    let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_sync_agents", { backendUrl: backendUrl(), agentsJson: "" })); }
-    catch (_) { data = await apiGet("/agents"); }
-    const list = renderAgents(data) || [];
+    const data = await apiGet("/agents");
+    const list = renderAgents(data, preferredId) || [];
     $("agents-out").textContent = "Loaded " + list.length + " agent(s).";
   } catch (e) { $("agents-out").textContent = "Refresh failed (is backend up at " + backendUrl() + "?): " + e; toastErr("Agents refresh failed", String(e).slice(0, 200)); }
 }
@@ -421,13 +453,19 @@ async function saveAgent() {
     runtime_mode: $("agent-mode").value,
   };
   if (!body.name) { toastErr("Agent", "Enter an agent name first."); return; }
+  if (body.trigger === "on_label" && !body.trigger_label) {
+    toastErr("Agent", "Enter the label name for an on_label agent.");
+    $("agent-label").focus();
+    return;
+  }
   $("agents-out").textContent = "Saving…";
   try {
     const saved = id ? await apiMut("PUT", "/agents/" + encodeURIComponent(id), body)
                       : await apiMut("POST", "/agents", body);
-    $("agents-out").textContent = "Saved agent " + ((saved && saved.id) || body.name);
-    toastOk("Agent saved", (saved && saved.id) || body.name);
-    await refreshAgents();
+    const savedId = saved && saved.id;
+    $("agents-out").textContent = "Saved agent " + (savedId || body.name);
+    toastOk("Agent saved", savedId || body.name);
+    await refreshAgents(savedId || undefined);
   } catch (e) { $("agents-out").textContent = "Save failed: " + e; toastErr("Agent save failed", String(e).slice(0, 220)); }
 }
 async function deleteAgent() {
@@ -439,7 +477,8 @@ async function deleteAgent() {
     await apiMut("DELETE", "/agents/" + encodeURIComponent(id));
     $("agents-out").textContent = "Deleted.";
     toastOk("Agent deleted", id.slice(0, 12));
-    await refreshAgents();
+    fillAgentForm({});
+    await refreshAgents("");
   } catch (e) { $("agents-out").textContent = "Delete failed: " + e; toastErr("Delete failed", String(e).slice(0, 200)); }
 }
 
@@ -452,7 +491,6 @@ function runStatusClass(s) {
   return "";
 }
 let lastRuns = [];
-let modalRunId = "";
 function renderRuns(list) {
   const box = $("runs-list");
   if (!box) return;
@@ -500,14 +538,6 @@ function renderRuns(list) {
     }
     const row = document.createElement("div");
     row.className = "row wrap";
-    if (id && /wait|pend|queued/i.test(String(status))) {
-      const b = document.createElement("button");
-      b.className = "btn btn-accent btn-sm";
-      b.type = "button";
-      b.textContent = "Approve";
-      b.addEventListener("click", () => approveRun(id));
-      row.appendChild(b);
-    }
     if (diff) {
       const v = document.createElement("button");
       v.className = "btn btn-ghost btn-sm";
@@ -516,6 +546,21 @@ function renderRuns(list) {
       v.addEventListener("click", () => openModal(id));
       row.appendChild(v);
     }
+    if (status === "queued" && id) {
+      const a = document.createElement("button");
+      a.className = "btn btn-outline btn-sm";
+      a.type = "button";
+      a.textContent = "Approve";
+      a.addEventListener("click", async () => {
+        a.disabled = true;
+        try {
+          await apiMut("POST", "/runs/" + encodeURIComponent(id) + "/approve", {});
+          toastOk("Run approved", id);
+          syncRuns();
+        } catch (e) { a.disabled = false; toastErr("Approve failed", String(e).slice(0, 200)); }
+      });
+      row.appendChild(a);
+    }
     if (row.children.length) div.appendChild(row);
     box.appendChild(div);
   }
@@ -523,36 +568,20 @@ function renderRuns(list) {
 async function syncRuns() {
   $("runs-out").textContent = "Syncing runs…";
   try {
-    let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_get_runs", { backendUrl: backendUrl() })); }
-    catch (_) { data = await apiGet("/runs?limit=50"); }
+    const data = await apiGet("/runs?limit=50");
     const list = Array.isArray(data) ? data : (data.runs || []);
     renderRuns(list);
     $("runs-out").textContent = "Synced " + list.length + " run(s).";
   } catch (e) { $("runs-out").textContent = "Sync failed (is backend up at " + backendUrl() + "?): " + e; toastErr("Runs sync failed", String(e).slice(0, 200)); }
 }
-async function approveRun(id) {
-  $("runs-out").textContent = "Approving " + String(id).slice(0, 8) + "…";
-  try {
-    try { await tauriInvoke("backend_approve_run", { backendUrl: backendUrl(), runId: id, apiToken: Secrets.api || null }); }
-    catch (_) { await apiMut("POST", "/runs/" + encodeURIComponent(id) + "/approve", {}); }
-    $("runs-out").textContent = "Approved.";
-    toastOk("Run approved", String(id).slice(0, 12));
-    closeModal();
-    syncRuns();
-  } catch (e) { $("runs-out").textContent = "Approve failed: " + e; toastErr("Approve failed", String(e).slice(0, 220)); }
-}
 function openModal(id) {
   const r = lastRuns.find((x) => (x.run_id || x.id) === id);
   if (!r) return;
-  modalRunId = id;
   $("modal-title").textContent = (r.repo || "?") + " #" + (r.pr_number || "?") + " — diff";
   $("modal-body").textContent = String(r.diff || "(no diff)").slice(0, 20000);
-  const ap = $("modal-approve");
-  ap.style.display = /wait|pend|queued/i.test(String(r.status || "")) ? "" : "none";
   $("modal-back").classList.add("open");
 }
-function closeModal() { $("modal-back").classList.remove("open"); modalRunId = ""; }
+function closeModal() { $("modal-back").classList.remove("open"); }
 
 /* ---------- quota ---------- */
 function setBar(barId, wrapId, used, limit) {
@@ -563,9 +592,7 @@ function setBar(barId, wrapId, used, limit) {
 }
 async function fetchQuota() {
   try {
-    let data = null;
-    try { data = parseJsonLoose(await tauriInvoke("backend_get_quota", { backendUrl: backendUrl() })); }
-    catch (_) { data = await apiGet("/quota"); }
+    const data = await apiGet("/quota");
     const box = (data && (data.upstash_box || data.box)) || {};
     const ver = (data && (data.vercel_sandbox || data.vercel)) || {};
     const bUsed = Number(box.used || 0), bLim = Number(box.limit || 18000);
@@ -582,7 +609,11 @@ async function fetchQuota() {
 }
 
 /* ---------- live stream ---------- */
-let evtSrc = null;
+let syncTimer = null;
+function scheduleSyncRuns() {
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => { syncTimer = null; syncRuns(); }, 300);
+}
 function toggleStream() {
   const btn = $("btn-stream");
   if (evtSrc) {
@@ -591,19 +622,34 @@ function toggleStream() {
     $("runs-out").textContent = "Stream stopped.";
     return;
   }
+  startStream(btn);
+}
+async function startStream(btn) {
   const base = backendUrl();
-  try { evtSrc = new EventSource(base + "/events/stream"); }
-  catch (e) { $("runs-out").textContent = "Stream failed: " + e; return; }
+  // EventSource cannot set headers: exchange the API token for a short-lived,
+  // single-use ticket so the long-lived token never appears in a URL.
+  let streamUrl = base + "/events/stream";
+  try {
+    if (Secrets.api) {
+      const t = await apiMut("POST", "/events/ticket", {});
+      if (!t || !t.ticket) throw new Error("no stream ticket returned");
+      streamUrl += "?ticket=" + encodeURIComponent(t.ticket);
+    }
+    evtSrc = new EventSource(streamUrl);
+  } catch (e) { $("runs-out").textContent = "Stream failed: " + e; return; }
   if (btn) btn.textContent = "Live: on";
   $("runs-out").textContent = "Streaming live events…";
   evtSrc.onmessage = (ev) => {
     try {
       const data = JSON.parse(ev.data);
       if (data && (data.type === "quota" || data.quota)) { fetchQuota(); return; }
-      if (data && (data.repo || data.pr_number || data.status)) syncRuns();
+      if (data && (data.repo || data.pr_number || data.status)) scheduleSyncRuns();
     } catch (_) { $("runs-out").textContent = "event: " + String(ev.data).slice(0, 200); }
   };
-  evtSrc.onerror = () => { $("runs-out").textContent = "Stream error — backend reachable at " + base + "?"; };
+  evtSrc.onerror = () => {
+    $("runs-out").textContent = "Stream error — check the backend at " + base +
+      " and set ALLOWED_ORIGINS to include tauri://localhost,http://tauri.localhost,http://localhost:1420";
+  };
 }
 
 /* ---------- integrations (1-click setup) ---------- */
@@ -642,8 +688,7 @@ async function intRefresh() {
   intOut("Checking status…");
   let data = null;
   try {
-    try { data = parseJsonLoose(await tauriInvoke("backend_config_status", { backendUrl: backendUrl() })); }
-    catch (_) { data = await apiGet("/config/status"); }
+    data = await apiGet("/config/status");
   } catch (e) {
     intOut("Status failed (is backend up at " + backendUrl() + "?): " + e);
     intBadge("unreachable", false);
@@ -651,6 +696,9 @@ async function intRefresh() {
     return;
   }
   const s = intStatusData(data);
+  const github = (data && data.github) || {};
+  const vercel = (data && data.vercel) || {};
+  const redis = (data && data.redis) || {};
   setDot(INT_DOTS.github, s.githubFull ? "ok" : "warn");
   setDot(INT_DOTS.vercel, s.vercel ? "ok" : "warn");
   setDot(INT_DOTS.upstash_box, s.upstash_box ? "ok" : "warn");
@@ -659,12 +707,12 @@ async function intRefresh() {
   const n = [s.githubFull, s.vercel, s.upstash_box, s.redis, s.openrouter].filter(Boolean).length;
   intBadge(n + "/5 connected", n === 5);
   const lines = [
-    "github: " + (data.github.token_set ? "token set" : "token MISSING") + " · " + (data.github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"),
-    "vercel: " + (s.vercel ? "configured" + (data.vercel.team_set ? " (team scoped)" : "") : "not configured"),
+    "github: " + (github.token_set ? "token set" : "token MISSING") + " · " + (github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"),
+    "vercel: " + (s.vercel ? "configured" + (vercel.team_set ? " (team scoped)" : "") : "not configured"),
     "upstash_box: " + (s.upstash_box ? "configured" : "not configured"),
-    "redis: " + (s.redis ? "configured (mode=" + data.redis.mode + ")" : "not configured (mode=" + data.redis.mode + ")"),
+    "redis: " + (s.redis ? "configured (mode=" + (redis.mode || "?") + ")" : "not configured (mode=" + (redis.mode || "?") + ")"),
     "openrouter: " + (s.openrouter ? "configured" : "not configured"),
-    "auth: " + (data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"),
+    "auth: " + (data && data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"),
   ];
   intOut(lines.join("\n"));
 }
@@ -672,8 +720,7 @@ async function intTest(provider) {
   intOut("Testing " + provider + "…");
   let res = null;
   try {
-    try { res = parseJsonLoose(await tauriInvoke("backend_config_test", { backendUrl: backendUrl(), provider, apiToken: Secrets.api || "" })); }
-    catch (_) { res = await apiMut("POST", "/config/test", { provider }); }
+    res = await apiMut("POST", "/config/test", { provider });
   } catch (e) {
     intOut(provider + ": test failed: " + e);
     toastErr("Test failed", String(e).slice(0, 200));
@@ -824,14 +871,14 @@ function wire() {
 
   // agents
   on("btn-agents-save", saveAgent);
-  on("btn-agents-refresh", refreshAgents);
+  on("btn-agents-refresh", () => refreshAgents());
   on("btn-agents-delete", deleteAgent);
   $("agent-trigger").addEventListener("change", () => {
     $("agent-label-wrap").style.display = $("agent-trigger").value === "on_label" ? "" : "none";
   });
   $("agent-select").addEventListener("change", async () => {
     const id = $("agent-select").value;
-    if (!id) return;
+    if (!id) { fillAgentForm({}); return; }
     try {
       const a = await apiGet("/agents/" + encodeURIComponent(id));
       fillAgentForm(a || {});
@@ -854,7 +901,6 @@ function wire() {
   on("modal-close", closeModal);
   $("modal-back").addEventListener("click", (e) => { if (e.target === $("modal-back")) closeModal(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
-  on("modal-approve", () => { if (modalRunId) approveRun(modalRunId); });
 
   // integrations (1-click setup)
   on("btn-int-refresh", intRefresh);
