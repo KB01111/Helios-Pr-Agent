@@ -11,6 +11,12 @@ repositories, plus the PR-Agent harness itself. Two review engines supported:
 Both run on **OpenRouter free models** (default
 `thinkingmachines/inkling-2-small:free`). No paid API needed.
 
+## Download (Windows)
+
+Grab the [latest release](https://github.com/KB01111/Helios-Pr-Agent/releases/latest).
+The NSIS `...setup.exe` is the recommended installer; an MSI is also published.
+The installers are unsigned, so Windows SmartScreen may ask for confirmation.
+
 ## What's in this repo
 
 | Path | What it is |
