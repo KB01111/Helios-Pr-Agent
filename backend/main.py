@@ -616,7 +616,15 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
             if not await store.arset(f"runretry:{run_id}:{attempt}", "1", ex=3600, nx=True):
                 continue
             record["attempt"] = attempt
-            await store.arset_json(key, record)
+            try:
+                await store.arset_json(key, record)
+            except Exception:
+                # Release the attempt claim so the next delivery can retry.
+                try:
+                    await asyncio.to_thread(store.rdelete, f"runretry:{run_id}:{attempt}")
+                except Exception as exc:
+                    log.warning("could not release retry claim for run=%s: %s", run_id, exc)
+                raise
         run_ids.append(run_id)
         pending.append((agent_cfg, run_id))
     # Dispatch only once every record is persisted.
