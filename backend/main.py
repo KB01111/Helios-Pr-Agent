@@ -319,8 +319,8 @@ def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> 
             logs.append(f"ERROR: {exc}")
             current["logs"] = [str(item) for item in logs]
             store.rset_json(f"run:{run_id}", current)
-        except Exception:
-            pass
+        except Exception as persist_exc:
+            log.warning("could not persist failure state for run=%s: %s", run_id, persist_exc)
 
 
 # Queued runs are held only in this process. After a restart, records older
@@ -698,8 +698,8 @@ async def _test_redis() -> dict[str, Any]:
     finally:
         try:
             await store.ardelete(key)
-        except Exception:
-            pass
+        except Exception as cleanup_exc:
+            log.debug("could not remove Redis test key: %s", cleanup_exc)
 
 
 async def _test_vercel() -> dict[str, Any]:
