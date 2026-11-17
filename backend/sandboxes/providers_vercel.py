@@ -94,15 +94,17 @@ class VercelSandboxProvider:
             except Exception as exc:
                 logs.append(f"vercel_sandbox: exec error ({type(exc).__name__}).")
             finally:
-                # 3. Teardown always runs (incl. cancellation); best-effort.
+                # 3. Teardown always runs, on its own client and task, so
+                # cancellation (or closing this client) can't interrupt it.
                 if sandbox_id:
+                    task = asyncio.ensure_future(
+                        _teardown(sandbox_id, headers, params, logs)
+                    )
                     try:
-                        del_resp = await asyncio.shield(client.delete(
-                            f"{SANDBOX_API}/{sandbox_id}", headers=headers, params=params
-                        ))
-                        logs.append(f"vercel_sandbox: teardown HTTP {del_resp.status_code}.")
-                    except Exception as exc:
-                        logs.append(f"vercel_sandbox: teardown error ({type(exc).__name__}).")
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        await asyncio.wait({task}, timeout=20)
+                        raise
 
         logs.extend(output.splitlines()[:50])
         return {
@@ -127,6 +129,15 @@ class VercelSandboxProvider:
         if result.get("status") == "completed":
             result["status"] = "completed_fallback"
         return result
+
+
+async def _teardown(sandbox_id: str, headers: dict, params: dict, logs: list[str]) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.delete(f"{SANDBOX_API}/{sandbox_id}", headers=headers, params=params)
+        logs.append(f"vercel_sandbox: teardown HTTP {r.status_code}.")
+    except Exception as exc:
+        logs.append(f"vercel_sandbox: teardown error ({type(exc).__name__}).")
 
 
 def _build_command(agent_config: dict, pr_context: dict) -> str:

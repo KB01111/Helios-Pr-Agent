@@ -436,6 +436,15 @@ async def _reap_loop() -> None:
 
 @app.on_event("startup")
 async def _startup_reap() -> None:
+    # Import the router once up front: concurrent first-time imports from
+    # worker threads can hit Python's import-lock deadlock detection.
+    try:
+        try:
+            import sandboxes.router  # noqa: F401  (cwd=backend)
+        except ImportError:
+            import backend.sandboxes.router  # type: ignore[no-redef]  # noqa: F401
+    except Exception as exc:
+        log.warning("router preload failed: %s", exc)
     _reap_stale_queued_runs()
     app.state.reap_task = asyncio.create_task(_reap_loop())
 
@@ -515,11 +524,13 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     # Two-state claim: a short-lived "pending" lease while runs are being
     # created (lapses fast even if cleanup fails), promoted to "done" for the
     # full window only once every run record is stored.
-    if not await store.arset(debounce_key, "pending", ex=_CLAIM_LEASE_S, nx=True):
+    claim = f"pending:{uuid.uuid4().hex}"
+    if not await store.arset(debounce_key, claim, ex=_CLAIM_LEASE_S, nx=True):
         state = await asyncio.to_thread(store.rget, debounce_key)
-        if state == "pending":
-            return JSONResponse({"in_progress": True, "retry": True}, status_code=409)
-        return JSONResponse({"debounced": True}, status_code=202)
+        if state == "done":
+            return JSONResponse({"debounced": True}, status_code=202)
+        # pending, or the lease lapsed between the two reads: ask the caller to retry
+        return JSONResponse({"in_progress": True, "retry": True}, status_code=409)
 
     pr_ctx = PRContext(
         repo=repo,
@@ -543,19 +554,22 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
             except Exception as exc:  # the stale-run reaper is the backstop
                 log.warning("could not fail run=%s during cleanup: %s", rid, exc)
         try:
-            await asyncio.to_thread(store.rdelete, debounce_key)
+            # Only release a claim we still own (our lease may have lapsed).
+            if await asyncio.to_thread(store.rget, debounce_key) == claim:
+                await asyncio.to_thread(store.rdelete, debounce_key)
         except Exception as exc:
             log.warning("could not release debounce key: %s", exc)
         raise
 
     try:
-        await store.arset(debounce_key, "done", ex=DEBOUNCE_TTL_S)
+        if await asyncio.to_thread(store.rget, debounce_key) == claim:
+            await store.arset(debounce_key, "done", ex=DEBOUNCE_TTL_S)
     except Exception as exc:  # lease just lapses; worst case one duplicate set of runs
         log.warning("could not promote debounce claim: %s", exc)
     return JSONResponse({"accepted": True, "runs": run_ids}, status_code=202)
 
 
-_CLAIM_LEASE_S = 10
+_CLAIM_LEASE_S = 60
 
 
 async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks) -> None:  # type: ignore[no-untyped-def]
