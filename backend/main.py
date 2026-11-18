@@ -469,6 +469,10 @@ async def _startup_reap() -> None:
     except Exception as exc:
         log.warning("router preload failed: %s", exc)
     _reap_stale_queued_runs()
+    try:  # restore open-evaluation markers lost to a crash (or predating the index)
+        await asyncio.to_thread(store.eval_reindex)
+    except Exception as exc:
+        log.warning("evaluation reindex failed: %s", exc)
     app.state.reap_task = asyncio.create_task(_reap_loop())
 
 

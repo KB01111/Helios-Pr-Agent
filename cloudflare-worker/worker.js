@@ -29,6 +29,7 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const FORWARD_TIMEOUT_MS = 7000;
 const KV_REPLAY_EVERY_MIN = 5; // KV free tier allows ~1000 list() calls/day
 const KV_REPLAY_BATCH = 10; // stay well inside the 50-subrequest limit
+const KV_REPLAY_MAX_PAGES = 5; // up to 5000 parked deliveries are reachable
 const KV_REPLAY_WINDOW = 1000; // keys listed per replay (one list() call, the KV maximum)
 
 const enc = new TextEncoder();
@@ -83,7 +84,7 @@ export async function forward(env, item) {
         "x-hub-signature-256": item.signature,
       },
       body: item.body,
-      signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
+      signal: AbortSignal.timeout(Number(env.FORWARD_TIMEOUT_MS) || FORWARD_TIMEOUT_MS),
     });
     if (resp.ok) return "ok";
     // 409 = another handler holds the claim right now; 5xx = cold/failing backend.
@@ -187,8 +188,16 @@ export async function handleWebhook(request, env, _ctx) {
  */
 export async function replayParked(env, slot = 0) {
   if (!env.PENDING) return { replayed: 0 };
-  const listed = await env.PENDING.list({ prefix: "pending:", limit: KV_REPLAY_WINDOW });
-  const names = listed.keys.map((k) => k.name);
+  // Follow the cursor so a backlog larger than one page is still reachable (bounded: each
+  // extra page is another list() against the free-tier budget).
+  const names = [];
+  let cursor;
+  for (let page = 0; page < KV_REPLAY_MAX_PAGES; page++) {
+    const listed = await env.PENDING.list({ prefix: "pending:", limit: KV_REPLAY_WINDOW, cursor });
+    names.push(...listed.keys.map((k) => k.name));
+    if (listed.list_complete !== false || !listed.cursor) break;
+    cursor = listed.cursor;
+  }
   if (!names.length) return { replayed: 0 };
   const start = (slot * KV_REPLAY_BATCH) % names.length;
   let replayed = 0;

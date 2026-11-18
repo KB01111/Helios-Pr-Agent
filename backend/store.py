@@ -608,8 +608,11 @@ def eval_register(
         "created_at": now, "updated_at": now,
     })
     for _ in range(2):  # second pass covers a record that expired between calls
+        # Marker first: if we crash between the two writes the leftover is a marker with no
+        # record, which eval_list_open() sweeps up. The reverse (record without marker)
+        # would hide an unresolved evaluation from the sweeper.
+        _sync_open_marker(rec, ex)
         if rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S, nx=True):
-            _sync_open_marker(rec, ex)
             return True, rec
         existing = rget_json(_eval_key(eid))
         if isinstance(existing, dict):
@@ -686,11 +689,28 @@ def eval_lock(eid: str, lease_s: int = EVAL_LOCK_LEASE_S):
             log.warning("store.eval_lock release failed: %s", exc)
 
 
+def eval_reindex() -> int:
+    """Rebuild missing open markers from the records themselves (run at startup; covers
+    records written before the index existed or a crash between the two writes)."""
+    restored = 0
+    have = {k.split("evalopen:", 1)[-1] for k in rkeys("evalopen:*")}
+    for rec in rget_json_many(rkeys("eval:*")):
+        if isinstance(rec, dict) and rec.get("id") and rec.get("state") in EVAL_OPEN_STATES and rec["id"] not in have:
+            _sync_open_marker(rec)
+            restored += 1
+    return restored
+
+
 def eval_list_open(states: tuple[str, ...] | None = None) -> list[dict]:
     """Records still awaiting action, oldest first. Reads only the open set."""
     ids = [k.split("evalopen:", 1)[-1] for k in rkeys("evalopen:*")]
-    records = [r for r in rget_json_many([_eval_key(i) for i in ids]) if isinstance(r, dict)]
-    records = [r for r in records if r.get("state") in (states or EVAL_OPEN_STATES)]
+    loaded = rget_json_many([_eval_key(i) for i in ids])
+    records = []
+    for eid, rec in zip(ids, loaded):
+        if not isinstance(rec, dict) or rec.get("state") not in EVAL_OPEN_STATES:
+            rdelete(f"evalopen:{eid}")  # stale marker (record gone or already settled)
+        elif rec.get("state") in (states or EVAL_OPEN_STATES):
+            records.append(rec)
     records.sort(key=lambda r: str(r.get("created_at", "")))
     return records
 

@@ -54,7 +54,13 @@ function fakeKv() {
     put: async (k, v) => void store.set(k, v),
     get: async (k, type) => (store.has(k) ? (type === "json" ? JSON.parse(store.get(k)) : store.get(k)) : null),
     delete: async (k) => void store.delete(k),
-    list: async ({ prefix, limit }) => ({ keys: [...store.keys()].filter((k) => k.startsWith(prefix)).slice(0, limit).map((name) => ({ name })) }),
+    list: async ({ prefix, limit, cursor }) => {
+      const all = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const from = Number(cursor || 0);
+      const page = all.slice(from, from + limit);
+      const complete = from + limit >= all.length;
+      return { keys: page.map((name) => ({ name })), list_complete: complete, cursor: complete ? undefined : String(from + limit) };
+    },
   };
 }
 
@@ -245,6 +251,42 @@ test("each forward attempt is bounded by a timeout signal", async () => {
   try {
     await post(prBody());
     assert.ok(f.calls[0].init.signal instanceof AbortSignal);
+  } finally {
+    f.restore();
+  }
+});
+
+test("a stalled backend is aborted by the timeout and the delivery is parked", async () => {
+  const kv = fakeKv();
+  const f = stubFetch((url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason)); // never answers
+  }));
+  try {
+    const started = Date.now();
+    const resp = await post(prBody(), { env: { ...baseEnv, PENDING: kv, FORWARD_TIMEOUT_MS: "25" }, delivery: "stall-1" });
+    assert.equal(resp.status, 202);
+    assert.ok(Date.now() - started < 2000);
+    assert.ok(kv.store.has("pending:stall-1"));
+  } finally {
+    f.restore();
+  }
+});
+
+test("replay follows the KV cursor so backlogs beyond one page are reached", async () => {
+  const kv = fakeKv();
+  const total = 2500; // > 2 pages of 1000
+  for (let i = 0; i < total; i++) {
+    await kv.put(`pending:${String(i).padStart(5, "0")}`, JSON.stringify({ body: "{}", event: "pull_request", delivery: `d${i}`, signature: "s" }));
+  }
+  const tried = new Set();
+  const f = stubFetch((url, init) => {
+    tried.add(init.headers["x-github-delivery"]);
+    return new Response("{}", { status: 503 });
+  });
+  try {
+    for (let slot = 0; slot < total / 10; slot++) await replayParked({ ...baseEnv, PENDING: kv }, slot);
+    assert.equal(tried.size, total); // including everything past the first 1000 keys
+    assert.equal(kv.store.size, total); // no KV writes or deletes while the backend is down
   } finally {
     f.restore();
   }

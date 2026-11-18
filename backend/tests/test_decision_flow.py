@@ -331,3 +331,16 @@ def test_open_index_finds_old_unresolved_items_beyond_any_recency_window(env):
     env["client"].post(f"/decisions/{old['id']}/resolve", json={"action": "skip"})
     assert env["client"].get("/decisions", params={"state": "escalated"}).json() == []
     assert store.eval_list_open() == []  # terminal states leave the open index
+
+
+def test_open_index_recovers_from_a_missing_or_stale_marker(env):
+    _created, rec = store.eval_register("o/r", 31, SHA, {"state": "deferred", "facts": TINY})
+    store.rdelete(f"evalopen:{rec['id']}")  # crash between the record and marker writes / pre-index data
+    assert store.eval_list_open() == []
+    assert store.eval_reindex() == 1
+    assert [r["id"] for r in store.eval_list_open()] == [rec["id"]]
+    # a marker whose record vanished or settled is swept up instead of lingering
+    store.rset("evalopen:deadbeefdeadbeef", "1")
+    store.eval_update(rec["id"], {"state": "dispatched"})
+    assert store.eval_list_open() == []
+    assert store.rget("evalopen:deadbeefdeadbeef") is None and store.rget(f"evalopen:{rec['id']}") is None
