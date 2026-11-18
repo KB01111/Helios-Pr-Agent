@@ -7,3 +7,5 @@ src-tauri/gen/
 .env
 __pycache__/
 upstash-box/node_modules/
+dist/
+*.tsbuildinfo

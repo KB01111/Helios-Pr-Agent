@@ -21,7 +21,7 @@ The installers are unsigned, so Windows SmartScreen may ask for confirmation.
 
 | Path | What it is |
 |---|---|
-| `src/` | Tauri frontend (tabbed UI: Review, Agents & repo sync, Runs, Autonomy, Quota, Providers, Integrations, Settings) |
+| `src/` | Tauri frontend: React + TypeScript + Tailwind v4 + [shadcn/ui](https://ui.shadcn.com), built with Vite (sidebar UI: Review, Agents & repo sync, Runs, Autonomy, Quota, Providers, Integrations, Settings). `src/components/ui/` holds the shadcn components; add more with `npx shadcn@latest add <name>` |
 | `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), and the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`) |
 | `backend/` | FastAPI webhook/event brain, agent/run API, quota, and Redis-backed shared state (`REDIS_URL` on FastAPI Cloud, or Upstash REST) |
 | `cloudflare-worker/` | Free-tier edge receiver + cron for the cloud fallback (signature check, retrying forward, deferred-event sweep) |
@@ -33,11 +33,12 @@ The installers are unsigned, so Windows SmartScreen may ask for confirmation.
 
 ```powershell
 npm install
-npx tauri dev        # dev window
-npx tauri build      # installer in src-tauri\target\release\bundle
+npx tauri dev        # dev window (starts the Vite dev server on :1420 with hot reload)
+npx tauri build      # type-checks + builds the UI into dist/, then the installer in src-tauri\target\release\bundle
+npm run typecheck    # TypeScript check only
 ```
 
-Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11), and
+Requirements: Node 20.19+ (Vite 8), Rust stable, WebView2 (preinstalled on Windows 10/11), and
 Python 3.12+ for local CLI reviews (or set `PR_AGENT_BASE_PYTHON` to a 3.12+ interpreter).
 
 ### Local CLI review (Review tab)
