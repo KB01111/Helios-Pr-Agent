@@ -203,6 +203,13 @@ export const useApp = create<AppState>((set, get) => ({
   setBackendUrl: (u) => {
     const clean = (u || "").trim().replace(/\/+$/, "");
     if (clean) lsSet("BACKEND_URL", clean);
+    else {
+      try {
+        localStorage.removeItem("BACKEND_URL"); // cleared => back to the default, also after restart
+      } catch {
+        /* ignore */
+      }
+    }
     set({ backendUrl: clean || "http://localhost:8000" });
   },
   backend: { ok: null, label: "checking…" },

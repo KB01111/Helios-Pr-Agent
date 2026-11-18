@@ -70,7 +70,9 @@ export function AgentsPage({ active }: { active: boolean }) {
       label: a.trigger_label || "",
       mode: a.runtime_mode || "review_only",
     });
-    setPicked(Array.isArray(a.target_repos) ? a.target_repos : []);
+    const targets: string[] = Array.isArray(a.target_repos) ? a.target_repos : [];
+    loadedRepos.current = targets;
+    setPicked(targets);
   };
 
   const refresh = async (preferred?: string) => {
@@ -86,18 +88,33 @@ export function AgentsPage({ active }: { active: boolean }) {
   };
 
   // `agents` can also change from other flows (repo setup syncs an agent); count shows live.
+  const selectSeq = React.useRef(0);
+  const loadedRepos = React.useRef<string[]>([]);
   const onSelect = async (id: string) => {
+    const seq = ++selectSeq.current; // only the newest selection may fill the form
     setSelectedId(id);
     if (id === NEW) {
       fillForm({});
       return;
     }
     try {
-      fillForm((await apiGet("/agents/" + encodeURIComponent(id))) || {});
+      const a = (await apiGet("/agents/" + encodeURIComponent(id))) || {};
+      if (seq === selectSeq.current) fillForm(a);
     } catch (e) {
-      toastErr("Agent", errText(e, 200));
+      if (seq === selectSeq.current) toastErr("Agent", errText(e, 200));
     }
   };
+
+  // Repo setup can add targets to the agent that is open here; merge them in so a
+  // later save does not silently drop them.
+  React.useEffect(() => {
+    const cur = agents.find((a) => a.id === selectedId);
+    const targets = cur && Array.isArray(cur.target_repos) ? cur.target_repos : null;
+    if (!targets) return;
+    const added = targets.filter((r) => !loadedRepos.current.includes(r));
+    loadedRepos.current = targets;
+    if (added.length) setPicked(Array.from(new Set([...useApp.getState().pickedRepos, ...added])));
+  }, [agents, selectedId, setPicked]);
 
   const save = async () => {
     const body = {

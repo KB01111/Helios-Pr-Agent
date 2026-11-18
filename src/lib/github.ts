@@ -114,6 +114,7 @@ export const useGh = create<GhState>((set, get) => ({
 
 const inflight = new Set<string>();
 let oauthCancel = false;
+let patWon = false; // a PAT sign-in finished while the device flow was still pending
 let batchCancel = false;
 
 const gh = () => useGh.getState();
@@ -145,12 +146,13 @@ export async function startDeviceFlow() {
   }
   lsSet("pragent.oauth_client", clientId);
   oauthCancel = false;
+  patWon = false;
   useGh.setState({ signingIn: true, userCode: "…", signinMsg: "Starting GitHub device flow…" });
   try {
     const d = jsonObj(await tauriInvoke("github_device_start", { clientId }));
     if (!d || !d.device_code || !d.user_code) throw new Error("device flow response missing device_code/user_code");
     if (oauthCancel) {
-      useGh.setState({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
+      if (!patWon) useGh.setState({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
       return;
     }
     const uri = String(d.verification_uri || "https://github.com/login/device");
@@ -205,7 +207,7 @@ export async function startDeviceFlow() {
       }
       useGh.setState({ signinMsg: "Waiting for approval…" });
     }
-    useGh.setState({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
+    if (!patWon) useGh.setState({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
   } catch (e) {
     useGh.setState({ userCode: "", signinMsg: "Sign-in failed: " + errText(e, 300) });
     toastErr("GitHub sign-in failed", errText(e));
@@ -223,8 +225,15 @@ export async function signInWithPat(pat: string): Promise<boolean> {
   try {
     const login = await tauriInvoke<string>("github_login", { token: t });
     useApp.getState().setSecret("github", t);
+    if (gh().signingIn) {
+      // Stop a pending device flow so its later response cannot replace this token.
+      oauthCancel = true;
+      patWon = true;
+    }
     useGh.setState({
       login: login || "",
+      userCode: "",
+      verificationUri: "",
       signinMsg: `Authenticated as ${login || "(unknown login)"}. Token kept in memory/session only.`,
     });
     toastOk("GitHub connected", login ? "Signed in as " + login : "PAT stored in session.");

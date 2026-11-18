@@ -34,8 +34,15 @@ export function ReviewPage({ active }: { active: boolean }) {
   const [out, setOut] = React.useState("Ready.");
 
   const url = prUrl.trim();
-  const reviewCmd = () =>
-    cmd === "ask" ? `ask "${askQ.trim() || "What does this PR change?"}"` : cmd;
+  const reviewCmd = () => {
+    if (cmd !== "ask") return cmd;
+    const q = askQ.trim().replace(/\s+/g, " ") || "What does this PR change?";
+    // The Rust splitter has no escape syntax: quote with a character the question
+    // does not contain, and downgrade embedded double quotes if it contains both.
+    if (!q.includes('"')) return `ask "${q}"`;
+    if (!q.includes("'")) return `ask '${q}'`;
+    return `ask "${q.replace(/"/g, "'")}"`;
+  };
 
   const copyCli = async () => {
     if (!url) return toastErr("Review", "Enter a PR URL first.");
