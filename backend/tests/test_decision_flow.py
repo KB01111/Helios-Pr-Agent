@@ -344,3 +344,34 @@ def test_open_index_recovers_from_a_missing_or_stale_marker(env):
     store.eval_update(rec["id"], {"state": "dispatched"})
     assert store.eval_list_open() == []
     assert store.rget("evalopen:deadbeefdeadbeef") is None and store.rget(f"evalopen:{rec['id']}") is None
+
+
+def test_marker_cleanup_never_races_a_registration_in_flight(env):
+    eid = store.eval_id("o/r", 41, SHA)
+    store.rset(f"evalopen:{eid}", repr(__import__("time").time()))  # marker written, record not yet
+    assert store.eval_list_open() == []
+    assert store.rget(f"evalopen:{eid}") is not None  # fresh orphan-looking marker is kept
+    store.eval_register("o/r", 41, SHA, {"state": "deferred", "facts": TINY})  # registration completes
+    assert [r["id"] for r in store.eval_list_open()] == [eid]
+    # an old orphan (crash) is eventually removed
+    other = store.eval_id("o/r", 42, SHA)
+    store.rset(f"evalopen:{other}", repr(__import__("time").time() - 3600))
+    store.eval_list_open()
+    assert store.rget(f"evalopen:{other}") is None
+
+
+def test_recent_list_reads_only_the_newest_records(env, monkeypatch):
+    for n in range(1, 31):
+        store.eval_register("o/r", n, SHA, {"state": "dispatched"})
+    loaded = []
+    real = store.rget_json_many
+    monkeypatch.setattr(store, "rget_json_many", lambda keys: (loaded.append(len(keys)), real(keys))[1])
+    newest = store.eval_list(5)
+    assert len(newest) == 5 and loaded == [5]  # 5 payload reads, not 30
+    assert [r["pr_number"] for r in newest] == [30, 29, 28, 27, 26]
+    # reindex rebuilds the time index for records that predate it
+    for k in store.rkeys("evalrecent:*"):
+        store.rdelete(k)
+    assert store.eval_list(5) == []
+    store.eval_reindex()
+    assert len(store.eval_list(5)) == 5

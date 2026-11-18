@@ -581,9 +581,32 @@ EVAL_OPEN_STATES = ("pending", "deferred", "dispatching", "escalated", "failed",
 def _sync_open_marker(rec: dict, ex: int | None = None) -> None:
     key = f"evalopen:{rec['id']}"
     if rec.get("state") in EVAL_OPEN_STATES:
-        rset(key, "1", ex=ex or EVAL_TTL_S)
+        rset(key, repr(time.time()), ex=ex or EVAL_TTL_S)
     else:
         rdelete(key)
+
+
+# An open marker whose record is missing is either a registration in flight (marker is
+# written first) or an orphan from a crash. Only orphans older than this are swept.
+ORPHAN_MARKER_GRACE_S = 60
+
+
+def _marker_age_s(eid: str) -> float:
+    try:
+        return time.time() - float(rget(f"evalopen:{eid}") or 0)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _recent_key(rec: dict) -> str:
+    """Time-ordered key so "newest N" reads N records instead of scanning all of them."""
+    import datetime
+
+    try:
+        ts = datetime.datetime.fromisoformat(str(rec["created_at"])).timestamp()
+    except (KeyError, ValueError):
+        ts = time.time()
+    return f"evalrecent:{int(ts * 1_000_000):018d}:{rec['id']}"
 
 
 def _now_iso() -> str:
@@ -613,6 +636,7 @@ def eval_register(
         # would hide an unresolved evaluation from the sweeper.
         _sync_open_marker(rec, ex)
         if rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S, nx=True):
+            rset(_recent_key(rec), "1", ex=ex or EVAL_TTL_S)
             return True, rec
         existing = rget_json(_eval_key(eid))
         if isinstance(existing, dict):
@@ -694,8 +718,13 @@ def eval_reindex() -> int:
     records written before the index existed or a crash between the two writes)."""
     restored = 0
     have = {k.split("evalopen:", 1)[-1] for k in rkeys("evalopen:*")}
+    have_recent = {k.rsplit(":", 1)[-1] for k in rkeys("evalrecent:*")}
     for rec in rget_json_many(rkeys("eval:*")):
-        if isinstance(rec, dict) and rec.get("id") and rec.get("state") in EVAL_OPEN_STATES and rec["id"] not in have:
+        if not isinstance(rec, dict) or not rec.get("id"):
+            continue
+        if rec["id"] not in have_recent:
+            rset(_recent_key(rec), "1", ex=EVAL_TTL_S)
+        if rec.get("state") in EVAL_OPEN_STATES and rec["id"] not in have:
             _sync_open_marker(rec)
             restored += 1
     return restored
@@ -707,16 +736,21 @@ def eval_list_open(states: tuple[str, ...] | None = None) -> list[dict]:
     loaded = rget_json_many([_eval_key(i) for i in ids])
     records = []
     for eid, rec in zip(ids, loaded):
-        if not isinstance(rec, dict) or rec.get("state") not in EVAL_OPEN_STATES:
-            rdelete(f"evalopen:{eid}")  # stale marker (record gone or already settled)
-        elif rec.get("state") in (states or EVAL_OPEN_STATES):
-            records.append(rec)
+        if isinstance(rec, dict) and rec.get("state") in EVAL_OPEN_STATES:
+            if rec.get("state") in (states or EVAL_OPEN_STATES):
+                records.append(rec)
+        elif isinstance(rec, dict):
+            rdelete(f"evalopen:{eid}")  # settled: terminal states never reopen
+        elif _marker_age_s(eid) > ORPHAN_MARKER_GRACE_S:
+            rdelete(f"evalopen:{eid}")  # orphan from a crash (a fresh one may be mid-registration)
     records.sort(key=lambda r: str(r.get("created_at", "")))
     return records
 
 
 def eval_list(limit: int = 100) -> list[dict]:
-    keys = rkeys("eval:*")
-    records = [r for r in rget_json_many(keys) if isinstance(r, dict)]
+    # Newest first from the time-ordered key index, then read only those `limit` records.
+    keys = sorted(rkeys("evalrecent:*"), reverse=True)[: max(1, limit)]
+    ids = [k.rsplit(":", 1)[-1] for k in keys]
+    records = [r for r in rget_json_many([_eval_key(i) for i in ids]) if isinstance(r, dict)]
     records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
-    return records[: max(1, limit)]
+    return records

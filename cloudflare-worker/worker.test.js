@@ -51,10 +51,13 @@ function fakeKv() {
   const store = new Map();
   return {
     store,
-    put: async (k, v) => void store.set(k, v),
+    writes: 0,
+    lists: 0,
+    put: async function (k, v) { this.writes++; store.set(k, v); },
     get: async (k, type) => (store.has(k) ? (type === "json" ? JSON.parse(store.get(k)) : store.get(k)) : null),
     delete: async (k) => void store.delete(k),
-    list: async ({ prefix, limit, cursor }) => {
+    list: async function ({ prefix, limit, cursor }) {
+      this.lists++;
       const all = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
       const from = Number(cursor || 0);
       const page = all.slice(from, from + limit);
@@ -272,21 +275,36 @@ test("a stalled backend is aborted by the timeout and the delivery is parked", a
   }
 });
 
-test("replay follows the KV cursor so backlogs beyond one page are reached", async () => {
+test("replay reaches a backlog larger than one KV page within the list-call budget", async () => {
   const kv = fakeKv();
-  const total = 2500; // > 2 pages of 1000
+  const total = 1500; // more than one 1000-key page
   for (let i = 0; i < total; i++) {
     await kv.put(`pending:${String(i).padStart(5, "0")}`, JSON.stringify({ body: "{}", event: "pull_request", delivery: `d${i}`, signature: "s" }));
   }
+  const parkWrites = kv.writes;
   const tried = new Set();
   const f = stubFetch((url, init) => {
     tried.add(init.headers["x-github-delivery"]);
     return new Response("{}", { status: 503 });
   });
   try {
-    for (let slot = 0; slot < total / 10; slot++) await replayParked({ ...baseEnv, PENDING: kv }, slot);
-    assert.equal(tried.size, total); // including everything past the first 1000 keys
-    assert.equal(kv.store.size, total); // no KV writes or deletes while the backend is down
+    const slots = total / 10;
+    for (let slot = 0; slot < slots; slot++) await replayParked({ ...baseEnv, PENDING: kv }, slot);
+    assert.equal(tried.size, total); // everything, including keys past the first page
+    assert.equal(kv.writes, parkWrites); // no KV writes while the backend is down
+    assert.ok(kv.lists <= 2 * slots); // at most two list() calls per run
+  } finally {
+    f.restore();
+  }
+});
+
+test("a small backlog costs exactly one list() call per replay", async () => {
+  const kv = fakeKv();
+  await kv.put("pending:a", JSON.stringify({ body: "{}", event: "pull_request", delivery: "a", signature: "s" }));
+  const f = stubFetch(() => new Response("{}", { status: 503 }));
+  try {
+    await replayParked({ ...baseEnv, PENDING: kv }, 1);
+    assert.equal(kv.lists, 1);
   } finally {
     f.restore();
   }

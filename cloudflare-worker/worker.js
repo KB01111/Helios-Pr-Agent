@@ -29,7 +29,10 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const FORWARD_TIMEOUT_MS = 7000;
 const KV_REPLAY_EVERY_MIN = 5; // KV free tier allows ~1000 list() calls/day
 const KV_REPLAY_BATCH = 10; // stay well inside the 50-subrequest limit
-const KV_REPLAY_MAX_PAGES = 5; // up to 5000 parked deliveries are reachable
+// The free tier caps KV *writes* at 1000/day, so at most ~1000 deliveries can be parked per
+// 24 h TTL: one list page normally holds them all. A second page is only read when the first
+// is full, which keeps the 5-minute cron at ~288 list() calls/day (free budget: 1000).
+const KV_REPLAY_MAX_PAGES = 2;
 const KV_REPLAY_WINDOW = 1000; // keys listed per replay (one list() call, the KV maximum)
 
 const enc = new TextEncoder();
