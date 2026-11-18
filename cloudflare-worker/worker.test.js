@@ -215,3 +215,30 @@ test("replay rotates through a backlog bigger than one batch", async () => {
     f.restore();
   }
 });
+
+test("a body without Content-Length is cut off at the size limit before any buffering or forwarding", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    const big = new Uint8Array(3 * 1024 * 1024);
+    const stream = new ReadableStream({ start(c) { c.enqueue(big); c.close(); } });
+    const request = new Request("https://edge.example.com/webhooks/github", {
+      method: "POST", body: stream, duplex: "half",
+      headers: { "x-github-event": "pull_request", "x-hub-signature-256": "sha256=" + "0".repeat(64) },
+    });
+    const resp = await worker.fetch(request, baseEnv, { waitUntil() {} });
+    assert.equal(resp.status, 413);
+    assert.equal(f.calls.length, 0);
+  } finally {
+    f.restore();
+  }
+});
+
+test("each forward attempt is bounded by a timeout signal", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    await post(prBody());
+    assert.ok(f.calls[0].init.signal instanceof AbortSignal);
+  } finally {
+    f.restore();
+  }
+});

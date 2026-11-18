@@ -25,6 +25,8 @@
 const PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "labeled"]);
 const DEFAULT_DELAYS_MS = [0, 1000, 3000];
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+// waitUntil work is cut off ~30 s after the response: 3 attempts x 7 s + backoff leaves time to park.
+const FORWARD_TIMEOUT_MS = 7000;
 const KV_REPLAY_EVERY_MIN = 5; // KV free tier allows ~1000 list() calls/day
 const KV_REPLAY_BATCH = 10; // stay well inside the 50-subrequest limit
 const KV_REPLAY_WINDOW = 100; // keys listed per replay (one list() call)
@@ -89,6 +91,7 @@ export async function forward(env, item) {
         "x-hub-signature-256": item.signature,
       },
       body: item.body,
+      signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
     });
     if (resp.ok) return "ok";
     // 409 = another handler holds the claim right now; 5xx = cold/failing backend.
@@ -119,14 +122,39 @@ export async function deliver(env, item) {
   return "lost";
 }
 
+/** Read at most `max` bytes, cancelling the stream as soon as the limit is exceeded. */
+async function readBounded(request, max) {
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
 export async function handleWebhook(request, env, ctx) {
   if (!env.GITHUB_WEBHOOK_SECRET || !backendBase(env)) {
     return json({ error: "worker not configured" }, 500);
   }
   const declared = Number(request.headers.get("content-length") || 0);
   if (declared > MAX_BODY_BYTES) return json({ error: "payload too large" }, 413);
-  const raw = new Uint8Array(await request.arrayBuffer());
-  if (raw.byteLength > MAX_BODY_BYTES) return json({ error: "payload too large" }, 413);
+  const raw = await readBounded(request, MAX_BODY_BYTES);
+  if (raw === null) return json({ error: "payload too large" }, 413);
 
   const signature = request.headers.get("x-hub-signature-256") || "";
   if (!(await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, signature))) {

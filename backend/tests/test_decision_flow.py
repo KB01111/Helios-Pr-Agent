@@ -315,3 +315,19 @@ def test_lock_release_is_compare_and_delete(env):
     assert store.rget("evallock:abc") == "someone-else"
     assert store.rdelete_if_equal("evallock:abc", "someone-else") is True
     assert store.rget("evallock:abc") is None
+
+
+def test_eval_ids_are_case_insensitive_for_repo_and_sha():
+    assert store.eval_id("KB01111/Helios-Pr-Agent", 3, "ABCDEF1") == store.eval_id("kb01111/helios-pr-agent", 3, "abcdef1")
+
+
+def test_open_index_finds_old_unresolved_items_beyond_any_recency_window(env):
+    env["facts"] = RUNTIME
+    old = hook(env["client"], number=1).json()  # escalated
+    for n in range(2, 12):  # many newer, already-settled evaluations
+        store.eval_register("o/r", 100 + n, SHA, {"state": "dispatched"})
+    escalated = env["client"].get("/decisions", params={"state": "escalated", "limit": 5}).json()
+    assert [r["id"] for r in escalated] == [old["id"]]
+    env["client"].post(f"/decisions/{old['id']}/resolve", json={"action": "skip"})
+    assert env["client"].get("/decisions", params={"state": "escalated"}).json() == []
+    assert store.eval_list_open() == []  # terminal states leave the open index

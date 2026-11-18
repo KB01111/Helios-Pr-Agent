@@ -198,11 +198,11 @@
             <button type="button" class="seg-btn" data-level="auto">Auto</button>
           </div>
           <p class="hint" id="autonomy-desc">…</p>
-          <div class="field" id="conf-auto-row"><span class="lbl">Act alone at confidence ≥ <b id="conf-auto-val">0.75</b></span>
-            <input type="range" id="conf-auto" min="0.5" max="1" step="0.01" value="0.75" />
+          <div class="field" id="conf-auto-row"><span class="lbl" id="lbl-conf-auto">Act alone at confidence ≥ <b id="conf-auto-val">0.75</b></span>
+            <input aria-labelledby="lbl-conf-auto" type="range" id="conf-auto" min="0.5" max="1" step="0.01" value="0.75" />
           </div>
-          <div class="field"><span class="lbl">Gray-zone floor — below <b id="conf-floor-val">0.55</b> a PR is escalated to you</span>
-            <input type="range" id="conf-floor" min="0.3" max="0.95" step="0.01" value="0.55" />
+          <div class="field"><span class="lbl" id="lbl-conf-floor">Gray-zone floor — below <b id="conf-floor-val">0.55</b> a PR is escalated to you</span>
+            <input aria-labelledby="lbl-conf-floor" type="range" id="conf-floor" min="0.3" max="0.95" step="0.01" value="0.55" />
           </div>
           <p class="hint">Safety-flagged PRs (workflows, Dockerfiles, secrets, auth, <code>curl | sh</code>) always escalate, at every level.</p>
           <div class="row wrap">
@@ -222,11 +222,11 @@
           <div class="card-head"><h2>Always-on daemon</h2><span class="badge" id="daemon-state">stopped</span></div>
           <p class="hint">While the app is open (closing the window keeps it in the tray) the daemon decides new PRs locally and keeps the cloud idle. If it stops or the machine sleeps, the cloud fallback takes over automatically — and the same PR is never reviewed twice.</p>
           <div class="grid2">
-            <div class="field"><span class="lbl">Poll interval (5–60 s)</span>
-              <input id="daemon-interval" inputmode="numeric" value="30" autocomplete="off" />
+            <div class="field"><span class="lbl" id="lbl-daemon-interval">Poll interval (5–60 s)</span>
+              <input aria-labelledby="lbl-daemon-interval" id="daemon-interval" inputmode="numeric" value="30" autocomplete="off" />
             </div>
-            <div class="field"><span class="lbl">Local model sidecar (optional, loopback only)</span>
-              <input id="daemon-sidecar" placeholder="http://127.0.0.1:8080" autocomplete="off" />
+            <div class="field"><span class="lbl" id="lbl-daemon-sidecar">Local model sidecar (optional, loopback only)</span>
+              <input aria-labelledby="lbl-daemon-sidecar" id="daemon-sidecar" placeholder="http://127.0.0.1:8080" autocomplete="off" />
             </div>
           </div>
           <div class="checks"><label><input type="checkbox" id="daemon-autostart" /> Start automatically when the app opens</label></div>

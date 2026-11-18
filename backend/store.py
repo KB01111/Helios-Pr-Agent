@@ -563,12 +563,27 @@ EVAL_LOCK_LEASE_S = 60
 
 def eval_id(repo: str, pr_number: int, head_sha: str) -> str:
     """Stable short id for one (repo, pr_number, head_sha) evaluation."""
-    raw = f"{repo}|{int(pr_number)}|{head_sha}".encode("utf-8")
+    # GitHub repo names and SHAs are case-insensitive; every caller must hash the same key.
+    raw = f"{str(repo).lower()}|{int(pr_number)}|{str(head_sha).lower()}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def _eval_key(eid: str) -> str:
     return f"eval:{eid}"
+
+
+# Evaluations that something still has to act on. A tiny marker key per open evaluation
+# lets the sweeper, the desktop's pending poll and the inbox read only those records,
+# instead of scanning (and MGET-ing) 14 days of history.
+EVAL_OPEN_STATES = ("pending", "deferred", "dispatching", "escalated", "failed", "external_claimed")
+
+
+def _sync_open_marker(rec: dict, ex: int | None = None) -> None:
+    key = f"evalopen:{rec['id']}"
+    if rec.get("state") in EVAL_OPEN_STATES:
+        rset(key, "1", ex=ex or EVAL_TTL_S)
+    else:
+        rdelete(key)
 
 
 def _now_iso() -> str:
@@ -594,6 +609,7 @@ def eval_register(
     })
     for _ in range(2):  # second pass covers a record that expired between calls
         if rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S, nx=True):
+            _sync_open_marker(rec, ex)
             return True, rec
         existing = rget_json(_eval_key(eid))
         if isinstance(existing, dict):
@@ -639,11 +655,13 @@ def eval_update(eid: str, patch: dict, ex: int | None = None) -> dict | None:
     rec.update(patch)
     rec["updated_at"] = _now_iso()
     rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S)
+    _sync_open_marker(rec, ex)
     return rec
 
 
 def eval_delete(eid: str) -> None:
     rdelete(_eval_key(eid))
+    rdelete(f"evalopen:{eid}")
 
 
 @contextlib.contextmanager
@@ -666,6 +684,15 @@ def eval_lock(eid: str, lease_s: int = EVAL_LOCK_LEASE_S):
             rdelete_if_equal(key, token)
         except Exception as exc:  # the lease simply expires
             log.warning("store.eval_lock release failed: %s", exc)
+
+
+def eval_list_open(states: tuple[str, ...] | None = None) -> list[dict]:
+    """Records still awaiting action, oldest first. Reads only the open set."""
+    ids = [k.split("evalopen:", 1)[-1] for k in rkeys("evalopen:*")]
+    records = [r for r in rget_json_many([_eval_key(i) for i in ids]) if isinstance(r, dict)]
+    records = [r for r in records if r.get("state") in (states or EVAL_OPEN_STATES)]
+    records.sort(key=lambda r: str(r.get("created_at", "")))
+    return records
 
 
 def eval_list(limit: int = 100) -> list[dict]:

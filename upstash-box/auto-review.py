@@ -105,15 +105,17 @@ def claim_call(payload):
 
 
 def claim(repo, number, sha):
-    """(ok_to_review, claim_id, state). Fails open: without a reachable backend this
-    runner behaves exactly as before (its own state file is the only guard)."""
+    """(ok_to_review, claim_id, state). With no BACKEND_URL this runner is standalone (its
+    state file is the only guard). Once BACKEND_URL is set the claim is mandatory: if the
+    backend cannot be reached we cannot know the commit is unreviewed, so we wait for the
+    next run rather than risk a duplicate review."""
     if not BACKEND_URL:
         return True, None, None
     try:
         got = claim_call({"action": "claim", "repo": repo, "pr_number": number, "head_sha": sha, "owner": "box-cron"})
     except Exception as e:
-        print(f"[{repo}#{number}] claim failed ({e}); reviewing anyway", flush=True)
-        return True, None, None
+        print(f"[{repo}#{number}] claim failed ({e}); will retry next run", flush=True)
+        return False, None, "backend_unreachable"
     return bool(got.get("claimed")), got.get("claim_id"), got.get("state")
 
 
@@ -149,7 +151,7 @@ def main():
             ok, claim_id, state = claim(repo, pr["number"], sha)
             if not ok:
                 print(f"[{repo}#{pr['number']}] already handled elsewhere ({state}); skipping", flush=True)
-                if state != "external_claimed":  # another runner's short lease may still lapse
+                if state not in ("external_claimed", "backend_unreachable"):  # these can still change
                     done[key] = True
                     save_state(done)
                 continue

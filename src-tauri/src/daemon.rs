@@ -206,7 +206,18 @@ fn valid_id(id: &str) -> bool {
     id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn handle_item(inner: &Inner, cfg: &Config, floor: f64, item: &serde_json::Value) -> Result<(), String> {
+/// `generation == None` (tests) means "always current".
+fn alive(inner: &Inner, generation: Option<u64>) -> bool {
+    generation.map_or(true, |g| inner.is_current(g))
+}
+
+fn handle_item(
+    inner: &Inner,
+    cfg: &Config,
+    generation: Option<u64>,
+    floor: f64,
+    item: &serde_json::Value,
+) -> Result<(), String> {
     let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
     if !valid_id(id) {
         return Err("pending item without a valid id".into());
@@ -217,6 +228,10 @@ fn handle_item(inner: &Inner, cfg: &Config, floor: f64, item: &serde_json::Value
     let model = cfg.sidecar.as_ref().and_then(|sc| query_sidecar(sc, &facts));
     let mut decision = decider::decide_blended(&facts, floor, model, SIDECAR_WEIGHT);
     decision.latency_ms = started.elapsed().as_millis() as u64;
+    // The (possibly slow) sidecar call may have outlived a stop or restart: don't submit then.
+    if !alive(inner, generation) {
+        return Ok(());
+    }
 
     let repo = item.get("repo").and_then(|v| v.as_str()).unwrap_or("?");
     let pr = item.get("pr_number").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -241,7 +256,7 @@ fn handle_item(inner: &Inner, cfg: &Config, floor: f64, item: &serde_json::Value
     }
 }
 
-fn tick(inner: &Inner, cfg: &Config) -> Result<(), String> {
+fn tick(inner: &Inner, cfg: &Config, generation: Option<u64>) -> Result<(), String> {
     call(
         cfg,
         "POST",
@@ -260,7 +275,10 @@ fn tick(inner: &Inner, cfg: &Config) -> Result<(), String> {
     let items = pending.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let mut first_error: Option<String> = None;
     for item in &items {
-        if let Err(e) = handle_item(inner, cfg, floor, item) {
+        if !alive(inner, generation) {
+            break;
+        }
+        if let Err(e) = handle_item(inner, cfg, generation, floor, item) {
             lock(&inner.status).failures += 1;
             inner.log(format!("error: {}", e));
             first_error.get_or_insert(e);
@@ -275,7 +293,7 @@ fn tick(inner: &Inner, cfg: &Config) -> Result<(), String> {
 fn run_loop(inner: Arc<Inner>, generation: u64, cfg: Config) {
     let mut consecutive_errors: u32 = 0;
     while inner.is_current(generation) {
-        let result = tick(&inner, &cfg);
+        let result = tick(&inner, &cfg, Some(generation));
         if !inner.is_current(generation) {
             break;
         }
@@ -341,6 +359,8 @@ fn start(
             url: loopback_sidecar(u)?,
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(3))
+                // A redirect could carry the PR facts off loopback.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| e.to_string())?,
         }),
@@ -537,7 +557,7 @@ mod tests {
     fn a_tick_heartbeats_decides_locally_and_submits_the_shared_schema() {
         let (url, seen, server) = mock_backend(4, router(200));
         let inner = Inner::default();
-        tick(&inner, &cfg(&url)).expect("tick succeeds");
+        tick(&inner, &cfg(&url), None).expect("tick succeeds");
         server.join().unwrap();
 
         let seen = seen.lock().unwrap();
@@ -567,7 +587,7 @@ mod tests {
     fn losing_the_race_to_the_cloud_fallback_is_not_an_error() {
         let (url, _seen, server) = mock_backend(4, router(409));
         let inner = Inner::default();
-        tick(&inner, &cfg(&url)).expect("a 409 means someone else already acted");
+        tick(&inner, &cfg(&url), None).expect("a 409 means someone else already acted");
         server.join().unwrap();
         let s = inner.snapshot();
         assert_eq!((s.decided, s.lost_races, s.failures), (0, 1, 0));
@@ -577,7 +597,7 @@ mod tests {
     fn a_failed_submit_is_reported_and_counted() {
         let (url, _seen, server) = mock_backend(4, router(500));
         let inner = Inner::default();
-        assert!(tick(&inner, &cfg(&url)).is_err());
+        assert!(tick(&inner, &cfg(&url), None).is_err());
         server.join().unwrap();
         assert_eq!(inner.snapshot().failures, 1);
     }

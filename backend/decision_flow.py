@@ -425,7 +425,7 @@ async def sweep() -> dict[str, int]:
     and fail evaluations stuck mid-flight so a human can retry them."""
     counts = {"decided": 0, "failed": 0}
     now = _utcnow()
-    records = await asyncio.to_thread(store.eval_list, 500)
+    records = await asyncio.to_thread(store.eval_list_open, ("deferred", "pending", "dispatching"))
     for rec in records:
         eid, state = rec.get("id"), rec.get("state")
         if not eid:
@@ -507,17 +507,21 @@ def build_router() -> APIRouter:
         limit: int = Query(default=50, ge=1, le=200),
     ) -> list[dict[str, Any]]:
         _auth(request)
-        records = store.eval_list(2000 if state else 500)
-        if state:
-            records = [r for r in records if r.get("state") == state]
+        if state in store.EVAL_OPEN_STATES:
+            # Open states are read from the open index, so old unresolved items never
+            # fall off a "newest N records" window.
+            records = list(reversed(store.eval_list_open((state,))))
+        else:
+            records = store.eval_list(500)
+            if state:
+                records = [r for r in records if r.get("state") == state]
         return [_brief(r) for r in records[:limit]]
 
     @router.get("/decisions/pending")
     def pending(request: Request, limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
         """Deferred events for the desktop daemon, oldest first, with facts."""
         _auth(request)
-        items = [r for r in store.eval_list(500) if r.get("state") == "deferred" and isinstance(r.get("facts"), dict)]
-        items.sort(key=lambda r: str(r.get("created_at", "")))
+        items = [r for r in store.eval_list_open(("deferred",)) if isinstance(r.get("facts"), dict)]
         keep = ("id", "repo", "pr_number", "head_sha", "title", "facts", "defer_until", "created_at")
         return {"items": [{k: r.get(k) for k in keep} for r in items[:limit]]}
 

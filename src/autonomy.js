@@ -202,11 +202,15 @@
   }
   function renderInbox(items) {
     const box = $("esc-list");
-    box.textContent = "";
     $("esc-count").textContent = items.length + " waiting";
     $("esc-count").className = "badge " + (items.length ? "err" : "ok");
     const nav = $("nav-esc-count");
     if (nav) { nav.textContent = String(items.length); nav.classList.toggle("hidden", items.length === 0); }
+    // Never rebuild the cards under a focused control (keyboard users would lose their place);
+    // the list is refreshed as soon as focus leaves it.
+    if (box.contains(document.activeElement)) { inboxDirty = true; return; }
+    inboxDirty = false;
+    box.textContent = "";
     if (!items.length) { box.appendChild(el("p", "hint", "Nothing needs you right now.")); return; }
     items.forEach((rec) => box.appendChild(escalationCard(rec)));
   }
@@ -241,6 +245,7 @@
     }
   }
   let inboxSeq = 0;
+  let inboxDirty = false;
   async function refreshInbox() {
     // Only the newest response may render: periodic and action-triggered refreshes can overlap.
     const seq = ++inboxSeq;
@@ -278,6 +283,7 @@
     $("btn-daemon-stop").addEventListener("click", stopDaemon);
     $("btn-daemon-refresh").addEventListener("click", refreshDaemon);
     $("btn-esc-refresh").addEventListener("click", refreshInbox);
+    $("esc-list").addEventListener("focusout", () => { setTimeout(() => { if (inboxDirty) refreshInbox(); }, 0); });
     $$(".nav-btn").forEach((b) => b.addEventListener("click", () => { if (b.dataset.tab === "autonomy") refreshAll(); }));
     $("daemon-autostart").addEventListener("change", () => { const p = loadPrefs(); p.autostart = $("daemon-autostart").checked; savePrefs(p); });
   }
