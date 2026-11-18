@@ -29,8 +29,9 @@ export function SettingsPage({ active }: { active: boolean }) {
   const test = async () => {
     setOut("Testing…");
     setBackendUrl(urlDraft);
+    const url = useApp.getState().backendUrl; // the URL actually being tested
     const ok = await checkBackend(true);
-    const url = useApp.getState().backendUrl;
+    if (useApp.getState().backendUrl !== url) return; // selection changed while testing
     setOut(ok ? `OK — ${url}` : `Unreachable — is the backend running at ${url}?`);
   };
 
