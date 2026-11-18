@@ -168,16 +168,21 @@ function ConnectionsCard({
       const todo = pairs.map(([key, field]) => [key, drafts[field].trim(), field] as const).filter(([, v]) => v);
       if (!todo.length) return toastErr("Connect", "Enter a value first.");
       setOut(`Saving ${label} to backend/.env…`);
+      const nonce = useApp.getState().clearNonce;
       try {
         const paths = new Set<string>();
         for (const [key, val] of todo) paths.add(await tauriInvoke<string>("save_backend_env_var", { key, value: val }));
-        // Mirror session-usable secrets into memory + sessionStorage (same convention as Settings).
-        for (const [key, val] of todo) {
-          if (key === "GITHUB_TOKEN") setSecret("github", val);
-          if (key === "OPENROUTER_API_KEY") setSecret("openrouter", val);
-          if (key === "UPSTASH_BOX_API_KEY") setSecret("box", val);
+        // Mirror session-usable secrets into memory + sessionStorage (same convention as
+        // Settings) — unless the user cleared session secrets while the save was pending.
+        const sessionCleared = useApp.getState().clearNonce !== nonce;
+        if (!sessionCleared) {
+          for (const [key, val] of todo) {
+            if (key === "GITHUB_TOKEN") setSecret("github", val);
+            if (key === "OPENROUTER_API_KEY") setSecret("openrouter", val);
+            if (key === "UPSTASH_BOX_API_KEY") setSecret("box", val);
+          }
+          if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
         }
-        if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
         setDrafts((d) => {
           const next = { ...d };
           for (const [, field] of pairs) if (!keep.includes(field)) next[field] = "";

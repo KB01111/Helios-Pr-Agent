@@ -127,13 +127,16 @@ export function AutonomyPage({ active }: { active: boolean }) {
     }
   }, []);
 
+  const daemonToken = React.useRef<string | null>(null); // token the running worker was started with
   const startDaemon = React.useCallback(
     async (silent: boolean, override?: Prefs) => {
       const p = override ?? loadPrefs();
       try {
+        const token = useApp.getState().secrets.api || null;
+        daemonToken.current = token;
         const s = await tauriInvoke("daemon_start", {
           backendUrl: backendUrl(),
-          apiToken: useApp.getState().secrets.api || null,
+          apiToken: token,
           intervalSecs: p.interval,
           sidecarUrl: p.sidecar || null,
         });
@@ -239,10 +242,22 @@ export function AutonomyPage({ active }: { active: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  // A new API token means the previous inbox/daemon context is stale.
+  // A new API token means the previous inbox/daemon context is stale. The worker
+  // captured the token when it started, so restart it with the new one.
   React.useEffect(() => {
-    if (apiToken) void refreshInbox();
-  }, [apiToken, refreshInbox]);
+    void refreshInbox();
+    if (local?.running && daemonToken.current !== (apiToken || null)) {
+      void (async () => {
+        try {
+          await tauriInvoke("daemon_stop");
+          await startDaemon(true);
+        } catch (e) {
+          toastErr("Could not restart daemon", errText(e, 200));
+        }
+      })();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiToken]);
 
   const running = !!(local && local.running);
   const logLines =

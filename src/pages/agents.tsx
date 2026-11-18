@@ -58,6 +58,8 @@ export function AgentsPage({ active }: { active: boolean }) {
   const [repoAdd, setRepoAdd] = React.useState("");
   const [msg, setMsg] = React.useState("Agents not loaded.");
   const [confirmDelete, setConfirmDelete] = React.useState(false);
+  // Selecting/saving/deleting is serialized: the selected id only changes together with its form.
+  const [busy, setBusy] = React.useState(false);
   const patch = (p: Partial<Form>) => setForm((f) => ({ ...f, ...p }));
 
   const allRepos = React.useMemo(() => Array.from(new Set([...picked, ...remote])).sort(), [picked, remote]);
@@ -92,16 +94,22 @@ export function AgentsPage({ active }: { active: boolean }) {
   const loadedRepos = React.useRef<string[]>([]);
   const onSelect = async (id: string) => {
     const seq = ++selectSeq.current; // only the newest selection may fill the form
-    setSelectedId(id);
     if (id === NEW) {
+      setSelectedId(NEW);
       fillForm({});
       return;
     }
+    setBusy(true);
     try {
       const a = (await apiGet("/agents/" + encodeURIComponent(id))) || {};
-      if (seq === selectSeq.current) fillForm(a);
+      if (seq === selectSeq.current) {
+        fillForm(a);
+        setSelectedId(id); // commit the id together with its loaded form
+      }
     } catch (e) {
       if (seq === selectSeq.current) toastErr("Agent", errText(e, 200));
+    } finally {
+      if (seq === selectSeq.current) setBusy(false);
     }
   };
 
@@ -130,6 +138,7 @@ export function AgentsPage({ active }: { active: boolean }) {
       return toastErr("Agent", "Enter the label name for an on_label agent.");
     }
     setMsg("Saving…");
+    setBusy(true);
     try {
       const saved =
         selectedId !== NEW
@@ -142,6 +151,8 @@ export function AgentsPage({ active }: { active: boolean }) {
     } catch (e) {
       setMsg("Save failed: " + errText(e, 300));
       toastErr("Agent save failed", errText(e, 220));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -149,6 +160,7 @@ export function AgentsPage({ active }: { active: boolean }) {
     setConfirmDelete(false);
     if (selectedId === NEW) return toastErr("Agent", "Select an existing agent to delete.");
     setMsg("Deleting…");
+    setBusy(true);
     try {
       await apiMut("DELETE", "/agents/" + encodeURIComponent(selectedId));
       setMsg("Deleted.");
@@ -158,6 +170,8 @@ export function AgentsPage({ active }: { active: boolean }) {
     } catch (e) {
       setMsg("Delete failed: " + errText(e, 300));
       toastErr("Delete failed", errText(e, 200));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -200,7 +214,7 @@ export function AgentsPage({ active }: { active: boolean }) {
         action={<Badge variant="outline">{agents.length} agent(s)</Badge>}
         footer={
           <ButtonRow className="w-full">
-            <AsyncButton onClick={save}>
+            <AsyncButton onClick={save} disabled={busy}>
               <Save /> {selectedId === NEW ? "Create agent" : "Save agent"}
             </AsyncButton>
             <AsyncButton variant="outline" onClick={() => refresh()}>
@@ -209,7 +223,7 @@ export function AgentsPage({ active }: { active: boolean }) {
             <Button
               type="button"
               variant="destructive"
-              disabled={selectedId === NEW}
+              disabled={selectedId === NEW || busy}
               onClick={() => setConfirmDelete(true)}
             >
               <Trash2 /> Delete selected
@@ -220,7 +234,7 @@ export function AgentsPage({ active }: { active: boolean }) {
       >
         <FieldGrid>
           <Field label="Existing agents" htmlFor="agent-select">
-            <Select value={selectedId} onValueChange={onSelect}>
+            <Select value={selectedId} onValueChange={onSelect} disabled={busy}>
               <SelectTrigger id="agent-select" className="w-full">
                 <SelectValue />
               </SelectTrigger>

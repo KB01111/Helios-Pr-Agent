@@ -92,7 +92,8 @@ export const useGh = create<GhState>((set, get) => ({
 
   reset: () => {
     flowGen++;
-    batchCancel = true;
+    batchGen++;
+    sessionGen++;
     inflight.clear();
     set({
       login: "",
@@ -112,11 +113,12 @@ export const useGh = create<GhState>((set, get) => ({
   },
 }));
 
-const inflight = new Set<string>();
+const inflight = new Map<string, Promise<void>>();
+let sessionGen = 0; // bumped on reset so responses from an earlier GitHub session are dropped
 let flowGen = 0; // bumped to invalidate any in-flight device flow (cancel, reset, PAT win)
 let startSeq = 0; // identifies the most recently started device flow
 let patWon = false; // a PAT sign-in finished while the device flow was still pending
-let batchCancel = false;
+let batchGen = 0; // identifies the current setup batch; reset() advances it to cancel
 
 const gh = () => useGh.getState();
 const token = () => useApp.getState().secrets.github;
@@ -228,8 +230,10 @@ export async function signInWithPat(pat: string): Promise<boolean> {
     toastErr("PAT", "Paste a token first.");
     return false;
   }
+  const sg = sessionGen;
   try {
     const login = await tauriInvoke<string>("github_login", { token: t });
+    if (sg !== sessionGen) return false; // secrets were cleared while validating
     useApp.getState().setSecret("github", t);
     if (gh().signingIn) {
       // Stop a pending device flow so its later response cannot replace this token.
@@ -246,6 +250,7 @@ export async function signInWithPat(pat: string): Promise<boolean> {
     void loadRepos();
     return true;
   } catch (e) {
+    if (sg !== sessionGen) return false;
     useGh.setState({ signinMsg: "PAT rejected: " + errText(e, 300) });
     toastErr("PAT rejected", errText(e, 200));
     return false;
@@ -264,10 +269,12 @@ export async function loadRepos() {
     toastErr("GitHub", "Sign in with GitHub first.");
     return;
   }
+  const sg = sessionGen;
+  const stale = () => sg !== sessionGen || token() !== t;
   useGh.setState({ loadingRepos: true });
   try {
     const raw = await tauriInvoke("github_list_repos", { token: t });
-    if (token() !== t) return; // session cleared or account switched while loading
+    if (stale()) return; // session cleared or account switched while loading
     const parsed = Array.isArray(raw) ? raw : jsonObj(raw) || [];
     const arr: any[] = Array.isArray(parsed) ? parsed : [];
     const repos: GhRepo[] = [];
@@ -295,6 +302,7 @@ export async function loadRepos() {
     ghOut(`Loaded ${repos.length} repositories.`);
     toastOk("Repos loaded", `${repos.length} repositories.`);
   } catch (e) {
+    if (stale()) return;
     ghOut("Repo load failed: " + String(e));
     toastErr("Repo load failed", errText(e, 200));
   } finally {
@@ -302,22 +310,36 @@ export async function loadRepos() {
   }
 }
 
-export async function loadStatus(name: string, force: boolean) {
+export async function loadStatus(name: string, force: boolean): Promise<void> {
   const t = token();
   if (!t || !name) return;
   if (!force && gh().status[name]) return;
-  if (inflight.has(name)) return;
-  inflight.add(name);
+  const pending = inflight.get(name);
+  if (pending) {
+    await pending; // dedupe ordinary requests...
+    if (!force) return;
+    // ...but a forced refresh must not be satisfied by a request that started earlier.
+    return loadStatus(name, true);
+  }
+  const sg = sessionGen;
+  const stale = () => sg !== sessionGen || token() !== t;
+  const run = (async () => {
+    try {
+      const raw = await tauriInvoke("github_repo_status", { token: t, repo: name });
+      if (stale()) return; // session cleared or account switched while loading
+      const st = jsonObj(raw);
+      const value = st && !Array.isArray(st) ? st : { repo: name, error: "unexpected status response" };
+      useGh.setState({ status: { ...gh().status, [name]: value } });
+    } catch (e) {
+      if (stale()) return;
+      useGh.setState({ status: { ...gh().status, [name]: { repo: name, error: errText(e, 300) } } });
+    }
+  })();
+  inflight.set(name, run);
   try {
-    const raw = await tauriInvoke("github_repo_status", { token: t, repo: name });
-    if (token() !== t) return; // session cleared or account switched while loading
-    const st = jsonObj(raw);
-    const value = st && !Array.isArray(st) ? st : { repo: name, error: "unexpected status response" };
-    useGh.setState({ status: { ...gh().status, [name]: value } });
-  } catch (e) {
-    useGh.setState({ status: { ...gh().status, [name]: { repo: name, error: errText(e, 300) } } });
+    await run;
   } finally {
-    inflight.delete(name);
+    if (inflight.get(name) === run) inflight.delete(name);
   }
 }
 
@@ -351,13 +373,15 @@ export async function checkStatus(filter: string) {
 }
 
 /* ---------- configure batch (sequential; failures never abort the batch) ---------- */
-async function saveEnv(key: string, value: string) {
+async function saveEnv(key: string, value: string): Promise<boolean> {
   try {
     const p = await tauriInvoke("save_backend_env_var", { key, value });
     ghOut(`[env] ${key} saved to ${p}`);
+    return true;
   } catch (e) {
     ghOut(`[env] ${key} save failed: ${errText(e, 220)}`);
     toastErr("Env save failed", `${key}: ${errText(e, 180)}`);
+    return false;
   }
 }
 
@@ -445,6 +469,22 @@ export async function configure(opts: ConfigureOptions) {
   }
   let secret = opts.secret.trim();
   if (useWebhook && !secret) {
+    // The backend verifies every webhook against ONE global secret. Generating a new
+    // one would break deliveries from repositories that were configured earlier.
+    let backendHasSecret = false;
+    try {
+      const st = await apiGet("/config/status");
+      backendHasSecret = !!(st && st.github && st.github.webhook_secret_set);
+    } catch {
+      /* backend unreachable: nothing to protect */
+    }
+    if (backendHasSecret) {
+      toastErr(
+        "GitHub setup",
+        "The backend already has a webhook secret. Enter that secret in the field — or click Generate to replace it, then re-run setup for every repo.",
+      );
+      return;
+    }
     secret = ghRandomSecret();
     opts.onSecretGenerated?.(secret);
     ghOut("[config] generated a 32-byte webhook secret (hex).");
@@ -462,7 +502,8 @@ export async function configure(opts: ConfigureOptions) {
   const successful: string[] = [];
   const batchFailed: string[] = [];
   useGh.setState({ batchRunning: true });
-  batchCancel = false;
+  const myBatch = ++batchGen;
+  const cancelled = () => myBatch !== batchGen;
   try {
     ghOut(
       `=== Setup started: ${repos.length} repo(s) · mode=${mode}` +
@@ -474,13 +515,17 @@ export async function configure(opts: ConfigureOptions) {
       ghOut("[warn] 'both' posts a review from the GitHub Action AND from the backend agent on every PR.");
     }
     if (useWebhook && opts.saveSecret) {
-      await saveEnv("GITHUB_WEBHOOK_SECRET", secret);
+      if (!(await saveEnv("GITHUB_WEBHOOK_SECRET", secret))) {
+        // GitHub would sign deliveries with a secret the backend does not know.
+        ghOut("[setup] aborted: the webhook secret could not be saved to backend/.env, so no repository was changed.");
+        return;
+      }
       ghOut("[env] restart the backend to pick up .env changes.");
     }
     if (opts.saveToken) await saveEnv("GITHUB_TOKEN", t);
 
     for (const repo of repos) {
-      if (batchCancel) {
+      if (cancelled()) {
         ghOut("[setup] cancelled — session secrets were cleared; remaining repos not touched.");
         break;
       }
@@ -537,14 +582,15 @@ export async function configure(opts: ConfigureOptions) {
     if (batchFailed.length) toastErr("GitHub setup", `${batchFailed.length} repo(s) failed — use Retry failed.`);
     // The backend agent only matters when the backend reviews PRs; in Actions
     // mode it would just be a second, uncoordinated reviewer.
-    if (useWebhook && !batchCancel && opts.agentCreate && successful.length) {
+    if (useWebhook && !cancelled() && opts.agentCreate && successful.length) {
       await upsertAgent(successful, opts.agentName);
     }
   } catch (e) {
     ghOut("[fatal] " + errText(e, 300));
     toastErr("GitHub setup", errText(e));
   } finally {
-    useGh.setState({ batchRunning: false, configuring: [] });
+    // A cancelled batch must not clear the state of a newer one.
+    if (!cancelled()) useGh.setState({ batchRunning: false, configuring: [] });
   }
 }
 

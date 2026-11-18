@@ -4,17 +4,21 @@ import { errText, tauriInvoke } from "./tauri";
 import { toastErr, toastOk } from "./toast";
 
 /* ---------- backend connection ---------- */
+let healthSeq = 0;
 export async function checkBackend(showToast = false): Promise<boolean> {
   const { setBackend } = useApp.getState();
+  const seq = ++healthSeq;
+  const base = backendUrl();
+  // Only the newest check for the still-selected backend may update the status.
+  const current = () => seq === healthSeq && base === backendUrl();
   try {
-    const base = backendUrl();
     const data = await apiGet("/health");
     const mode = (data && (data.store || data.mode)) || "up";
-    setBackend({ ok: true, label: `online (${mode})` });
+    if (current()) setBackend({ ok: true, label: `online (${mode})` });
     if (showToast) toastOk("Backend reachable", `${base} · store=${mode}`);
     return true;
   } catch (e) {
-    setBackend({ ok: false, label: "offline" });
+    if (current()) setBackend({ ok: false, label: "offline" });
     if (showToast) toastErr("Backend unreachable", errText(e, 200));
     return false;
   }
@@ -134,7 +138,12 @@ function scheduleSyncRuns() {
   }, 300);
 }
 
+let streamGen = 0; // invalidates pending stream starts (ticket requests in flight)
+let streamStarting = false;
+
 export function stopStream(message?: string) {
+  streamGen++;
+  streamStarting = false;
   if (evtSrc) {
     evtSrc.close();
     evtSrc = null;
@@ -148,6 +157,9 @@ export async function toggleStream() {
     stopStream("Stream stopped.");
     return;
   }
+  if (streamStarting) return; // a start is already in flight
+  streamStarting = true;
+  const gen = ++streamGen;
   const { setRunsMsg, setStreaming, secrets } = useApp.getState();
   const base = backendUrl();
   // EventSource cannot set headers: exchange the API token for a short-lived,
@@ -159,11 +171,16 @@ export async function toggleStream() {
       if (!t || !t.ticket) throw new Error("no stream ticket returned");
       streamUrl += "?ticket=" + encodeURIComponent(t.ticket);
     }
+    if (gen !== streamGen) return; // stopped / secrets cleared while the ticket was pending
     evtSrc = new EventSource(streamUrl);
   } catch (e) {
-    setRunsMsg("Stream failed: " + errText(e, 200));
+    if (gen === streamGen) {
+      streamStarting = false;
+      setRunsMsg("Stream failed: " + errText(e, 200));
+    }
     return;
   }
+  streamStarting = false;
   setStreaming(true);
   setRunsMsg("Streaming live events…");
   evtSrc.onmessage = (ev) => {
@@ -178,7 +195,14 @@ export async function toggleStream() {
       setRunsMsg("event: " + String(ev.data).slice(0, 200));
     }
   };
-  evtSrc.onerror = () => {
+  const source = evtSrc;
+  source.onerror = () => {
+    // A closed source will not retry (e.g. the single-use ticket was rejected on
+    // reconnect): stop so the next click mints a fresh ticket.
+    if (source.readyState === EventSource.CLOSED && evtSrc === source) {
+      stopStream("Live stream closed by the backend — click Live to reconnect.");
+      return;
+    }
     setRunsMsg(
       "Stream error — check the backend at " +
         base +

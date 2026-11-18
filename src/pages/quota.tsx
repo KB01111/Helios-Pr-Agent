@@ -123,8 +123,8 @@ export function QuotaPage({ active }: { active: boolean }) {
         title="Auto-run on Upstash Box"
         description={
           <>
-            Provisions a <code>python</code> box, uploads the review loop, sets a cron schedule. Keys stay in memory — never
-            written to disk.
+            Provisions a <code>python</code> box, uploads the review loop, sets a cron schedule. Keys stay in memory and
+            sessionStorage until you clear them (they are sent to Upstash to provision the box).
           </>
         }
         action={<Badge variant="outline">cron</Badge>}

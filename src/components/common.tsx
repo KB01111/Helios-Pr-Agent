@@ -87,7 +87,6 @@ export function SecretInput({
         className="absolute top-1/2 right-1.5 -translate-y-1/2"
         onClick={() => setShow((s) => !s)}
         aria-label={show ? "Hide value" : "Show value"}
-        tabIndex={-1}
       >
         {show ? <EyeOff /> : <Eye />}
       </Button>
