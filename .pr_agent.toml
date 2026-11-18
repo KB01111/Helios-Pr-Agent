@@ -4,6 +4,7 @@ model = "openrouter/thinkingmachines/inkling-2-small:free"
 fallback_models = ["openrouter/free"]
 # Inkling 2 Small advertises ~1M context / 131k output.
 # PR-Agent doesn't know this new model yet, so set explicit budget.
+max_model_tokens = 200000
 custom_model_max_tokens = 200000
 # Keep reasoning cheap/fast on free tier. Options: none, low, medium, high
 reasoning_effort = "low"

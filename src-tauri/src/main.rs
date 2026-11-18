@@ -1,13 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 // PR Agent Control — Tauri v2 backend
-// Reads/writes .pr_agent.toml + workflow file next to the app root,
-// and optionally shells out to a local `pr-agent` CLI if installed.
+// Manages app configuration and repository workflows, and runs local PR-Agent
+// through the selected Python interpreter.
+
+mod local_runtime;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use tauri::Manager;
 
 fn app_root_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -134,7 +138,8 @@ fn add_venv_to_path(cmd: &mut Command) {
 fn ensure_pr_agent_venv() -> Result<PathBuf, String> {
     let venv = pr_agent_venv_dir();
     let python = venv_python(&venv);
-    if python.is_file() {
+    let rebuild = python.is_file();
+    if rebuild && local_runtime::ensure_pip(&python).is_ok() {
         return Ok(python);
     }
     if let Some(parent) = venv.parent() {
@@ -142,8 +147,14 @@ fn ensure_pr_agent_venv() -> Result<PathBuf, String> {
             .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
     }
     let base = std::env::var("PR_AGENT_BASE_PYTHON").unwrap_or_else(|_| "python".to_string());
-    let out = Command::new(&base)
-        .args(["-m", "venv"])
+    let mut create = Command::new(&base);
+    create.args(["-m", "venv"]);
+    // If ensurepip cannot repair an existing interpreter, recreate only the
+    // incomplete managed environment. Healthy environments returned above.
+    if rebuild {
+        create.arg("--clear");
+    }
+    let out = create
         .arg(&venv)
         .output()
         .map_err(|e| format!("failed to run {} -m venv: {}", base, e))?;
@@ -160,19 +171,16 @@ fn ensure_pr_agent_venv() -> Result<PathBuf, String> {
             python.display()
         ));
     }
+    local_runtime::ensure_pip(&python)?;
     Ok(python)
 }
 
-fn config_path_for_write() -> PathBuf {
-    if let Some(p) = find_file(".pr_agent.toml") {
-        return p;
-    }
-    // default: app root (parent of src-tauri) or cwd
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .map(|p| p.join(".pr_agent.toml"))
-        .unwrap_or_else(|| PathBuf::from(".pr_agent.toml"))
+static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn config_path_for_write() -> Result<PathBuf, String> {
+    let path = CONFIG_PATH.get().ok_or("app configuration is not initialized")?;
+    local_runtime::prepare_config(path)?;
+    Ok(path.clone())
 }
 
 fn toml_escape(value: &str) -> String {
@@ -212,7 +220,7 @@ async fn get_config() -> Result<serde_json::Value, String> {
 }
 
 fn get_config_blocking() -> Result<serde_json::Value, String> {
-    let path = find_file(".pr_agent.toml").ok_or("No .pr_agent.toml found next to app")?;
+    let path = config_path_for_write()?;
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
 
     // fallback_models = ["a", "b"]
@@ -311,7 +319,7 @@ auto_improve = {ai}
         ai = b("auto_improve", false),
     );
 
-    let path = config_path_for_write();
+    let path = config_path_for_write()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -337,17 +345,19 @@ fn get_workflow_blocking() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-fn build_cli_command(pr_url: String, command: String) -> String {
-    let cmd = command.trim().trim_start_matches('/').to_string();
-    match find_file(".pr_agent.toml") {
-        Some(path) => format!(
-            "pr-agent --pr_url {} --extra_config_url \"{}\" {}",
-            pr_url.trim(),
-            path.display(),
-            cmd
-        ),
-        None => format!("pr-agent --pr_url {} {}", pr_url.trim(), cmd),
-    }
+fn build_cli_command(pr_url: String, command: String) -> Result<String, String> {
+    let path = config_path_for_write()?;
+    let mut args = vec![
+        pr_agent_python().to_string_lossy().into_owned(),
+        "-m".into(),
+        "pr_agent.cli".into(),
+        "--pr_url".into(),
+        pr_url.trim().into(),
+        "--extra_config_url".into(),
+        path.to_string_lossy().into_owned(),
+    ];
+    args.extend(split_cli_args(command.trim().trim_start_matches('/')));
+    Ok(local_runtime::shell_command(&args, cfg!(windows)))
 }
 
 /// Split a command line like `ask "what changed?"` into separate arguments
@@ -455,7 +465,7 @@ fn run_local_review_blocking(
     let cmd = command.trim().trim_start_matches('/').to_string();
     let cmd_args = split_cli_args(&cmd);
     let url = pr_url.trim();
-    let config_path = find_file(".pr_agent.toml");
+    let config_path = config_path_for_write()?;
     let python_label = pr_agent_python().display().to_string();
 
     let build = |program: &str, module: Option<&str>| {
@@ -467,9 +477,7 @@ fn run_local_review_blocking(
         c.args(["--pr_url", url]);
         // The target repo's default branch may not contain a .pr_agent.toml.
         // Pass the app's config explicitly so the selected model/limits apply.
-        if let Some(path) = &config_path {
-            c.arg("--extra_config_url").arg(path);
-        }
+        c.arg("--extra_config_url").arg(&config_path);
         c.args(&cmd_args)
             .env("OPENROUTER__KEY", &openrouter_key)
             // Without this, PR-Agent can print a model/provider error and still
@@ -2125,6 +2133,19 @@ fn backend_approve_run_blocking(
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            // Installed apps use a writable per-user copy of the embedded default.
+            let path = if cfg!(debug_assertions) {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.pr_agent.toml")
+            } else {
+                app.path().app_config_dir()?.join(".pr_agent.toml")
+            };
+            local_runtime::prepare_config(&path).map_err(std::io::Error::other)?;
+            CONFIG_PATH
+                .set(path)
+                .map_err(|_| std::io::Error::other("configuration already initialized"))?;
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -2159,4 +2180,37 @@ pub fn run() {
 
 fn main() {
     run();
+}
+
+#[cfg(all(test, unix))]
+mod runtime_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn rebuilds_unusable_managed_interpreter_and_keeps_healthy_venv() {
+        let dir = std::env::temp_dir().join(format!("pr-agent-rebuild-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let python = venv_python(&dir);
+        std::fs::write(&python, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let previous_venv = std::env::var_os("PR_AGENT_VENV");
+        let previous_base = std::env::var_os("PR_AGENT_BASE_PYTHON");
+        std::env::set_var("PR_AGENT_VENV", &dir);
+        std::env::set_var("PR_AGENT_BASE_PYTHON", "python3");
+        let repaired = ensure_pr_agent_venv();
+        let marker = dir.join("keep.txt");
+        std::fs::write(&marker, "healthy state").unwrap();
+        let healthy = ensure_pr_agent_venv();
+        for (key, old) in [("PR_AGENT_VENV", previous_venv), ("PR_AGENT_BASE_PYTHON", previous_base)] {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(repaired.unwrap(), python);
+        assert_eq!(healthy.unwrap(), python);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "healthy state");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

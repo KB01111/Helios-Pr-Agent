@@ -52,9 +52,20 @@ Python 3.12+ for local CLI reviews (or set `PR_AGENT_BASE_PYTHON` to a 3.12+ int
   `PR_AGENT_BASE_PYTHON`).
 - **OpenRouter key** in the Review card (session only).
 
-The app passes its local `.pr_agent.toml` as `--extra_config_url`, so the model selected
-in the app is used even when the target repo has no `.pr_agent.toml` of its own. For
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:757d17abfdee93ddec5ec42e030e15e212d2a80eb4f16492d75588171517d34d -->
+
+Installed builds initialize `.pr_agent.toml` in the per-user application configuration
+directory (`%APPDATA%\com.pragent.control` on Windows) from an embedded default.
+Development builds use the repository configuration. Loading, saving, and local reviews
+use this same file, passed as `--extra_config_url` even when the target repository has
+no configuration. Legacy `custom_model_max_tokens` settings are migrated to
+`max_model_tokens` before execution. Copy CLI generates a command for PowerShell on
+Windows and a POSIX shell elsewhere, using the selected Python interpreter. For
 private repos, the GitHub token needs `repo` scope.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Use it
 
