@@ -375,3 +375,28 @@ def test_recent_list_reads_only_the_newest_records(env, monkeypatch):
     assert store.eval_list(5) == []
     store.eval_reindex()
     assert len(store.eval_list(5)) == 5
+
+
+def test_orphan_cleanup_cannot_delete_a_marker_rewritten_after_it_was_aged(env, monkeypatch):
+    eid = store.eval_id("o/r", 51, SHA)
+    store.rset(f"evalopen:{eid}", repr(__import__("time").time() - 3600))  # old orphan
+    real = store.rdelete_if_equal
+
+    def racing(key, token):
+        # a registration lands between cleanup's age check and its delete
+        store.eval_register("o/r", 51, SHA, {"state": "deferred", "facts": TINY})
+        return real(key, token)
+
+    monkeypatch.setattr(store, "rdelete_if_equal", racing)
+    store.eval_list_open()
+    monkeypatch.setattr(store, "rdelete_if_equal", real)
+    assert [r["id"] for r in store.eval_list_open()] == [eid]
+
+
+def test_deleting_an_evaluation_also_removes_its_recent_index_entry(env):
+    _c, rec = store.eval_register("o/r", 61, SHA, {"state": "dispatched"})
+    assert len(store.rkeys("evalrecent:*")) == 1
+    store.eval_delete(rec["id"])
+    assert store.rkeys("evalrecent:*") == [] and store.eval_list(5) == []
+    _c, again = store.eval_register("o/r", 61, SHA, {"state": "dispatched"})
+    assert [r["id"] for r in store.eval_list(5)] == [again["id"]]  # re-registered: exactly one entry

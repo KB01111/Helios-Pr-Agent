@@ -591,11 +591,19 @@ def _sync_open_marker(rec: dict, ex: int | None = None) -> None:
 ORPHAN_MARKER_GRACE_S = 60
 
 
-def _marker_age_s(eid: str) -> float:
+def _drop_orphan_marker(eid: str) -> None:
+    """Delete an orphan marker with compare-and-delete on the value we aged: if a
+    registration rewrote the marker after we read it, the value differs and it survives."""
+    key = f"evalopen:{eid}"
+    raw = rget(key)
+    if raw is None:
+        return
     try:
-        return time.time() - float(rget(f"evalopen:{eid}") or 0)
-    except (TypeError, ValueError):
-        return float("inf")
+        age = time.time() - float(raw)
+    except ValueError:
+        age = float("inf")
+    if age > ORPHAN_MARKER_GRACE_S:
+        rdelete_if_equal(key, raw)
 
 
 def _recent_key(rec: dict) -> str:
@@ -687,8 +695,11 @@ def eval_update(eid: str, patch: dict, ex: int | None = None) -> dict | None:
 
 
 def eval_delete(eid: str) -> None:
+    rec = eval_get(eid)
     rdelete(_eval_key(eid))
     rdelete(f"evalopen:{eid}")
+    if rec is not None:
+        rdelete(_recent_key(rec))  # keep the time index free of dead entries
 
 
 @contextlib.contextmanager
@@ -741,8 +752,8 @@ def eval_list_open(states: tuple[str, ...] | None = None) -> list[dict]:
                 records.append(rec)
         elif isinstance(rec, dict):
             rdelete(f"evalopen:{eid}")  # settled: terminal states never reopen
-        elif _marker_age_s(eid) > ORPHAN_MARKER_GRACE_S:
-            rdelete(f"evalopen:{eid}")  # orphan from a crash (a fresh one may be mid-registration)
+        else:
+            _drop_orphan_marker(eid)  # orphan from a crash (a fresh one may be mid-registration)
     records.sort(key=lambda r: str(r.get("created_at", "")))
     return records
 
@@ -750,7 +761,7 @@ def eval_list_open(states: tuple[str, ...] | None = None) -> list[dict]:
 def eval_list(limit: int = 100) -> list[dict]:
     # Newest first from the time-ordered key index, then read only those `limit` records.
     keys = sorted(rkeys("evalrecent:*"), reverse=True)[: max(1, limit)]
-    ids = [k.rsplit(":", 1)[-1] for k in keys]
+    ids = list(dict.fromkeys(k.rsplit(":", 1)[-1] for k in keys))  # no duplicate ids
     records = [r for r in rget_json_many([_eval_key(i) for i in ids]) if isinstance(r, dict)]
     records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
     return records
