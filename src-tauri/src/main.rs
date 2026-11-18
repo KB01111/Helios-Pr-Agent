@@ -348,7 +348,7 @@ fn get_workflow_blocking() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-fn build_cli_command(pr_url: String, command: String) -> Result<String, String> {
+fn build_cli_command(pr_url: String, command: String, question: Option<String>) -> Result<String, String> {
     let path = config_path_for_write()?;
     let mut args = vec![
         pr_agent_python().to_string_lossy().into_owned(),
@@ -359,8 +359,19 @@ fn build_cli_command(pr_url: String, command: String) -> Result<String, String> 
         "--extra_config_url".into(),
         path.to_string_lossy().into_owned(),
     ];
-    args.extend(split_cli_args(command.trim().trim_start_matches('/')));
+    args.extend(command_args(&command, question));
     Ok(local_runtime::shell_command(&args, cfg!(windows)))
+}
+
+/// Arguments for the PR-Agent command. A free-text `/ask` question is passed as a
+/// structured value so quotes and spacing survive unchanged (the splitter below
+/// has no escape syntax).
+fn command_args(command: &str, question: Option<String>) -> Vec<String> {
+    let cmd = command.trim().trim_start_matches('/');
+    match question {
+        Some(q) if !q.trim().is_empty() && cmd == "ask" => vec!["ask".to_string(), q.trim().to_string()],
+        _ => split_cli_args(cmd),
+    }
 }
 
 /// Split a command line like `ask "what changed?"` into separate arguments
@@ -451,9 +462,10 @@ async fn run_local_review(
     command: String,
     openrouter_key: String,
     github_token: String,
+    question: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        run_local_review_blocking(pr_url, command, openrouter_key, github_token)
+        run_local_review_blocking(pr_url, command, openrouter_key, github_token, question)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -464,9 +476,9 @@ fn run_local_review_blocking(
     command: String,
     openrouter_key: String,
     github_token: String,
+    question: Option<String>,
 ) -> Result<String, String> {
-    let cmd = command.trim().trim_start_matches('/').to_string();
-    let cmd_args = split_cli_args(&cmd);
+    let cmd_args = command_args(&command, question);
     let url = pr_url.trim();
     let config_path = config_path_for_write()?;
     let python_label = pr_agent_python().display().to_string();

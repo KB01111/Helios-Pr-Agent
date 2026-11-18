@@ -79,14 +79,26 @@ export function AgentsPage({ active }: { active: boolean }) {
 
   const refresh = async (preferred?: string) => {
     setMsg("Loading agents…");
-    const list = await refreshAgents();
-    if (list === null) {
-      setMsg(`Refresh failed (is backend up at ${backendUrl()}?)`);
-      return;
+    setBusy(true); // serialized with selection and save
+    try {
+      const list = await refreshAgents();
+      if (list === null) {
+        setMsg(`Refresh failed (is backend up at ${backendUrl()}?)`);
+        return;
+      }
+      setMsg(`Loaded ${list.length} agent(s).`);
+      const keep = preferred !== undefined ? preferred : selectedId;
+      if (keep && list.some((a) => a.id === keep)) {
+        setSelectedId(keep);
+      } else if (selectedId !== NEW || preferred !== undefined) {
+        // The open agent no longer exists: clear the form together with the selection.
+        selectSeq.current++;
+        setSelectedId(NEW);
+        fillForm({});
+      }
+    } finally {
+      setBusy(false);
     }
-    setMsg(`Loaded ${list.length} agent(s).`);
-    const keep = preferred !== undefined ? preferred : selectedId;
-    setSelectedId(keep && list.some((a) => a.id === keep) ? keep : NEW);
   };
 
   // `agents` can also change from other flows (repo setup syncs an agent); count shows live.
@@ -217,7 +229,7 @@ export function AgentsPage({ active }: { active: boolean }) {
             <AsyncButton onClick={save} disabled={busy}>
               <Save /> {selectedId === NEW ? "Create agent" : "Save agent"}
             </AsyncButton>
-            <AsyncButton variant="outline" onClick={() => refresh()}>
+            <AsyncButton variant="outline" onClick={() => refresh()} disabled={busy}>
               <RefreshCw /> Refresh
             </AsyncButton>
             <Button

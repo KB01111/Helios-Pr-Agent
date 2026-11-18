@@ -15,8 +15,8 @@ function fetchOptions(extra?: RequestInit): RequestInit {
   return opts;
 }
 
-export async function apiGet<T = any>(path: string): Promise<T> {
-  const base = backendUrl();
+export async function apiGet<T = any>(path: string, baseOverride?: string): Promise<T> {
+  const base = (baseOverride || backendUrl()).replace(/\/+$/, "");
   const token = apiToken();
   let raw: unknown;
   try {

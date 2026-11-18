@@ -34,20 +34,13 @@ export function ReviewPage({ active }: { active: boolean }) {
   const [out, setOut] = React.useState("Ready.");
 
   const url = prUrl.trim();
-  const reviewCmd = () => {
-    if (cmd !== "ask") return cmd;
-    const q = askQ.trim().replace(/\s+/g, " ") || "What does this PR change?";
-    // The Rust splitter has no escape syntax: quote with a character the question
-    // does not contain, and downgrade embedded double quotes if it contains both.
-    if (!q.includes('"')) return `ask "${q}"`;
-    if (!q.includes("'")) return `ask '${q}'`;
-    return `ask "${q.replace(/"/g, "'")}"`;
-  };
+  // The question travels as its own argument so quotes and spacing are preserved.
+  const question = () => (cmd === "ask" ? askQ.trim() || "What does this PR change?" : null);
 
   const copyCli = async () => {
     if (!url) return toastErr("Review", "Enter a PR URL first.");
     try {
-      const s = await tauriInvoke<string>("build_cli_command", { prUrl: url, command: reviewCmd() });
+      const s = await tauriInvoke<string>("build_cli_command", { prUrl: url, command: cmd, question: question() });
       await navigator.clipboard.writeText(s);
       setOut("Copied: " + s);
       toastOk("Copied", s.slice(0, 120));
@@ -68,7 +61,8 @@ export function ReviewPage({ active }: { active: boolean }) {
     try {
       const r = await tauriInvoke<string>("run_local_review", {
         prUrl: url,
-        command: reviewCmd(),
+        command: cmd,
+        question: question(),
         openrouterKey: openrouter,
         githubToken: github,
       });

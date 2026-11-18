@@ -467,28 +467,6 @@ export async function configure(opts: ConfigureOptions) {
     toastErr("GitHub setup", opts.retryOnly ? "No failed repositories to retry." : "Select at least one repository.");
     return;
   }
-  let secret = opts.secret.trim();
-  if (useWebhook && !secret) {
-    // The backend verifies every webhook against ONE global secret. Generating a new
-    // one would break deliveries from repositories that were configured earlier.
-    let backendHasSecret = false;
-    try {
-      const st = await apiGet("/config/status");
-      backendHasSecret = !!(st && st.github && st.github.webhook_secret_set);
-    } catch {
-      /* backend unreachable: nothing to protect */
-    }
-    if (backendHasSecret) {
-      toastErr(
-        "GitHub setup",
-        "The backend already has a webhook secret. Enter that secret in the field — or click Generate to replace it, then re-run setup for every repo.",
-      );
-      return;
-    }
-    secret = ghRandomSecret();
-    opts.onSecretGenerated?.(secret);
-    ghOut("[config] generated a 32-byte webhook secret (hex).");
-  }
   const orKey = opts.orKey;
   if (useActions && !orKey) {
     toastErr("GitHub setup", "Add the OpenRouter API key in the OpenRouter row above first.");
@@ -501,36 +479,71 @@ export async function configure(opts: ConfigureOptions) {
 
   const successful: string[] = [];
   const batchFailed: string[] = [];
+  // Claim the batch before the first await so a reset during any later step cancels it.
   useGh.setState({ batchRunning: true });
   const myBatch = ++batchGen;
   const cancelled = () => myBatch !== batchGen;
+  const out = (line: string) => {
+    if (!cancelled()) ghOut(line);
+  };
   try {
-    ghOut(
+    let secret = opts.secret.trim();
+    if (useWebhook && !secret) {
+      // The backend verifies every webhook against ONE global secret. Generating a new
+      // one would break deliveries from repositories that were configured earlier, so
+      // only generate when the backend that receives the webhooks reports none.
+      let backendHasSecret: boolean | null = null; // null = unknown
+      try {
+        const st = await apiGet("/config/status", base);
+        backendHasSecret = !!(st && st.github && st.github.webhook_secret_set);
+      } catch {
+        backendHasSecret = null;
+      }
+      if (cancelled()) return;
+      if (backendHasSecret !== false) {
+        toastErr(
+          "GitHub setup",
+          backendHasSecret
+            ? "The backend already has a webhook secret. Enter that secret in the field — or click Generate to replace it, then re-run setup for every repo."
+            : `Could not check whether ${base} already has a webhook secret. Enter the secret in the field (or Generate one), then retry.`,
+        );
+        return;
+      }
+      secret = ghRandomSecret();
+      opts.onSecretGenerated?.(secret);
+      out("[config] generated a 32-byte webhook secret (hex).");
+    }
+    out(
       `=== Setup started: ${repos.length} repo(s) · mode=${mode}` +
         (useActions ? ` · provider=${provider}` : "") +
         (useWebhook ? ` · webhook base=${base}` : "") +
         " ===",
     );
     if (mode === "both") {
-      ghOut("[warn] 'both' posts a review from the GitHub Action AND from the backend agent on every PR.");
+      out("[warn] 'both' posts a review from the GitHub Action AND from the backend agent on every PR.");
     }
     if (useWebhook && opts.saveSecret) {
-      if (!(await saveEnv("GITHUB_WEBHOOK_SECRET", secret))) {
+      const saved = await saveEnv("GITHUB_WEBHOOK_SECRET", secret);
+      if (cancelled()) return;
+      if (!saved) {
         // GitHub would sign deliveries with a secret the backend does not know.
-        ghOut("[setup] aborted: the webhook secret could not be saved to backend/.env, so no repository was changed.");
+        out("[setup] aborted: the webhook secret could not be saved to backend/.env, so no repository was changed.");
         return;
       }
-      ghOut("[env] restart the backend to pick up .env changes.");
+      out("[env] restart the backend to pick up .env changes.");
     }
-    if (opts.saveToken) await saveEnv("GITHUB_TOKEN", t);
+    if (opts.saveToken) {
+      await saveEnv("GITHUB_TOKEN", t);
+      if (cancelled()) return;
+    }
 
     for (const repo of repos) {
       if (cancelled()) {
-        ghOut("[setup] cancelled — session secrets were cleared; remaining repos not touched.");
+        out("[setup] cancelled — session secrets were cleared; remaining repos not touched.");
         break;
       }
       useGh.setState({ configuring: [...gh().configuring, repo] });
-      ghOut(`[${repo}] starting…`);
+      out(`[${repo}] starting…`);
       try {
         const raw = await tauriInvoke("github_setup_repo", {
           token: t,
@@ -541,30 +554,33 @@ export async function configure(opts: ConfigureOptions) {
           workflowProvider: provider,
           reviewMode: mode,
         });
+        if (cancelled()) break; // secrets were cleared mid-request: leave shared state alone
         const r = jsonObj(raw);
         if (!r) throw new Error("unexpected setup response");
-        ghOut(`[${repo}] webhook: ${r.webhook || "unknown"}${errSuffix(r.errors && r.errors.webhook)}`);
-        ghOut(`[${repo}] secrets: ${r.secrets || "unknown"}${errSuffix(r.errors && r.errors.secrets)}`);
-        ghOut(
+        out(`[${repo}] webhook: ${r.webhook || "unknown"}${errSuffix(r.errors && r.errors.webhook)}`);
+        out(`[${repo}] secrets: ${r.secrets || "unknown"}${errSuffix(r.errors && r.errors.secrets)}`);
+        out(
           `[${repo}] workflow: ${r.workflow || "unknown"}${errSuffix(r.errors && r.errors.workflow)}` +
             (r.workflow_path ? ` (${r.workflow_path})` : ""),
         );
-        if (r.webhook_url) ghOut(`[${repo}] webhook target: ${r.webhook_url}`);
+        if (r.webhook_url) out(`[${repo}] webhook target: ${r.webhook_url}`);
         if (r.ok) {
           useGh.setState({ failed: gh().failed.filter((n) => n !== repo) });
           successful.push(repo);
-          ghOut(`[${repo}] done.`);
+          out(`[${repo}] done.`);
         } else {
           useGh.setState({ failed: Array.from(new Set([...gh().failed, repo])) });
           batchFailed.push(repo);
-          ghOut(`[${repo}] failed — see per-step statuses above.`);
+          out(`[${repo}] failed — see per-step statuses above.`);
         }
       } catch (e) {
+        if (cancelled()) break;
         useGh.setState({ failed: Array.from(new Set([...gh().failed, repo])) });
         batchFailed.push(repo);
-        ghOut(`[${repo}] error: ${errText(e, 300)}`);
+        out(`[${repo}] error: ${errText(e, 300)}`);
       } finally {
-        useGh.setState({ configuring: gh().configuring.filter((n) => n !== repo) });
+        // Only touch shared state if this batch is still the current one.
+        if (!cancelled()) useGh.setState({ configuring: gh().configuring.filter((n) => n !== repo) });
       }
       // Refresh this repo's badges once; a status failure must not abort the batch.
       await loadStatus(repo, true);
@@ -572,12 +588,12 @@ export async function configure(opts: ConfigureOptions) {
       // repo can end up with two reviewers. Say so instead of staying silent.
       const stale = staleReviewPath(mode, gh().status[repo]);
       if (stale) {
-        ghOut(`[${repo}] warning: ${stale}`);
+        out(`[${repo}] warning: ${stale}`);
         toastErr("Possible duplicate reviews", `${repo}: ${stale}`);
       }
     }
 
-    ghOut(`=== Done: ${successful.length} succeeded, ${batchFailed.length} failed ===`);
+    out(`=== Done: ${successful.length} succeeded, ${batchFailed.length} failed ===`);
     if (successful.length) toastOk("GitHub setup", `${successful.length} repo(s) configured.`);
     if (batchFailed.length) toastErr("GitHub setup", `${batchFailed.length} repo(s) failed — use Retry failed.`);
     // The backend agent only matters when the backend reviews PRs; in Actions
@@ -586,7 +602,7 @@ export async function configure(opts: ConfigureOptions) {
       await upsertAgent(successful, opts.agentName);
     }
   } catch (e) {
-    ghOut("[fatal] " + errText(e, 300));
+    out("[fatal] " + errText(e, 300));
     toastErr("GitHub setup", errText(e));
   } finally {
     // A cancelled batch must not clear the state of a newer one.
