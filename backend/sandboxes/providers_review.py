@@ -28,6 +28,10 @@ _NOISY_SUFFIXES = (
 )
 
 
+_TRUNC_MARK = "\n... [file truncated]\n"
+_MAX_COMMENT_PAGES = 20
+
+
 def diff_budget() -> int:
     try:
         return max(2000, int(os.environ.get("REVIEW_DIFF_MAX_CHARS", DEFAULT_DIFF_BUDGET)))
@@ -59,14 +63,21 @@ def prepare_diff(diff: str, budget: int | None = None) -> tuple[str, list[str]]:
     budget = budget or diff_budget()
     notes: list[str] = []
     files = _split_files(diff)
-    if not files or len(diff) <= budget:
+    if not files:
         return diff, notes
+    # Always drop generated/binary files, even from small diffs. If that would
+    # leave nothing (a lockfile-only PR) review the original instead.
     kept: list[tuple[str, str]] = []
     for path, chunk in files:
         if path.endswith(_NOISY_SUFFIXES) or "Binary files" in chunk:
             notes.append(f"omitted generated/binary file {path}")
         else:
             kept.append((path, chunk))
+    if not kept:
+        return diff[:budget], [f"diff contains only generated/binary files; truncated to {budget} chars"]
+    files = list(kept)  # original order; ``kept`` is re-sorted below
+    if sum(len(chunk) for _, chunk in kept) <= budget:
+        return "".join(chunk for _, chunk in kept), notes
     # Smallest files first: each gets its full text if it fits, and the
     # remaining budget is shared fairly between the larger ones.
     kept.sort(key=lambda item: len(item[1]))
@@ -78,7 +89,9 @@ def prepare_diff(diff: str, budget: int | None = None) -> tuple[str, list[str]]:
             out[path] = chunk
             remaining -= len(chunk)
         else:
-            out[path] = chunk[:share].rstrip() + "\n... [file truncated]\n"
+            # The marker counts against this file's share so the total stays in budget.
+            cut = max(0, share - len(_TRUNC_MARK))
+            out[path] = chunk[:cut].rstrip() + _TRUNC_MARK
             remaining -= share
             notes.append(f"truncated {path} ({len(chunk)} -> {share} chars)")
     ordered = [out[path] for path, _ in files if path in out]
@@ -189,6 +202,9 @@ class ReviewOnlyProvider:
 
         # 3. Post comment (update this agent's previous review when there is one)
         posted = False
+        if await _head_moved(repo, pr_number, pr_context.get("sha"), github_token):
+            logs.append("review_only: PR head moved on while reviewing; skipping the stale comment.")
+            return _result(logs, truncated, "completed_no_comment", False, agent_name)
         try:
             body = f"{REVIEW_MARKER}\n## \U0001f916 {agent_name} (review_only, 0 CPU-sec)\n\n{review}"
             headers = {
@@ -220,16 +236,42 @@ class ReviewOnlyProvider:
 
 async def _find_previous_review(client: Any, comments_url: str, headers: dict) -> int | None:
     """Id of the newest comment carrying our marker, or None (best effort)."""
+    found: int | None = None
     try:
-        resp = await client.get(comments_url, headers=headers, params={"per_page": 100})
-        if resp.status_code != 200:
-            return None
-        for comment in reversed(resp.json() or []):
-            if isinstance(comment, dict) and REVIEW_MARKER in str(comment.get("body", "")):
-                return int(comment["id"])
+        # Comments come oldest first; walk every page (bounded) so a busy PR
+        # whose previous review is past the first 100 comments is still found.
+        for page in range(1, _MAX_COMMENT_PAGES + 1):
+            resp = await client.get(comments_url, headers=headers, params={"per_page": 100, "page": page})
+            if resp.status_code != 200:
+                break
+            batch = resp.json() or []
+            for comment in batch:
+                if isinstance(comment, dict) and REVIEW_MARKER in str(comment.get("body", "")):
+                    found = int(comment["id"])
+            if len(batch) < 100:
+                break
     except Exception:
-        return None
-    return None
+        pass
+    return found
+
+
+async def _head_moved(repo: str, pr_number: int, sha: Any, token: str) -> bool:
+    """True when the PR head is no longer ``sha``: a newer push has its own
+    review, so this older one must not overwrite it. Best effort."""
+    if not sha:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            )
+        if resp.status_code != 200:
+            return False
+        head = (resp.json().get("head") or {}).get("sha")
+        return bool(head) and str(head) != str(sha)
+    except Exception:
+        return False
 
 
 def _result(logs: list[str], diff: str, status: str, posted: bool, agent: str) -> dict[str, Any]:
