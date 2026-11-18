@@ -253,7 +253,7 @@ async function loadConfig() {
     if (known.includes(cfg.model)) { $("model").value = cfg.model; $("custom-wrap").classList.add("hidden"); }
     else { $("model").value = "custom"; $("custom-wrap").classList.remove("hidden"); $("custom-model").value = cfg.model; }
     $("fallbacks").value = (cfg.fallback_models || []).join(", ");
-    $("max-tokens").value = cfg.custom_model_max_tokens || "200000";
+    $("max-tokens").value = cfg.max_model_tokens || cfg.custom_model_max_tokens || "200000";
     $("effort").value = cfg.reasoning_effort || "low";
     $("auto-describe").checked = !!cfg.auto_describe;
     $("auto-review").checked = !!cfg.auto_review;
@@ -265,6 +265,7 @@ async function saveConfig() {
   const payload = {
     model: selectedModel(),
     fallback_models: $("fallbacks").value.split(",").map((s) => s.trim()).filter(Boolean),
+    max_model_tokens: $("max-tokens").value.trim() || "200000",
     custom_model_max_tokens: $("max-tokens").value.trim() || "200000",
     reasoning_effort: $("effort").value,
     auto_describe: $("auto-describe").checked,
@@ -1477,9 +1478,20 @@ function wire() {
     if (!prUrl()) { toastErr("Review", "Enter a PR URL first."); return; }
     const key = $("or-key").value.trim() || Secrets.openrouter;
     if (!key) { toastErr("Review", "Enter OPENROUTER_API_KEY first (session only)."); return; }
+    const ghToken = ($("gh-key") ? $("gh-key").value.trim() : "") || Secrets.github;
+    if (!ghToken) {
+      $("out").textContent = "GitHub token required. Connect GitHub in Settings → GitHub, then retry.";
+      toastErr("Review", "Connect GitHub first (Settings → GitHub).");
+      return;
+    }
     $("out").textContent = "Running local review…";
     try {
-      const r = await tauriInvoke("run_local_review", { prUrl: prUrl(), command: reviewCmd(), openrouterKey: key });
+      const r = await tauriInvoke("run_local_review", {
+        prUrl: prUrl(),
+        command: reviewCmd(),
+        openrouterKey: key,
+        githubToken: ghToken,
+      });
       $("out").textContent = r || "(empty output)";
       toastOk("Review finished", String(r || "").slice(0, 140));
     } catch (e) { $("out").textContent = "Run failed: " + e; toastErr("Run failed", String(e).slice(0, 220)); }
@@ -1602,7 +1614,7 @@ function wire() {
     paOut(parts.join("\n"));
   });
   on("btn-pa-install", async () => {
-    paOut("Installing pr-agent[github] via pip — takes a few minutes…");
+    paOut("Creating a dedicated venv and installing pr-agent[github] — takes a few minutes…");
     try { paOut(await tauriInvoke("install_pr_agent")); toastOk("Install finished", "pr-agent CLI installed."); }
     catch (e) { paOut("Install failed: " + e); toastErr("Install failed", String(e).slice(0, 200)); }
   });

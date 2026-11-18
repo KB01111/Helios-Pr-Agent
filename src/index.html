@@ -110,6 +110,7 @@
           <div class="field hidden" id="ask-wrap"><span class="lbl">Question (for /ask)</span>
             <input id="ask-q" placeholder="What does this PR change?" autocomplete="off" />
           </div>
+          <p class="hint">Needs GitHub sign-in (Settings) and the PR-Agent CLI (<code>Providers → Install CLI</code>). The app's <code>.pr_agent.toml</code> is applied to the target PR automatically.</p>
           <div class="row wrap">
             <button id="btn-cli" class="btn btn-outline" type="button">Copy CLI command</button>
             <button id="btn-run" class="btn btn-accent" type="button">Run locally</button>
@@ -298,7 +299,7 @@
       <section class="tabpane" id="tab-providers" aria-label="Providers">
         <div class="card">
           <div class="card-head"><h2>Provider: PR-Agent</h2><span class="badge">always online via Actions</span></div>
-          <p class="hint">Full review quality. The Action workflow below runs on every PR event — no PC needed.</p>
+          <p class="hint">Full review quality. The Action workflow below runs on every PR event — no PC needed. The local CLI installs into a dedicated venv so backend Python packages are not touched.</p>
           <div class="row wrap">
             <button id="btn-pa-check" class="btn btn-outline" type="button">Check pr-agent CLI</button>
             <button id="btn-pa-install" class="btn btn-ghost" type="button">Install CLI (pip)</button>

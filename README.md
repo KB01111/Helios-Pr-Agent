@@ -37,7 +37,36 @@ npx tauri dev        # dev window
 npx tauri build      # installer in src-tauri\target\release\bundle
 ```
 
-Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11).
+Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11), and
+Python 3.12+ for local CLI reviews (or set `PR_AGENT_BASE_PYTHON` to a 3.12+ interpreter).
+
+### Local CLI review (Review tab)
+
+`Run locally` shells out to PR-Agent on this PC. It needs:
+
+- **GitHub sign-in** in Settings → GitHub (device flow or PAT). The session token is
+  passed to the CLI as `GITHUB__USER_TOKEN`; it is never written to disk.
+- **PR-Agent CLI** installed once. Providers → Install CLI creates a dedicated venv at
+  `%LOCALAPPDATA%\PR Agent Control\pr-agent-venv` and installs pinned
+  `pr-agent[github]==0.50.0` there, so the backend's Python packages are not touched.
+  Override the location with `PR_AGENT_VENV` (and the base interpreter with
+  `PR_AGENT_BASE_PYTHON`).
+- **OpenRouter key** in the Review card (session only).
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:757d17abfdee93ddec5ec42e030e15e212d2a80eb4f16492d75588171517d34d -->
+
+Installed builds initialize `.pr_agent.toml` in the per-user application configuration
+directory (`%APPDATA%\com.pragent.control` on Windows) from an embedded default.
+Development builds use the repository configuration. Loading, saving, and local reviews
+use this same file, passed as `--extra_config_url` even when the target repository has
+no configuration. Legacy `custom_model_max_tokens` settings are migrated to
+`max_model_tokens` before execution. Copy CLI generates a command for PowerShell on
+Windows and a POSIX shell elsewhere, using the selected Python interpreter. For
+private repos, the GitHub token needs `repo` scope.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Use it
 
