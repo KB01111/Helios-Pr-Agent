@@ -100,16 +100,6 @@ fn venv_bin_dir(venv: &Path) -> PathBuf {
     }
 }
 
-fn pr_agent_exe() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "pr-agent.exe" } else { "pr-agent" };
-    let exe = venv_bin_dir(&pr_agent_venv_dir()).join(name);
-    if exe.is_file() {
-        Some(exe)
-    } else {
-        None
-    }
-}
-
 /// Prefer the explicit PR_AGENT_PYTHON override, then the app-managed venv,
 /// then the ambient `python`.
 fn pr_agent_python() -> PathBuf {
@@ -466,8 +456,7 @@ fn run_local_review_blocking(
     let cmd_args = split_cli_args(&cmd);
     let url = pr_url.trim();
     let config_path = find_file(".pr_agent.toml");
-    let python = pr_agent_python();
-    let python_label = python.display().to_string();
+    let python_label = pr_agent_python().display().to_string();
 
     let build = |program: &str, module: Option<&str>| {
         let mut c = Command::new(program);
@@ -507,24 +496,10 @@ fn run_local_review_blocking(
         Err(e) => Err(format!("failed to run {}: {}", python_label, e)),
     };
 
-    // Prefer the app-managed venv's Python module over its console-script shim.
-    // If no venv exists, try `pr-agent` on PATH, then the ambient Python module.
-    if python.is_file() {
-        return run_python();
-    }
-    match build("pr-agent", None).output() {
-        Ok(out) if out.status.success() => Ok(render_process_output(&out)),
-        Ok(out) => {
-            if is_missing_pr_agent(&out) {
-                run_python()
-            } else {
-                // Do not retry a real failure through a second entry point:
-                // it can duplicate side effects such as PR comments.
-                Err(process_failure("pr-agent", &out))
-            }
-        }
-        Err(_) => run_python(),
-    }
+    // Always invoke the Python module, never the console-script shim: the shim
+    // can block under the app's piped stdio. This uses the app venv when
+    // present, otherwise the ambient Python.
+    run_python()
 }
 
 #[tauri::command]
@@ -664,17 +639,8 @@ fn check_tool_blocking(name: String) -> Result<String, String> {
     }
 
     if name == "pr-agent" {
-        let direct_program = pr_agent_exe()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "pr-agent".to_string());
-        let mut direct = Command::new(&direct_program);
-        add_venv_to_path(&mut direct);
-        if let Ok(out) = direct.arg("--version").output() {
-            if out.status.success() {
-                let s = version_output(&out);
-                return Ok(if s.is_empty() { "pr-agent installed".into() } else { s });
-            }
-        }
+        // Use the Python module, not the console-script shim: the shim can
+        // block under the app's piped stdio, while `-m` returns immediately.
         let python = pr_agent_python();
         let out = Command::new(&python)
             .args(["-m", "pr_agent.cli", "--version"])
@@ -686,7 +652,7 @@ fn check_tool_blocking(name: String) -> Result<String, String> {
                     e
                 )
             })?;
-        let s = version_output(&out);
+        let s = strip_ansi(&version_output(&out));
         if out.status.success() {
             let label = if s.is_empty() {
                 "pr-agent installed".to_string()
@@ -695,11 +661,13 @@ fn check_tool_blocking(name: String) -> Result<String, String> {
             };
             return Ok(format!("{} (via {})", label, python.display()));
         }
-        return Err(format!(
-            "pr-agent not installed for {}. Open Providers → Install CLI (pip). {}",
-            python.display(),
-            s
-        ));
+        if is_missing_pr_agent(&out) {
+            return Err(missing_pr_agent_message(
+                &python.display().to_string(),
+                &s,
+            ));
+        }
+        return Err(format!("pr-agent check failed: {}", s));
     }
 
     let program = if name == "python" {
