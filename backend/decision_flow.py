@@ -292,7 +292,8 @@ def _mark_failed(eid: str, error: str) -> None:
 
 
 async def _dispatch(eid: str, mode_of: Callable[[dict[str, Any]], str | None], decision: dict[str, Any] | None) -> list[str]:
-    assert _dispatch_agents is not None, "decision_flow.register() was not called"
+    if _dispatch_agents is None:
+        raise RuntimeError("decision_flow.register() was not called")
     rec = await asyncio.to_thread(store.eval_get, eid)
     if rec is None:
         return []
@@ -417,7 +418,8 @@ async def sweep() -> dict[str, int]:
 
 
 def _auth(request: Request) -> None:
-    assert _require_auth is not None, "decision_flow.register() was not called"
+    if _require_auth is None:
+        raise RuntimeError("decision_flow.register() was not called")
     _require_auth(request)
 
 
