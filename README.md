@@ -21,9 +21,10 @@ The installers are unsigned, so Windows SmartScreen may ask for confirmation.
 
 | Path | What it is |
 |---|---|
-| `src/` | Tauri frontend (tabbed UI: Review, Agents & repo sync, Runs, Quota, Providers, Integrations, Settings) |
+| `src/` | Tauri frontend (tabbed UI: Review, Agents & repo sync, Runs, Autonomy, Quota, Providers, Integrations, Settings) |
 | `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), and the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`) |
 | `backend/` | FastAPI webhook/event brain, agent/run API, quota, and Redis-backed shared state (`REDIS_URL` on FastAPI Cloud, or Upstash REST) |
+| `cloudflare-worker/` | Free-tier edge receiver + cron for the cloud fallback (signature check, retrying forward, deferred-event sweep) |
 | `upstash-box/` | Node provisioner + Python cron script that auto-reviews open PRs on a schedule (runs on Upstash Box free tier) |
 | `.pr_agent.toml` | PR-Agent config for this repo (free OpenRouter model + `openrouter/free` fallback) |
 | `.github/workflows/pr-agent.yml` | PR-Agent GitHub Action for this repo |
@@ -185,6 +186,70 @@ local `backend/.env`.
 3. The browser opens GitHub — enter the shown code, approve, done. The token lives
    in memory/session only (or paste a classic PAT with `repo` scope instead).
 
+## Calibrated decisions, always-on daemon & edge fallback
+
+Before any sandbox is spent, every PR head commit is triaged by a small, deterministic,
+calibrated policy (`backend/sandboxes/decider.py`, mirrored in `src-tauri/src/decider.rs`;
+both are pinned to `backend/tests/decider_cases.json`). No ML packages are installed in
+the backend, so free-tier cold starts stay fast.
+
+```json
+{ "decision": "SKIP | FAST_REVIEW | SANDBOX_TEST | ESCALATE_HUMAN", "confidence": 0.91,
+  "provider": "none | review | vercel | box", "reason_code": "DOCS_ONLY | LOCKFILE_BUMP | STATIC_DIFF_OK | UI_PREVIEW_NEEDED | RUNTIME_TEST_NEEDED | LOW_CONFIDENCE_GRAY_ZONE | SAFETY_FLAGGED",
+  "policy_version": "v1", "latency_ms": 8 }
+```
+
+| Signal | Outcome |
+|---|---|
+| docs only; small trusted lockfile bump | `SKIP` (`DOCS_ONLY`, `LOCKFILE_BUMP`) |
+| small, static source diff | `FAST_REVIEW` via the zero-CPU `review` provider |
+| UI files dominate | `SANDBOX_TEST` on `vercel` (`UI_PREVIEW_NEEDED`) |
+| tests/config/larger source churn | `SANDBOX_TEST` on `box` (`RUNTIME_TEST_NEEDED`) |
+| workflows, Dockerfiles, `.env`, keys, auth/secret-ish paths, secret-like or `curl \| sh` added lines | `ESCALATE_HUMAN` (`SAFETY_FLAGGED`) — always, at every autonomy level |
+| best class below the confidence floor, truncated or oversized diff | `ESCALATE_HUMAN` (`LOW_CONFIDENCE_GRAY_ZONE`) |
+
+Guardrails: SKIP is never produced by scoring; a decision can only *reduce* spend relative
+to an agent's `runtime_mode` (a `review_only` agent never gets a sandbox); `labeled` events
+bypass the gate (a human asked on purpose). Confidence is a temperature-scaled softmax;
+`GET /decisions/stats` reports how often humans override each decision type so the
+temperature/thresholds can be re-fit (bump `POLICY_VERSION` when you do).
+
+**Strict idempotency.** Every path registers `(repo, pr_number, head_sha)` in
+`backend/store.py` (`eval_register`, NX) before acting: cloud webhook, Cloudflare worker
+replays, the desktop daemon, and the Box cron loop (`BACKEND_URL` + `/decisions/claim`).
+Only one wins per head commit; a new push is a new evaluation. (The GitHub Action
+workflow runs independently of the backend and is not covered.)
+
+**Desktop daemon (Autonomy tab).** The Rust daemon heartbeats to the backend, pulls PR
+facts the cloud deferred to it, decides locally and submits the decision. Closing the
+window keeps it running in the tray ("Stop daemon and quit" ends it); it does **not**
+start at OS login. An optional classifier sidecar on `127.0.0.1` (`POST /classify` ->
+`{"probs": {"static":…, "ui":…, "runtime":…}}`) is blended into the scoring branch only —
+it can never override a guardrail. The backend token is held in memory only.
+
+**Cloud fallback.** If the desktop's heartbeat lapses (asleep/offline/stopped), the cloud
+decides immediately; if it goes away mid-flight, `POST /decisions/sweep` decides deferred
+events after `DECIDER_DEFER_GRACE_S` (default 120 s). Autonomy levels: `observe` (shadow —
+record only, legacy behaviour), `assist` (default — acts alone on cheap confident calls,
+asks otherwise), `auto` (acts at/above the floor). Escalations appear in the app's inbox.
+
+### Cloudflare worker (free tier)
+
+`cloudflare-worker/` is an always-on edge receiver: it verifies the GitHub signature, acks
+in milliseconds, forwards to the backend with retries (optionally parking failures in KV),
+and a per-minute cron calls `/decisions/sweep` to wake the backend and run the fallback.
+
+```bash
+cd cloudflare-worker
+# set BACKEND_URL in wrangler.toml, then:
+npx wrangler secret put GITHUB_WEBHOOK_SECRET
+npx wrangler secret put BACKEND_API_TOKEN   # only if the backend sets one
+npx wrangler deploy
+```
+
+Point the repo webhook (pull requests, `application/json`, same secret) at
+`https://<worker>.workers.dev/webhooks/github`. Tests: `node --test cloudflare-worker/worker.test.js`.
+
 ## Deploy the backend (FastAPI)
 
 ```powershell
@@ -213,6 +278,7 @@ Health: `GET /health` · status: `GET /config/status` (auth when a token is set)
 | `VERCEL_TOKEN` (or `VERCEL_API_TOKEN`), `VERCEL_TEAM_ID` | ephemeral sandbox runs | — |
 | `BACKEND_API_TOKEN` | Bearer auth on agent/run/quota/config-status + `/config/test` endpoints | empty = open (local dev only) |
 | `ALLOWED_ORIGINS` | CORS allowlist, comma-separated. Desktop dev: `tauri://localhost,http://tauri.localhost,http://localhost:1420`. Browsers need their origin listed. Most app calls go through the Rust proxy, but the live SSE stream opens directly from the webview and needs its origin here | `[]` (no cross-origin; set `*` only for local dev) |
+| `DECIDER_ENABLED` / `DECIDER_DEFER_GRACE_S` | calibrated decision layer on/off; seconds to wait for the desktop daemon before the cloud decides | `1` / `120` |
 | `QUOTA_LIMIT` | vCPU-seconds per provider per month | `18000` |
 | `PORT` / `LOG_LEVEL` | server | `8000` / `INFO` |
 

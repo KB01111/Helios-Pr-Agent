@@ -1,0 +1,21 @@
+name = "helios-pr-agent-edge"
+main = "worker.js"
+compatibility_date = "2025-11-01"
+
+# Free tier: 100k requests/day. The per-minute cron below uses ~1.4k of them.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+# Public https:// base URL of the FastAPI backend (no trailing slash).
+BACKEND_URL = "https://your-backend.example.com"
+
+# Optional: park deliveries the backend could not accept (outage / cold start) and
+# replay them from the cron. Create with `wrangler kv namespace create PENDING`.
+# [[kv_namespaces]]
+# binding = "PENDING"
+# id = "<kv-namespace-id>"
+
+# Secrets (never put these in this file):
+#   wrangler secret put GITHUB_WEBHOOK_SECRET   # same value as the GitHub webhook secret
+#   wrangler secret put BACKEND_API_TOKEN       # only if the backend sets BACKEND_API_TOKEN

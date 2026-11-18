@@ -8,6 +8,9 @@
 //   BOX_NAME="pr-agent-runner"   MODEL="thinkingmachines/inkling-2-small:free"
 //   PR_CRON="*/15 * * * *"      (5-field UTC cron; default every 15 min)
 //   BOX_SIZE="small"
+//   BACKEND_URL / BACKEND_API_TOKEN  (optional) let the box claim each PR head commit at
+//     the backend's /decisions/claim so it never duplicates a review the cloud decision
+//     layer or the desktop daemon already handled.
 //
 // Usage: node provision.mjs [--status]
 import { readFileSync } from "node:fs";
@@ -33,6 +36,16 @@ function need(name) {
 }
 
 const apiKey = need("UPSTASH_BOX_API_KEY");
+
+// Optional backend claim settings (single-line values only).
+function extraEnv() {
+  const out = {};
+  for (const name of ["BACKEND_URL", "BACKEND_API_TOKEN"]) {
+    const v = (process.env[name] || "").trim();
+    if (v && !/[\r\n]/.test(v)) out[name] = v;
+  }
+  return out;
+}
 
 async function getBox() {
   try {
@@ -70,6 +83,7 @@ if (!box) {
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
       REPOS: repos,
       MODEL,
+      ...extraEnv(),
     },
     initCommand: RUN_CMD,
   });
@@ -88,6 +102,7 @@ await box.files.write({
     `OPENROUTER_API_KEY=${process.env.OPENROUTER_API_KEY}`,
     `REPOS=${repos}`,
     `MODEL=${MODEL}`,
+    ...Object.entries(extraEnv()).map(([k, v]) => `${k}=${v}`),
   ].join("\n") + "\n",
 });
 

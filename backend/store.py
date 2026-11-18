@@ -16,6 +16,8 @@ fallback store:
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -542,3 +544,109 @@ def incr_quota(provider: str, seconds: float) -> float:
     except Exception as exc:
         log.warning("store.incr_quota(%s) write failed: %s", provider, exc)
     return nxt
+
+
+# ---------------------------------------------------------------------------
+# PR evaluation idempotency
+#
+# Every path that wants to act on a pull request (cloud webhook, Cloudflare
+# worker replay, desktop daemon polling, the Box cron loop) registers the
+# evaluation here first. The record is keyed on (repo, pr_number, head_sha) and
+# created with NX, so exactly one path wins per head commit — waking the
+# desktop never produces a second review or a second sandbox. A new push has a
+# new head_sha and therefore a fresh evaluation.
+# ---------------------------------------------------------------------------
+
+EVAL_TTL_S = 14 * 24 * 3600
+EVAL_LOCK_LEASE_S = 60
+
+
+def eval_id(repo: str, pr_number: int, head_sha: str) -> str:
+    """Stable short id for one (repo, pr_number, head_sha) evaluation."""
+    raw = f"{repo}|{int(pr_number)}|{head_sha}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _eval_key(eid: str) -> str:
+    return f"eval:{eid}"
+
+
+def _now_iso() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def eval_register(
+    repo: str, pr_number: int, head_sha: str, record: dict, ex: int | None = None
+) -> tuple[bool, dict]:
+    """Create the evaluation record if absent. Returns ``(created, record)``.
+
+    When ``created`` is False the returned record is the existing one, so the
+    caller can report what already happened instead of acting again.
+    """
+    eid = eval_id(repo, pr_number, head_sha)
+    now = _now_iso()
+    rec = dict(record)
+    rec.update({
+        "id": eid, "repo": repo, "pr_number": int(pr_number), "head_sha": head_sha,
+        "created_at": now, "updated_at": now,
+    })
+    for _ in range(2):  # second pass covers a record that expired between calls
+        if rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S, nx=True):
+            return True, rec
+        existing = rget_json(_eval_key(eid))
+        if isinstance(existing, dict):
+            return False, existing
+    return False, rec
+
+
+def eval_get(eid: str) -> dict | None:
+    rec = rget_json(_eval_key(eid))
+    return rec if isinstance(rec, dict) else None
+
+
+def eval_update(eid: str, patch: dict, ex: int | None = None) -> dict | None:
+    """Merge ``patch`` into a record. Callers hold ``eval_lock`` (or own the
+    record via its registration) so this read-modify-write cannot interleave."""
+    rec = eval_get(eid)
+    if rec is None:
+        return None
+    rec.update(patch)
+    rec["updated_at"] = _now_iso()
+    rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S)
+    return rec
+
+
+def eval_delete(eid: str) -> None:
+    rdelete(_eval_key(eid))
+
+
+@contextlib.contextmanager
+def eval_lock(eid: str, lease_s: int = EVAL_LOCK_LEASE_S):
+    """Short exclusive lease on one evaluation; yields a token or ``None``.
+
+    The desktop's submit, the cloud sweeper and a human clicking Approve all
+    mutate the same record; whoever holds the lease re-reads state and proceeds,
+    everyone else backs off.
+    """
+    key = f"evallock:{eid}"
+    token = uuid.uuid4().hex
+    if not rset(key, token, ex=lease_s, nx=True):
+        yield None
+        return
+    try:
+        yield token
+    finally:
+        try:
+            if rget(key) == token:
+                rdelete(key)
+        except Exception as exc:  # the lease simply expires
+            log.warning("store.eval_lock release failed: %s", exc)
+
+
+def eval_list(limit: int = 100) -> list[dict]:
+    keys = rkeys("eval:*")
+    records = [r for r in rget_json_many(keys) if isinstance(r, dict)]
+    records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+    return records[: max(1, limit)]

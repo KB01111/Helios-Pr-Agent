@@ -20,6 +20,7 @@
       <button class="nav-btn active" data-tab="review"><span class="ico">◈</span>Review</button>
       <button class="nav-btn" data-tab="agents"><span class="ico">⚙</span>Agents &amp; sync</button>
       <button class="nav-btn" data-tab="runs"><span class="ico">▶</span>Runs</button>
+      <button class="nav-btn" data-tab="autonomy"><span class="ico">⚖</span>Autonomy<span class="nav-count hidden" id="nav-esc-count" aria-label="escalations waiting">0</span></button>
       <button class="nav-btn" data-tab="quota"><span class="ico">▦</span>Quota</button>
       <button class="nav-btn" data-tab="providers"><span class="ico">◍</span>Providers</button>
       <button class="nav-btn" data-tab="integrations"><span class="ico">🔌</span>Integrations</button>
@@ -183,6 +184,67 @@
           </div>
           <pre class="out" id="runs-out">Runs not synced.</pre>
           <div id="runs-list"></div>
+        </div>
+      </section>
+
+      <!-- AUTONOMY & ESCALATIONS -->
+      <section class="tabpane" id="tab-autonomy" aria-label="Autonomy">
+        <div class="card">
+          <div class="card-head"><h2>Autonomy level</h2><span class="badge" id="autonomy-policy">policy …</span></div>
+          <p class="hint">How much the calibrated decision layer may do without asking you. Stored in the backend, so the desktop daemon and the cloud fallback follow the same rules.</p>
+          <div class="seg" id="autonomy-levels" role="group" aria-label="Autonomy level">
+            <button type="button" class="seg-btn" data-level="observe">Observe</button>
+            <button type="button" class="seg-btn" data-level="assist">Assist</button>
+            <button type="button" class="seg-btn" data-level="auto">Auto</button>
+          </div>
+          <p class="hint" id="autonomy-desc">…</p>
+          <div class="field" id="conf-auto-row"><span class="lbl">Act alone at confidence ≥ <b id="conf-auto-val">0.75</b></span>
+            <input type="range" id="conf-auto" min="0.5" max="1" step="0.01" value="0.75" />
+          </div>
+          <div class="field"><span class="lbl">Gray-zone floor — below <b id="conf-floor-val">0.55</b> a PR is escalated to you</span>
+            <input type="range" id="conf-floor" min="0.3" max="0.95" step="0.01" value="0.55" />
+          </div>
+          <p class="hint">Safety-flagged PRs (workflows, Dockerfiles, secrets, auth, <code>curl | sh</code>) always escalate, at every level.</p>
+          <div class="row wrap">
+            <button id="btn-autonomy-save" class="btn btn-accent" type="button">Save autonomy</button>
+            <button id="btn-autonomy-reload" class="btn btn-outline" type="button">Reload</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Escalation inbox</h2><span class="badge" id="esc-count">…</span></div>
+          <p class="hint">PRs the decider will not decide alone. “Fast review” posts a zero-CPU diff review; “Run as configured” uses the agent's own execution mode.</p>
+          <div class="row wrap"><button id="btn-esc-refresh" class="btn btn-outline btn-sm" type="button">Refresh</button></div>
+          <div id="esc-list" class="esc-list"><p class="hint">Loading…</p></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Always-on daemon</h2><span class="badge" id="daemon-state">stopped</span></div>
+          <p class="hint">While the app is open (closing the window keeps it in the tray) the daemon decides new PRs locally and keeps the cloud idle. If it stops or the machine sleeps, the cloud fallback takes over automatically — and the same PR is never reviewed twice.</p>
+          <div class="grid2">
+            <div class="field"><span class="lbl">Poll interval (5–60 s)</span>
+              <input id="daemon-interval" inputmode="numeric" value="30" autocomplete="off" />
+            </div>
+            <div class="field"><span class="lbl">Local model sidecar (optional, loopback only)</span>
+              <input id="daemon-sidecar" placeholder="http://127.0.0.1:8080" autocomplete="off" />
+            </div>
+          </div>
+          <div class="checks"><label><input type="checkbox" id="daemon-autostart" /> Start automatically when the app opens</label></div>
+          <div class="row wrap">
+            <button id="btn-daemon-start" class="btn btn-accent" type="button">Start daemon</button>
+            <button id="btn-daemon-stop" class="btn btn-destructive hidden" type="button">Stop daemon</button>
+            <button id="btn-daemon-refresh" class="btn btn-outline" type="button">Refresh</button>
+          </div>
+          <div class="kv-grid" id="daemon-stats"></div>
+          <p class="hint" id="daemon-cloud"></p>
+          <p class="hint gh-warn" id="daemon-error"></p>
+          <pre class="out run-logs" id="daemon-log">No daemon activity yet.</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Recent decisions</h2><span class="badge">calibration feedback</span></div>
+          <div class="row wrap" id="dec-stats"></div>
+          <div id="dec-list" class="dec-list"></div>
         </div>
       </section>
 
@@ -507,5 +569,6 @@
 </div>
 
 <script src="main.js"></script>
+<script src="autonomy.js"></script>
 </body>
 </html>

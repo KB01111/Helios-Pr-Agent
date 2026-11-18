@@ -140,6 +140,7 @@ const TAB_TITLES = {
   review: "Review",
   agents: "Agents & repo sync",
   runs: "Background runs",
+  autonomy: "Autonomy & escalations",
   quota: "Quota & autoscale",
   providers: "Providers",
   integrations: "Integrations",
