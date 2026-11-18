@@ -1,0 +1,1453 @@
+{
+ "policy_version": "v1",
+ "cases": [
+  {
+   "name": "docs_only",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "README.md",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "flags": []
+     },
+     {
+      "path": "docs/guide.md",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SKIP",
+    "confidence": 0.97,
+    "provider": "none",
+    "reason_code": "DOCS_ONLY",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "docs_and_license",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "LICENSE",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "CHANGELOG",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SKIP",
+    "confidence": 0.97,
+    "provider": "none",
+    "reason_code": "DOCS_ONLY",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "lockfile_small",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "package-lock.json",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 20,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SKIP",
+    "confidence": 0.92,
+    "provider": "none",
+    "reason_code": "LOCKFILE_BUMP",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "lockfile_plus_docs",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "Cargo.lock",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 30,
+      "flags": []
+     },
+     {
+      "path": "README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SKIP",
+    "confidence": 0.92,
+    "provider": "none",
+    "reason_code": "LOCKFILE_BUMP",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "lockfile_untrusted_url",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "package-lock.json",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 10,
+      "flags": [
+       "untrusted_url"
+      ]
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.8,
+    "provider": "review",
+    "reason_code": "LOCKFILE_BUMP",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "lockfile_no_patch",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "poetry.lock",
+      "status": "modified",
+      "additions": 900,
+      "deletions": 900,
+      "flags": [
+       "no_patch"
+      ]
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.8,
+    "provider": "review",
+    "reason_code": "LOCKFILE_BUMP",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "lockfile_big",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "yarn.lock",
+      "status": "modified",
+      "additions": 300,
+      "deletions": 200,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.8,
+    "provider": "review",
+    "reason_code": "LOCKFILE_BUMP",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "tiny_source",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "src/main.js",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.84,
+    "provider": "review",
+    "reason_code": "STATIC_DIFF_OK",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "small_two_files",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "backend/store.py",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 20,
+      "flags": []
+     },
+     {
+      "path": "backend/main.py",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.62,
+    "provider": "review",
+    "reason_code": "STATIC_DIFF_OK",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "ui_only",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "src/index.html",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 5,
+      "flags": []
+     },
+     {
+      "path": "src/styles.css",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 5,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SANDBOX_TEST",
+    "confidence": 0.73,
+    "provider": "vercel",
+    "reason_code": "UI_PREVIEW_NEEDED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "ui_mixed_gray_zone",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "src/index.html",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "src/app.py",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "src/util.py",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.54,
+    "provider": "none",
+    "reason_code": "LOW_CONFIDENCE_GRAY_ZONE",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "runtime_with_tests",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "backend/api.py",
+      "status": "modified",
+      "additions": 80,
+      "deletions": 20,
+      "flags": []
+     },
+     {
+      "path": "backend/tests/test_api.py",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SANDBOX_TEST",
+    "confidence": 0.8,
+    "provider": "box",
+    "reason_code": "RUNTIME_TEST_NEEDED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "config_change",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "package.json",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "flags": []
+     },
+     {
+      "path": "src/run.py",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 5,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SANDBOX_TEST",
+    "confidence": 0.58,
+    "provider": "box",
+    "reason_code": "RUNTIME_TEST_NEEDED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "medium_three_files",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "a.py",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 20,
+      "flags": []
+     },
+     {
+      "path": "b.py",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 10,
+      "flags": []
+     },
+     {
+      "path": "c.py",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 10,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "SANDBOX_TEST",
+    "confidence": 0.71,
+    "provider": "box",
+    "reason_code": "RUNTIME_TEST_NEEDED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "workflow_file",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": ".github/workflows/ci.yml",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.95,
+    "provider": "none",
+    "reason_code": "SAFETY_FLAGGED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "dockerfile",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "Dockerfile",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.95,
+    "provider": "none",
+    "reason_code": "SAFETY_FLAGGED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "env_example_is_not_sensitive",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": ".env.example",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "src/a.py",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.81,
+    "provider": "review",
+    "reason_code": "STATIC_DIFF_OK",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "auth_source",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "backend/auth_utils.py",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.95,
+    "provider": "none",
+    "reason_code": "SAFETY_FLAGGED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "author_is_not_auth",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "src/author_list.py",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.83,
+    "provider": "review",
+    "reason_code": "STATIC_DIFF_OK",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "secret_flag",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "src/a.py",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "flags": [
+       "secret_like"
+      ]
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.95,
+    "provider": "none",
+    "reason_code": "SAFETY_FLAGGED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "shell_pipe_flag",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "scripts/install.sh",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "flags": [
+       "shell_pipe"
+      ]
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.95,
+    "provider": "none",
+    "reason_code": "SAFETY_FLAGGED",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "huge_churn",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "a.py",
+      "status": "modified",
+      "additions": 3000,
+      "deletions": 100,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.4,
+    "provider": "none",
+    "reason_code": "LOW_CONFIDENCE_GRAY_ZONE",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "too_many_files",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "f0.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f1.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f2.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f3.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f4.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f5.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f6.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f7.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f8.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f9.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f10.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f11.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f12.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f13.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f14.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f15.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f16.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f17.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f18.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f19.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f20.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f21.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f22.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f23.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f24.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f25.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f26.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f27.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f28.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f29.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f30.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f31.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f32.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f33.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f34.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f35.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f36.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f37.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f38.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f39.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f40.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f41.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f42.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f43.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f44.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f45.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f46.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f47.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f48.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f49.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f50.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f51.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f52.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f53.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f54.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f55.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f56.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f57.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f58.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f59.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f60.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f61.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f62.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f63.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f64.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f65.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f66.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f67.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f68.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f69.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f70.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f71.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f72.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f73.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f74.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f75.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f76.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f77.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f78.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f79.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f80.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f81.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f82.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f83.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f84.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f85.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f86.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f87.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f88.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f89.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f90.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f91.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f92.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f93.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f94.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f95.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f96.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f97.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f98.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f99.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "f100.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.4,
+    "provider": "none",
+    "reason_code": "LOW_CONFIDENCE_GRAY_ZONE",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "empty",
+   "facts": {
+    "title": "t",
+    "files": [],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.3,
+    "provider": "none",
+    "reason_code": "LOW_CONFIDENCE_GRAY_ZONE",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "binary_image",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "assets/logo.png",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 0,
+      "flags": [
+       "no_patch"
+      ]
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "FAST_REVIEW",
+    "confidence": 0.87,
+    "provider": "review",
+    "reason_code": "STATIC_DIFF_OK",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "truncated_diff",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "a.py",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": true
+   },
+   "conf_floor": 0.55,
+   "expect": {
+    "decision": "ESCALATE_HUMAN",
+    "confidence": 0.4,
+    "provider": "none",
+    "reason_code": "LOW_CONFIDENCE_GRAY_ZONE",
+    "policy_version": "v1"
+   }
+  },
+  {
+   "name": "ui_mixed_with_lower_floor",
+   "facts": {
+    "title": "t",
+    "files": [
+     {
+      "path": "src/index.html",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "src/app.py",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "flags": []
+     },
+     {
+      "path": "src/util.py",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "flags": []
+     }
+    ],
+    "truncated": false
+   },
+   "conf_floor": 0.5,
+   "expect": {
+    "decision": "SANDBOX_TEST",
+    "confidence": 0.54,
+    "provider": "box",
+    "reason_code": "RUNTIME_TEST_NEEDED",
+    "policy_version": "v1"
+   }
+  }
+ ]
+}

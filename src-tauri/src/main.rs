@@ -4,6 +4,9 @@
 // Reads/writes .pr_agent.toml + workflow file next to the app root,
 // and optionally shells out to a local `pr-agent` CLI if installed.
 
+mod daemon;
+mod decider;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use std::path::PathBuf;
@@ -1872,7 +1875,19 @@ fn backend_approve_run_blocking(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(daemon::DaemonState::default())
+        .setup(|app| {
+            // Non-fatal: without a tray the window simply closes normally.
+            if let Err(e) = daemon::setup_tray(app) {
+                eprintln!("tray unavailable, daemon will stop when the window closes: {}", e);
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| daemon::on_window_event(window, event))
         .invoke_handler(tauri::generate_handler![
+            daemon::daemon_start,
+            daemon::daemon_stop,
+            daemon::daemon_status,
             get_config,
             save_config,
             get_workflow,

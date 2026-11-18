@@ -52,6 +52,11 @@ try:
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
     from backend import store as store  # type: ignore[no-redef]
 
+try:
+    import decision_flow  # calibrated decision layer (idempotent triage + escalation)
+except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+    from backend import decision_flow as decision_flow  # type: ignore[no-redef]
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("pr-agent.backend")
 
@@ -446,6 +451,10 @@ async def _reap_loop() -> None:
     while True:
         await asyncio.sleep(REAP_INTERVAL_S)
         await asyncio.to_thread(_reap_stale_queued_runs)
+        try:  # cloud fallback: decide deferred PRs the desktop did not pick up in time
+            await decision_flow.sweep()
+        except Exception as exc:
+            log.warning("decision sweep failed: %s", exc)
 
 
 @app.on_event("startup")
@@ -460,6 +469,10 @@ async def _startup_reap() -> None:
     except Exception as exc:
         log.warning("router preload failed: %s", exc)
     _reap_stale_queued_runs()
+    try:  # restore open-evaluation markers lost to a crash (or predating the index)
+        await asyncio.to_thread(store.eval_reindex)
+    except Exception as exc:
+        log.warning("evaluation reindex failed: %s", exc)
     app.state.reap_task = asyncio.create_task(_reap_loop())
 
 
@@ -528,6 +541,18 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     if not matched:
         return JSONResponse({"accepted": True, "runs": [], "matched": 0}, status_code=202)
 
+    # Calibrated decision layer. Idempotent on (repo, pr_number, head_sha), so a
+    # desktop that wakes up later never triggers a duplicate review. Returns None
+    # to continue with the legacy flow below (labeled events, layer disabled, or
+    # PR files unavailable).
+    gate = await decision_flow.gate_webhook(
+        {"repo": repo, "pr_number": pr_number, "sha": sha, "action": action,
+         "label": label, "title": title, "head_ref": head_ref},
+        matched,
+    )
+    if gate is not None:
+        return JSONResponse(gate, status_code=202)
+
     # Debounce: one trigger per PR/action/label per 45s.
     # Keyed by head SHA so a newer push is never swallowed, while redeliveries
     # of the same event (same SHA) are still deduplicated.
@@ -583,7 +608,7 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
 _CLAIM_LEASE_S = 60
 
 
-async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks) -> None:  # type: ignore[no-untyped-def]
+async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks, extra=None) -> None:  # type: ignore[no-untyped-def]
     pending: list[tuple[dict[str, Any], str]] = []
     for agent_cfg in matched:
         # Deterministic per (event, agent): if two handlers overlap (e.g. a
@@ -602,6 +627,8 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
             "created_at": _now_iso(),
             "logs": [],
         }
+        if extra:
+            record.update(extra)  # e.g. eval_id + the decision that produced this run
         key = f"run:{run_id}"
         if not await store.arset_json(key, record, nx=True):
             existing = await store.arget_json(key)
@@ -627,6 +654,21 @@ async def _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, t
     # Dispatch only once every record is persisted.
     for agent_cfg, run_id in pending:
         tasks.add_task(enqueue_dispatch, agent_cfg, pr_ctx.model_dump(), run_id)
+
+
+class _DirectTasks:
+    """BackgroundTasks stand-in for non-request contexts (sweeper, escalation
+    resolve): ``enqueue_dispatch`` only submits to the executor, so run it inline."""
+
+    def add_task(self, fn, *args) -> None:  # type: ignore[no-untyped-def]
+        fn(*args)
+
+
+async def _dispatch_agents(agents: list[dict[str, Any]], pr: dict[str, Any], extra: dict[str, Any]) -> list[str]:
+    ctx = PRContext(**pr)
+    run_ids: list[str] = []
+    await _create_runs(agents, ctx.repo, ctx.pr_number, ctx.sha, ctx.action, ctx, run_ids, _DirectTasks(), extra)
+    return run_ids
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1182,10 @@ def health() -> dict[str, Any]:
 @app.get("/")
 def root() -> dict[str, Any]:
     return {"ok": True, "service": "pr-agent-backend", "docs": "/docs"}
+
+
+# Decision layer routes: /autonomy, /daemon/*, /decisions/*
+decision_flow.register(app, require_auth=_require_auth, dispatch_agents=_dispatch_agents)
 
 
 if __name__ == "__main__":

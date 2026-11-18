@@ -16,6 +16,8 @@ fallback store:
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -542,3 +544,224 @@ def incr_quota(provider: str, seconds: float) -> float:
     except Exception as exc:
         log.warning("store.incr_quota(%s) write failed: %s", provider, exc)
     return nxt
+
+
+# ---------------------------------------------------------------------------
+# PR evaluation idempotency
+#
+# Every path that wants to act on a pull request (cloud webhook, Cloudflare
+# worker replay, desktop daemon polling, the Box cron loop) registers the
+# evaluation here first. The record is keyed on (repo, pr_number, head_sha) and
+# created with NX, so exactly one path wins per head commit — waking the
+# desktop never produces a second review or a second sandbox. A new push has a
+# new head_sha and therefore a fresh evaluation.
+# ---------------------------------------------------------------------------
+
+EVAL_TTL_S = 14 * 24 * 3600
+EVAL_LOCK_LEASE_S = 60
+
+
+def eval_id(repo: str, pr_number: int, head_sha: str) -> str:
+    """Stable short id for one (repo, pr_number, head_sha) evaluation."""
+    # GitHub repo names and SHAs are case-insensitive; every caller must hash the same key.
+    raw = f"{str(repo).lower()}|{int(pr_number)}|{str(head_sha).lower()}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _eval_key(eid: str) -> str:
+    return f"eval:{eid}"
+
+
+# Evaluations that something still has to act on. A tiny marker key per open evaluation
+# lets the sweeper, the desktop's pending poll and the inbox read only those records,
+# instead of scanning (and MGET-ing) 14 days of history.
+EVAL_OPEN_STATES = ("pending", "deferred", "dispatching", "escalated", "failed", "external_claimed")
+
+
+def _sync_open_marker(rec: dict, ex: int | None = None) -> None:
+    key = f"evalopen:{rec['id']}"
+    if rec.get("state") in EVAL_OPEN_STATES:
+        rset(key, repr(time.time()), ex=ex or EVAL_TTL_S)
+    else:
+        rdelete(key)
+
+
+# An open marker whose record is missing is either a registration in flight (marker is
+# written first) or an orphan from a crash. Only orphans older than this are swept.
+ORPHAN_MARKER_GRACE_S = 60
+
+
+def _drop_orphan_marker(eid: str) -> None:
+    """Delete an orphan marker with compare-and-delete on the value we aged: if a
+    registration rewrote the marker after we read it, the value differs and it survives."""
+    key = f"evalopen:{eid}"
+    raw = rget(key)
+    if raw is None:
+        return
+    try:
+        age = time.time() - float(raw)
+    except ValueError:
+        age = float("inf")
+    if age > ORPHAN_MARKER_GRACE_S:
+        rdelete_if_equal(key, raw)
+
+
+def _recent_key(rec: dict) -> str:
+    """Time-ordered key so "newest N" reads N records instead of scanning all of them."""
+    import datetime
+
+    try:
+        ts = datetime.datetime.fromisoformat(str(rec["created_at"])).timestamp()
+    except (KeyError, ValueError):
+        ts = time.time()
+    return f"evalrecent:{int(ts * 1_000_000):018d}:{rec['id']}"
+
+
+def _now_iso() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def eval_register(
+    repo: str, pr_number: int, head_sha: str, record: dict, ex: int | None = None
+) -> tuple[bool, dict]:
+    """Create the evaluation record if absent. Returns ``(created, record)``.
+
+    When ``created`` is False the returned record is the existing one, so the
+    caller can report what already happened instead of acting again.
+    """
+    eid = eval_id(repo, pr_number, head_sha)
+    now = _now_iso()
+    rec = dict(record)
+    rec.update({
+        "id": eid, "repo": repo, "pr_number": int(pr_number), "head_sha": head_sha,
+        "created_at": now, "updated_at": now,
+    })
+    for _ in range(2):  # second pass covers a record that expired between calls
+        # Marker first: if we crash between the two writes the leftover is a marker with no
+        # record, which eval_list_open() sweeps up. The reverse (record without marker)
+        # would hide an unresolved evaluation from the sweeper.
+        _sync_open_marker(rec, ex)
+        if rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S, nx=True):
+            rset(_recent_key(rec), "1", ex=ex or EVAL_TTL_S)
+            return True, rec
+        existing = rget_json(_eval_key(eid))
+        if isinstance(existing, dict):
+            return False, existing
+    return False, rec
+
+
+_COMPARE_AND_DELETE = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
+def rdelete_if_equal(key: str, token: str) -> bool:
+    """Atomically delete ``key`` only if it still holds ``token``.
+
+    A plain GET-then-DELETE could remove a lease that expired and was re-acquired by
+    someone else between the two calls.
+    """
+    if _REDIS is not None:
+        return bool(_REDIS.eval(_COMPARE_AND_DELETE, 1, key, token))
+    if _SDK is not None and hasattr(_SDK, "eval"):
+        return bool(_SDK.eval(_COMPARE_AND_DELETE, keys=[key], args=[token]))  # type: ignore[attr-defined]
+    if _use_rest():
+        return bool(int(_rest_cmd("EVAL", _COMPARE_AND_DELETE, "1", key, token)))  # type: ignore[arg-type]
+    with _MEM_LOCK:
+        if _mem_get(key) == token:
+            _MEM.pop(key, None)
+            return True
+        return False
+
+
+def eval_get(eid: str) -> dict | None:
+    rec = rget_json(_eval_key(eid))
+    return rec if isinstance(rec, dict) else None
+
+
+def eval_update(eid: str, patch: dict, ex: int | None = None) -> dict | None:
+    """Merge ``patch`` into a record. Callers hold ``eval_lock`` (or own the
+    record via its registration) so this read-modify-write cannot interleave."""
+    rec = eval_get(eid)
+    if rec is None:
+        return None
+    rec.update(patch)
+    rec["updated_at"] = _now_iso()
+    rset_json(_eval_key(eid), rec, ex=ex or EVAL_TTL_S)
+    _sync_open_marker(rec, ex)
+    return rec
+
+
+def eval_delete(eid: str) -> None:
+    rec = eval_get(eid)
+    rdelete(_eval_key(eid))
+    rdelete(f"evalopen:{eid}")
+    if rec is not None:
+        rdelete(_recent_key(rec))  # keep the time index free of dead entries
+
+
+@contextlib.contextmanager
+def eval_lock(eid: str, lease_s: int = EVAL_LOCK_LEASE_S):
+    """Short exclusive lease on one evaluation; yields a token or ``None``.
+
+    The desktop's submit, the cloud sweeper and a human clicking Approve all
+    mutate the same record; whoever holds the lease re-reads state and proceeds,
+    everyone else backs off.
+    """
+    key = f"evallock:{eid}"
+    token = uuid.uuid4().hex
+    if not rset(key, token, ex=lease_s, nx=True):
+        yield None
+        return
+    try:
+        yield token
+    finally:
+        try:
+            rdelete_if_equal(key, token)
+        except Exception as exc:  # the lease simply expires
+            log.warning("store.eval_lock release failed: %s", exc)
+
+
+def eval_reindex() -> int:
+    """Rebuild missing open markers from the records themselves (run at startup; covers
+    records written before the index existed or a crash between the two writes)."""
+    restored = 0
+    have = {k.split("evalopen:", 1)[-1] for k in rkeys("evalopen:*")}
+    have_recent = {k.rsplit(":", 1)[-1] for k in rkeys("evalrecent:*")}
+    for rec in rget_json_many(rkeys("eval:*")):
+        if not isinstance(rec, dict) or not rec.get("id"):
+            continue
+        if rec["id"] not in have_recent:
+            rset(_recent_key(rec), "1", ex=EVAL_TTL_S)
+        if rec.get("state") in EVAL_OPEN_STATES and rec["id"] not in have:
+            _sync_open_marker(rec)
+            restored += 1
+    return restored
+
+
+def eval_list_open(states: tuple[str, ...] | None = None) -> list[dict]:
+    """Records still awaiting action, oldest first. Reads only the open set."""
+    ids = [k.split("evalopen:", 1)[-1] for k in rkeys("evalopen:*")]
+    loaded = rget_json_many([_eval_key(i) for i in ids])
+    records = []
+    for eid, rec in zip(ids, loaded):
+        if isinstance(rec, dict) and rec.get("state") in EVAL_OPEN_STATES:
+            if rec.get("state") in (states or EVAL_OPEN_STATES):
+                records.append(rec)
+        elif isinstance(rec, dict):
+            rdelete(f"evalopen:{eid}")  # settled: terminal states never reopen
+        else:
+            _drop_orphan_marker(eid)  # orphan from a crash (a fresh one may be mid-registration)
+    records.sort(key=lambda r: str(r.get("created_at", "")))
+    return records
+
+
+def eval_list(limit: int = 100) -> list[dict]:
+    # Newest first from the time-ordered key index, then read only those `limit` records.
+    keys = sorted(rkeys("evalrecent:*"), reverse=True)[: max(1, limit)]
+    ids = list(dict.fromkeys(k.rsplit(":", 1)[-1] for k in keys))  # no duplicate ids
+    records = [r for r in rget_json_many([_eval_key(i) for i in ids]) if isinstance(r, dict)]
+    records.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+    return records
