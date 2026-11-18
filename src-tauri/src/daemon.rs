@@ -267,10 +267,16 @@ fn tick(inner: &Inner, cfg: &Config, generation: Option<u64>) -> Result<(), Stri
             "model": if cfg.sidecar.is_some() { "sidecar" } else { "rules" },
         })),
     )?;
+    if !alive(inner, generation) {
+        return Ok(());
+    }
     let floor = call(cfg, "GET", "/autonomy", None)
         .ok()
         .and_then(|v| v.get("conf_floor").and_then(|f| f.as_f64()))
         .unwrap_or(decider::DEFAULT_CONF_FLOOR);
+    if !alive(inner, generation) {
+        return Ok(());
+    }
     let pending = call(cfg, "GET", "/decisions/pending?limit=20", None)?;
     let items = pending.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let mut first_error: Option<String> = None;

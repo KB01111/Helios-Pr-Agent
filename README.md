@@ -236,8 +236,10 @@ asks otherwise), `auto` (acts at/above the floor). Escalations appear in the app
 ### Cloudflare worker (free tier)
 
 `cloudflare-worker/` is an always-on edge receiver: it verifies the GitHub signature, acks
-in milliseconds, forwards to the backend with retries (optionally parking failures in KV),
-and a per-minute cron calls `/decisions/sweep` to wake the backend and run the fallback.
+quickly, makes one delivery attempt to the backend and, if that fails, parks the event in
+KV (optional) for the cron to replay — without KV an outage answers 502 so GitHub shows a
+failed delivery you can redeliver. A per-minute cron calls `/decisions/sweep` to wake the
+backend and run the fallback.
 
 ```bash
 cd cloudflare-worker

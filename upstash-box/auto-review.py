@@ -155,18 +155,22 @@ def main():
                     done[key] = True
                     save_state(done)
                 continue
+            published = False
             try:
                 diff = gh(f"/repos/{repo}/pulls/{pr['number']}", diff=True)
                 review = review_with_openrouter(pr.get("title", ""), diff)
                 gh(f"/repos/{repo}/issues/{pr['number']}/comments",
                    method="POST",
                    payload={"body": "## 🤖 Auto-review (" + MODEL + ")\n\n" + review})
+                published = True
                 done[key] = True
                 save_state(done)
                 finish_claim(repo, pr["number"], sha, claim_id, "complete")
                 print(f"[{repo}#{pr['number']}] reviewed", flush=True)
             except Exception as e:
-                finish_claim(repo, pr["number"], sha, claim_id, "release")
+                # Once the comment is out the commit counts as reviewed, whatever else fails;
+                # releasing then would let another runner post a duplicate.
+                finish_claim(repo, pr["number"], sha, claim_id, "complete" if published else "release")
                 print(f"[{repo}#{pr['number']}] failed: {e}", flush=True)
     return 0
 

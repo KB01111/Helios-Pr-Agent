@@ -110,25 +110,44 @@ test("a valid pull_request is acked fast and forwarded verbatim with its signatu
   }
 });
 
-test("retries 503 and 409 then succeeds; drops other 4xx immediately", async () => {
-  let n = 0;
-  let f = stubFetch(() => new Response("{}", { status: ++n < 3 ? (n === 1 ? 503 : 409) : 202 }));
+test("a retryable failure is parked before acking; 4xx is dropped; without KV it is a visible 502", async () => {
+  const kv = fakeKv();
+  let f = stubFetch(() => new Response("{}", { status: 503 }));
   try {
-    await post(prBody());
-    assert.equal(f.calls.length, 3);
+    assert.equal((await post(prBody(), { env: { ...baseEnv, PENDING: kv }, delivery: "p1" })).status, 202);
+    assert.equal(f.calls.length, 1); // one inline attempt only: GitHub times out at 10 s
+    assert.deepEqual([...kv.store.keys()], ["pending:p1"]);
+    assert.equal((await post(prBody(), { delivery: "p2" })).status, 502);
+  } finally {
+    f.restore();
+  }
+  f = stubFetch(() => new Response("{}", { status: 409 })); // another handler holds the claim
+  try {
+    assert.equal((await post(prBody(), { env: { ...baseEnv, PENDING: kv }, delivery: "p3" })).status, 202);
+    assert.ok(kv.store.has("pending:p3"));
   } finally {
     f.restore();
   }
   f = stubFetch(() => new Response("{}", { status: 400 }));
   try {
-    await post(prBody());
-    assert.equal(f.calls.length, 1);
+    assert.equal((await post(prBody(), { env: { ...baseEnv, PENDING: kv }, delivery: "p4" })).status, 202);
+    assert.equal(kv.store.has("pending:p4"), false);
   } finally {
     f.restore();
   }
 });
 
-test("parks deliveries in KV when the backend stays down, then the cron replays them", async () => {
+test("if parking itself fails the webhook fails visibly", async () => {
+  const kv = { ...fakeKv(), put: async () => { throw new Error("KV write limit"); } };
+  const f = stubFetch(() => new Response("{}", { status: 503 }));
+  try {
+    assert.equal((await post(prBody(), { env: { ...baseEnv, PENDING: kv } })).status, 502);
+  } finally {
+    f.restore();
+  }
+});
+
+test("parks deliveries in KV when the backend is down, then the cron replays them", async () => {
   const kv = fakeKv();
   const env = { ...baseEnv, PENDING: kv };
   let f = stubFetch(() => {
@@ -136,12 +155,11 @@ test("parks deliveries in KV when the backend stays down, then the cron replays 
   });
   try {
     await post(prBody(), { env, delivery: "parked-1" });
-    assert.equal(f.calls.length, 3);
+    assert.equal(f.calls.length, 1);
     assert.deepEqual([...kv.store.keys()], ["pending:parked-1"]);
   } finally {
     f.restore();
   }
-  // Cron on a replay minute with the backend back: replays + sweeps (with bearer when configured).
   f = stubFetch(() => new Response("{}", { status: 202 }));
   try {
     const out = await runCron({ ...env, BACKEND_API_TOKEN: "tok" }, 5 * 60000);
@@ -184,17 +202,6 @@ test("insecure or missing BACKEND_URL never forwards", async () => {
 test("health and unknown routes", async () => {
   assert.equal((await worker.fetch(new Request("https://e/health"), baseEnv, {})).status, 200);
   assert.equal((await worker.fetch(new Request("https://e/nope"), baseEnv, {})).status, 404);
-});
-
-test("without KV an unavailable backend is a visible 502, not a silent 202", async () => {
-  const f = stubFetch(() => new Response("{}", { status: 503 }));
-  try {
-    const resp = await post(prBody());
-    assert.equal(resp.status, 502);
-    assert.equal(f.calls.length, 3);
-  } finally {
-    f.restore();
-  }
 });
 
 test("replay rotates through a backlog bigger than one batch", async () => {

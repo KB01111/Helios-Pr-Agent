@@ -3,8 +3,9 @@
 // GitHub -> this worker -> FastAPI backend (/webhooks/github)
 //
 //  * Always on, even when the desktop is asleep and the FastAPI free tier is cold:
-//    it verifies the webhook signature, answers GitHub in milliseconds, and
-//    delivers to the backend in the background with retries.
+//    it verifies the webhook signature and makes one delivery attempt (GitHub gives
+//    up after 10 s). A 2xx means delivered or safely parked; if the backend is down
+//    and nothing could be parked, it answers 502 so GitHub shows a failed delivery.
 //  * The backend decides who handles the PR: if the desktop daemon has a fresh
 //    heartbeat it defers the event to it, otherwise the cloud decider acts
 //    immediately. Idempotency on (repo, pr_number, head_sha) lives in the
@@ -13,8 +14,8 @@
 //    which decides events the desktop did not pick up within the grace period.
 //    That is the "desktop went to sleep" fallback.
 //  * Optional KV namespace `PENDING` parks deliveries the backend could not take
-//    (down / cold-start timeout) and replays them from the cron. Without it, the
-//    in-request retries are all you get.
+//    (down / cold-start timeout) *before* the worker acks, and the cron replays them.
+//    Without it, an outage is a visible 502 and GitHub's "Redeliver" is the recovery.
 //
 // Config (wrangler.toml / `wrangler secret put`):
 //   BACKEND_URL             https://… base URL of the FastAPI backend   (var)
@@ -23,13 +24,12 @@
 //   PENDING                 KV binding for parked deliveries            (optional)
 
 const PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "labeled"]);
-const DEFAULT_DELAYS_MS = [0, 1000, 3000];
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
-// waitUntil work is cut off ~30 s after the response: 3 attempts x 7 s + backoff leaves time to park.
+// GitHub gives up on a webhook after 10 s, so the single inline attempt must finish well inside that.
 const FORWARD_TIMEOUT_MS = 7000;
 const KV_REPLAY_EVERY_MIN = 5; // KV free tier allows ~1000 list() calls/day
 const KV_REPLAY_BATCH = 10; // stay well inside the 50-subrequest limit
-const KV_REPLAY_WINDOW = 100; // keys listed per replay (one list() call)
+const KV_REPLAY_WINDOW = 1000; // keys listed per replay (one list() call, the KV maximum)
 
 const enc = new TextEncoder();
 const json = (obj, status = 200) =>
@@ -64,14 +64,6 @@ function backendBase(env) {
   return raw;
 }
 
-function delaysFor(env) {
-  // Test hook; production uses the defaults.
-  if (!env.RETRY_DELAYS_MS) return DEFAULT_DELAYS_MS;
-  return String(env.RETRY_DELAYS_MS).split(",").map((n) => Math.max(0, Number(n) || 0));
-}
-
-const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
-
 /** One delivery attempt. Returns "ok" | "retry" | "drop". */
 export async function forward(env, item) {
   const base = backendBase(env);
@@ -104,22 +96,27 @@ export async function forward(env, item) {
   }
 }
 
-/** Deliver with in-request retries; park in KV when the backend stays unavailable. */
+/**
+ * One delivery attempt. On a retryable failure the delivery is parked in KV *before* we
+ * answer GitHub, so a successful ack always means "delivered or safely parked"; the cron
+ * replays parked items. Without KV a failure is reported ("lost") so the caller can fail
+ * the webhook visibly. Returns "delivered" | "dropped" | "parked" | "lost".
+ */
 export async function deliver(env, item) {
-  for (const delay of delaysFor(env)) {
-    await sleep(delay);
-    const result = await forward(env, item);
-    if (result === "ok") return "delivered";
-    if (result === "drop") return "dropped";
+  const result = await forward(env, item);
+  if (result === "ok") return "delivered";
+  if (result === "drop") return "dropped";
+  if (!env.PENDING) {
+    console.error(`delivery ${item.delivery} not accepted and no PENDING KV bound`);
+    return "lost";
   }
-  if (env.PENDING) {
-    await env.PENDING.put(`pending:${item.delivery}`, JSON.stringify({ ...item, attempts: 0 }), {
-      expirationTtl: 24 * 3600,
-    });
+  try {
+    await env.PENDING.put(`pending:${item.delivery}`, JSON.stringify(item), { expirationTtl: 24 * 3600 });
     return "parked";
+  } catch (err) {
+    console.error(`could not park ${item.delivery}: ${err && err.name}`);
+    return "lost";
   }
-  console.error(`delivery ${item.delivery} not accepted and no PENDING KV bound`);
-  return "lost";
 }
 
 /** Read at most `max` bytes, cancelling the stream as soon as the limit is exceeded. */
@@ -147,7 +144,7 @@ async function readBounded(request, max) {
   return out;
 }
 
-export async function handleWebhook(request, env, ctx) {
+export async function handleWebhook(request, env, _ctx) {
   if (!env.GITHUB_WEBHOOK_SECRET || !backendBase(env)) {
     return json({ error: "worker not configured" }, 500);
   }
@@ -177,13 +174,8 @@ export async function handleWebhook(request, env, ctx) {
 
   const delivery = request.headers.get("x-github-delivery") || crypto.randomUUID();
   const item = { body: new TextDecoder().decode(raw), event, delivery, signature };
-  if (env.PENDING) {
-    // Failures are parked in KV and replayed by the cron, so ack GitHub right away.
-    ctx.waitUntil(deliver(env, item));
-    return json({ accepted: true, delivery }, 202);
-  }
-  // Nothing to park failures in: deliver before answering, so an outage shows up as a
-  // failed delivery in GitHub (where it can be redelivered) instead of a silent 202.
+  // Delivered or safely parked => 202. Otherwise fail the webhook so GitHub shows a failed
+  // delivery that can be redelivered, instead of a silent 202 for work that was lost.
   if ((await deliver(env, item)) === "lost") return json({ error: "backend unavailable", delivery }, 502);
   return json({ accepted: true, delivery }, 202);
 }
