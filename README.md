@@ -36,7 +36,25 @@ npx tauri dev        # dev window
 npx tauri build      # installer in src-tauri\target\release\bundle
 ```
 
-Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11).
+Requirements: Node 18+, Rust stable, WebView2 (preinstalled on Windows 10/11), and
+Python 3.12+ for local CLI reviews (or set `PR_AGENT_BASE_PYTHON` to a 3.12+ interpreter).
+
+### Local CLI review (Review tab)
+
+`Run locally` shells out to PR-Agent on this PC. It needs:
+
+- **GitHub sign-in** in Settings → GitHub (device flow or PAT). The session token is
+  passed to the CLI as `GITHUB__USER_TOKEN`; it is never written to disk.
+- **PR-Agent CLI** installed once. Providers → Install CLI creates a dedicated venv at
+  `%LOCALAPPDATA%\PR Agent Control\pr-agent-venv` and installs pinned
+  `pr-agent[github]==0.50.0` there, so the backend's Python packages are not touched.
+  Override the location with `PR_AGENT_VENV` (and the base interpreter with
+  `PR_AGENT_BASE_PYTHON`).
+- **OpenRouter key** in the Review card (session only).
+
+The app passes its local `.pr_agent.toml` as `--extra_config_url`, so the model selected
+in the app is used even when the target repo has no `.pr_agent.toml` of its own. For
+private repos, the GitHub token needs `repo` scope.
 
 ## Use it
 

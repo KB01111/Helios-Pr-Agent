@@ -6,7 +6,7 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn app_root_candidates() -> Vec<PathBuf> {
@@ -48,6 +48,129 @@ fn find_file(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn app_root_dir() -> PathBuf {
+    if let Some(path) = find_file(".pr_agent.toml") {
+        if let Some(parent) = path.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.to_path_buf();
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// PR-Agent gets its own venv so installing it cannot upgrade/downgrade the
+/// FastAPI backend's packages in the ambient Python environment.
+fn pr_agent_venv_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("PR_AGENT_VENV") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let local = local.trim();
+        if !local.is_empty() {
+            return PathBuf::from(local)
+                .join("PR Agent Control")
+                .join("pr-agent-venv");
+        }
+    }
+    app_root_dir().join(".venv")
+}
+
+fn venv_python(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    }
+}
+
+fn venv_bin_dir(venv: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv.join("Scripts")
+    } else {
+        venv.join("bin")
+    }
+}
+
+fn pr_agent_exe() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "pr-agent.exe" } else { "pr-agent" };
+    let exe = venv_bin_dir(&pr_agent_venv_dir()).join(name);
+    if exe.is_file() {
+        Some(exe)
+    } else {
+        None
+    }
+}
+
+/// Prefer the explicit PR_AGENT_PYTHON override, then the app-managed venv,
+/// then the ambient `python`.
+fn pr_agent_python() -> PathBuf {
+    if let Ok(path) = std::env::var("PR_AGENT_PYTHON") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    let python = venv_python(&pr_agent_venv_dir());
+    if python.is_file() {
+        python
+    } else {
+        PathBuf::from("python")
+    }
+}
+
+fn add_venv_to_path(cmd: &mut Command) {
+    let bin = venv_bin_dir(&pr_agent_venv_dir());
+    if !bin.is_dir() {
+        return;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&path));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+}
+
+fn ensure_pr_agent_venv() -> Result<PathBuf, String> {
+    let venv = pr_agent_venv_dir();
+    let python = venv_python(&venv);
+    if python.is_file() {
+        return Ok(python);
+    }
+    if let Some(parent) = venv.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+    }
+    let base = std::env::var("PR_AGENT_BASE_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let out = Command::new(&base)
+        .args(["-m", "venv"])
+        .arg(&venv)
+        .output()
+        .map_err(|e| format!("failed to run {} -m venv: {}", base, e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "failed to create venv at {}: {}",
+            venv.display(),
+            render_process_output(&out).trim()
+        ));
+    }
+    if !python.is_file() {
+        return Err(format!(
+            "venv created but Python was not found at {}",
+            python.display()
+        ));
+    }
+    Ok(python)
 }
 
 fn config_path_for_write() -> PathBuf {
@@ -136,6 +259,9 @@ fn get_config_blocking() -> Result<serde_json::Value, String> {
         "raw": raw,
         "model": get_val(&raw, "model").unwrap_or_else(|| "openrouter/thinkingmachines/inkling-2-small:free".into()),
         "fallback_models": fallbacks,
+        "max_model_tokens": get_val(&raw, "max_model_tokens")
+            .or_else(|| get_val(&raw, "custom_model_max_tokens"))
+            .unwrap_or_else(|| "200000".into()),
         "custom_model_max_tokens": get_val(&raw, "custom_model_max_tokens").unwrap_or_else(|| "200000".into()),
         "reasoning_effort": get_val(&raw, "reasoning_effort").unwrap_or_else(|| "low".into()),
         "auto_describe": parse_bool("auto_describe"),
@@ -155,8 +281,15 @@ fn save_config_blocking(cfg: serde_json::Value) -> Result<String, String> {
     let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or("openrouter/thinkingmachines/inkling-2-small:free"));
     let fallbacks = cfg.get("fallback_models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let fb: Vec<String> = fallbacks.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", toml_escape(s)))).collect();
-    let max_tokens_raw = cfg.get("custom_model_max_tokens").and_then(|v| v.as_str()).unwrap_or("200000");
-    let max_tokens: i64 = max_tokens_raw.trim().parse().map_err(|_| "custom_model_max_tokens must be an integer".to_string())?;
+    let max_tokens_raw = cfg
+        .get("max_model_tokens")
+        .or_else(|| cfg.get("custom_model_max_tokens"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("200000");
+    let max_tokens: i64 = max_tokens_raw
+        .trim()
+        .parse()
+        .map_err(|_| "max_model_tokens must be an integer".to_string())?;
     let effort = toml_escape(cfg.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("low"));
     let b = |k: &str, d: bool| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
@@ -165,6 +298,7 @@ fn save_config_blocking(cfg: serde_json::Value) -> Result<String, String> {
 # Managed by PR Agent Control app
 model = "{model}"
 fallback_models = [{fb}]
+max_model_tokens = {max_tokens}
 custom_model_max_tokens = {max_tokens}
 reasoning_effort = "{effort}"
 
@@ -215,7 +349,15 @@ fn get_workflow_blocking() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn build_cli_command(pr_url: String, command: String) -> String {
     let cmd = command.trim().trim_start_matches('/').to_string();
-    format!("pr-agent --pr_url {} {}", pr_url.trim(), cmd)
+    match find_file(".pr_agent.toml") {
+        Some(path) => format!(
+            "pr-agent --pr_url {} --extra_config_url \"{}\" {}",
+            pr_url.trim(),
+            path.display(),
+            cmd
+        ),
+        None => format!("pr-agent --pr_url {} {}", pr_url.trim(), cmd),
+    }
 }
 
 /// Split a command line like `ask "what changed?"` into separate arguments
@@ -248,9 +390,27 @@ fn split_cli_args(input: &str) -> Vec<String> {
     args
 }
 
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(code) = chars.next() {
+                if ('@'..='~').contains(&code) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn render_process_output(out: &std::process::Output) -> String {
-    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let mut s = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     if !stderr.is_empty() {
         s.push_str("\n[stderr]\n");
         s.push_str(&stderr);
@@ -268,49 +428,102 @@ fn process_failure(label: &str, out: &std::process::Output) -> String {
     )
 }
 
-#[tauri::command]
-async fn run_local_review(pr_url: String, command: String, openrouter_key: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || run_local_review_blocking(pr_url, command, openrouter_key))
-        .await
-        .map_err(|e| e.to_string())?
+fn is_missing_pr_agent(out: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stderr.contains("No module named 'pr_agent'")
+        || stderr.contains("No module named \"pr_agent\"")
+        || stderr.contains("No module named pr_agent")
 }
 
-fn run_local_review_blocking(pr_url: String, command: String, openrouter_key: String) -> Result<String, String> {
+fn missing_pr_agent_message(python: &str, details: &str) -> String {
+    format!(
+        "PR-Agent CLI is not installed for `{}`. Open Providers → Install CLI (pip), or run: \"{}\" -m pip install \"pr-agent[github]==0.50.0\" — then retry.\n{}",
+        python, python, details
+    )
+}
+
+#[tauri::command]
+async fn run_local_review(
+    pr_url: String,
+    command: String,
+    openrouter_key: String,
+    github_token: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_local_review_blocking(pr_url, command, openrouter_key, github_token)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn run_local_review_blocking(
+    pr_url: String,
+    command: String,
+    openrouter_key: String,
+    github_token: String,
+) -> Result<String, String> {
     let cmd = command.trim().trim_start_matches('/').to_string();
     let cmd_args = split_cli_args(&cmd);
     let url = pr_url.trim();
-    let python_fallback = || {
-        Command::new("python")
-            .args(["-m", "pr_agent.cli", "--pr_url", url])
-            .args(&cmd_args)
+    let config_path = find_file(".pr_agent.toml");
+    let python = pr_agent_python();
+    let python_label = python.display().to_string();
+
+    let build = |program: &str, module: Option<&str>| {
+        let mut c = Command::new(program);
+        add_venv_to_path(&mut c);
+        if let Some(m) = module {
+            c.args(["-m", m]);
+        }
+        c.args(["--pr_url", url]);
+        // The target repo's default branch may not contain a .pr_agent.toml.
+        // Pass the app's config explicitly so the selected model/limits apply.
+        if let Some(path) = &config_path {
+            c.arg("--extra_config_url").arg(path);
+        }
+        c.args(&cmd_args)
             .env("OPENROUTER__KEY", &openrouter_key)
-            .output()
+            // Without this, PR-Agent can print a model/provider error and still
+            // exit 0, which the app would report as a successful review.
+            .env("CONFIG__PROPAGATE_TOOL_ERRORS", "true")
+            // Free models can take longer than the 120 s default on a large PR.
+            .env("CONFIG__AI_TIMEOUT", "300");
+        if !github_token.trim().is_empty() {
+            c.env("GITHUB__USER_TOKEN", github_token.trim());
+        }
+        c
     };
 
-    // Try `pr-agent` on PATH first, then `python -m pr_agent`.
-    match Command::new("pr-agent")
-        .args(["--pr_url", url])
-        .args(&cmd_args)
-        .env("OPENROUTER__KEY", &openrouter_key)
-        .output()
-    {
-        Ok(out) if out.status.success() => Ok(render_process_output(&out)),
-        Ok(out) => {
-            let first_error = process_failure("pr-agent", &out);
-            match python_fallback() {
-                Ok(py) if py.status.success() => Ok(render_process_output(&py)),
-                Ok(py) => Err(format!("{}; {}", first_error, process_failure("python -m pr_agent", &py))),
-                Err(_) => Err(first_error),
+    let run_python = || match build(&python_label, Some("pr_agent.cli")).output() {
+        Ok(py) if py.status.success() => Ok(render_process_output(&py)),
+        Ok(py) => {
+            let py_error = process_failure(&format!("{} -m pr_agent.cli", python_label), &py);
+            if is_missing_pr_agent(&py) {
+                Err(missing_pr_agent_message(&python_label, &py_error))
+            } else {
+                Err(py_error)
             }
         }
-        Err(first_err) => match python_fallback() {
-            Ok(py) if py.status.success() => Ok(render_process_output(&py)),
-            Ok(py) => Err(process_failure("python -m pr_agent", &py)),
-            Err(_) => Err(format!(
-                "No local `pr-agent` found ({}). Install: pip install \"pr-agent[github]\" — then retry. CLI would be: pr-agent --pr_url {} {}",
-                first_err, url, cmd
-            )),
-        },
+        Err(e) => Err(format!("failed to run {}: {}", python_label, e)),
+    };
+
+    // Prefer the app-managed venv's Python module over its console-script shim.
+    // If no venv exists, try `pr-agent` on PATH, then the ambient Python module.
+    if python.is_file() {
+        return run_python();
+    }
+    match build("pr-agent", None).output() {
+        Ok(out) if out.status.success() => Ok(render_process_output(&out)),
+        Ok(out) => {
+            if is_missing_pr_agent(&out) {
+                run_python()
+            } else {
+                // Do not retry a real failure through a second entry point:
+                // it can duplicate side effects such as PR comments.
+                Err(process_failure("pr-agent", &out))
+            }
+        }
+        Err(_) => run_python(),
     }
 }
 
@@ -438,22 +651,77 @@ async fn check_tool(name: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+fn version_output(out: &std::process::Output) -> String {
+    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    s.trim().to_string()
+}
+
 fn check_tool_blocking(name: String) -> Result<String, String> {
     let allowed = ["pr-agent", "python", "pip", "node", "gh"];
     if !allowed.contains(&name.as_str()) {
         return Err("tool not allowed".into());
     }
-    let out = Command::new(&name)
+
+    if name == "pr-agent" {
+        let direct_program = pr_agent_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "pr-agent".to_string());
+        let mut direct = Command::new(&direct_program);
+        add_venv_to_path(&mut direct);
+        if let Ok(out) = direct.arg("--version").output() {
+            if out.status.success() {
+                let s = version_output(&out);
+                return Ok(if s.is_empty() { "pr-agent installed".into() } else { s });
+            }
+        }
+        let python = pr_agent_python();
+        let out = Command::new(&python)
+            .args(["-m", "pr_agent.cli", "--version"])
+            .output()
+            .map_err(|e| {
+                format!(
+                    "pr-agent not found ({} not runnable: {})",
+                    python.display(),
+                    e
+                )
+            })?;
+        let s = version_output(&out);
+        if out.status.success() {
+            let label = if s.is_empty() {
+                "pr-agent installed".to_string()
+            } else {
+                s
+            };
+            return Ok(format!("{} (via {})", label, python.display()));
+        }
+        return Err(format!(
+            "pr-agent not installed for {}. Open Providers → Install CLI (pip). {}",
+            python.display(),
+            s
+        ));
+    }
+
+    let program = if name == "python" {
+        pr_agent_python()
+    } else {
+        PathBuf::from(&name)
+    };
+    let mut cmd = Command::new(&program);
+    add_venv_to_path(&mut cmd);
+    let out = cmd
         .arg("--version")
         .output()
-        .map_err(|e| format!("{} not found: {}", name, e))?;
-    let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-    s.push_str(&String::from_utf8_lossy(&out.stderr));
-    let s = s.trim().to_string();
+        .map_err(|e| format!("{} not found: {}", program.display(), e))?;
+    let s = version_output(&out);
     if out.status.success() {
-        Ok(if s.is_empty() { format!("{} installed", name) } else { s })
+        Ok(if s.is_empty() {
+            format!("{} installed", program.display())
+        } else {
+            s
+        })
     } else {
-        Err(format!("{} check failed: {}", name, s))
+        Err(format!("{} check failed: {}", program.display(), s))
     }
 }
 
@@ -465,19 +733,37 @@ async fn install_pr_agent() -> Result<String, String> {
 }
 
 fn install_pr_agent_blocking() -> Result<String, String> {
-    // Installs the PR-Agent CLI with the GitHub integration into the ambient Python.
-    let out = Command::new("python")
-        .args(["-m", "pip", "install", "pr-agent[github]"])
+    // Dedicated venv: installing PR-Agent must not upgrade/downgrade the
+    // FastAPI backend's packages in the ambient Python environment.
+    let python = ensure_pr_agent_venv()?;
+    let out = Command::new(&python)
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-cache-dir",
+            "--upgrade",
+            "pr-agent[github]==0.50.0",
+        ])
         .output()
-        .map_err(|e| format!("failed to run pip: {}", e))?;
+        .map_err(|e| format!("failed to run pip in {}: {}", python.display(), e))?;
     let mut s = String::from_utf8_lossy(&out.stdout).to_string();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     if out.status.success() {
         let tail: Vec<&str> = s.lines().collect();
         let start = tail.len().saturating_sub(25);
-        Ok(tail[start..].join("\n"))
+        Ok(format!(
+            "Installed into {}\n{}",
+            python.display(),
+            tail[start..].join("\n")
+        ))
     } else {
-        Err(format!("pip install failed: {}", s))
+        Err(format!(
+            "pip install failed in {}: {}",
+            python.display(),
+            s
+        ))
     }
 }
 
