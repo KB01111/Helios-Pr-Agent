@@ -91,7 +91,7 @@ export const useGh = create<GhState>((set, get) => ({
   },
 
   reset: () => {
-    oauthCancel = true;
+    flowGen++;
     batchCancel = true;
     inflight.clear();
     set({
@@ -113,7 +113,8 @@ export const useGh = create<GhState>((set, get) => ({
 }));
 
 const inflight = new Set<string>();
-let oauthCancel = false;
+let flowGen = 0; // bumped to invalidate any in-flight device flow (cancel, reset, PAT win)
+let startSeq = 0; // identifies the most recently started device flow
 let patWon = false; // a PAT sign-in finished while the device flow was still pending
 let batchCancel = false;
 
@@ -134,7 +135,7 @@ export function ghRandomSecret(): string {
 
 /* ---------- sign-in: device flow ---------- */
 export function cancelDeviceFlow() {
-  oauthCancel = true;
+  flowGen++;
   useGh.setState({ signinMsg: "Cancelling…" });
 }
 
@@ -145,14 +146,19 @@ export async function startDeviceFlow() {
     return;
   }
   lsSet("pragent.oauth_client", clientId);
-  oauthCancel = false;
+  const myGen = ++flowGen;
+  const mySeq = ++startSeq;
+  const cancelled = () => flowGen !== myGen;
+  const ui = (p: Partial<GhState>) => {
+    if (mySeq === startSeq) useGh.setState(p);
+  };
   patWon = false;
   useGh.setState({ signingIn: true, userCode: "…", signinMsg: "Starting GitHub device flow…" });
   try {
     const d = jsonObj(await tauriInvoke("github_device_start", { clientId }));
     if (!d || !d.device_code || !d.user_code) throw new Error("device flow response missing device_code/user_code");
-    if (oauthCancel) {
-      if (!patWon) useGh.setState({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
+    if (cancelled()) {
+      if (!patWon) ui({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
       return;
     }
     const uri = String(d.verification_uri || "https://github.com/login/device");
@@ -168,7 +174,7 @@ export async function startDeviceFlow() {
       /* the user can press "Open GitHub" */
     }
     let interval = Math.max(5, Number(d.interval) || 5);
-    while (!oauthCancel) {
+    while (!cancelled()) {
       let r: any = null;
       try {
         r = jsonObj(
@@ -180,14 +186,14 @@ export async function startDeviceFlow() {
           }),
         );
       } catch (e) {
-        if (oauthCancel) break;
+        if (cancelled()) break;
         if (/pending|slow_down|authorization_pending/i.test(String(e))) {
           useGh.setState({ signinMsg: "Waiting for approval…" });
           continue;
         }
         throw e;
       }
-      if (oauthCancel) break;
+      if (cancelled()) break;
       if (r && r.interval) interval = Math.max(interval, Number(r.interval) || interval);
       if (r && r.status === "authorized") {
         if (!r.access_token) throw new Error("GitHub did not return an access token");
@@ -207,12 +213,12 @@ export async function startDeviceFlow() {
       }
       useGh.setState({ signinMsg: "Waiting for approval…" });
     }
-    if (!patWon) useGh.setState({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
+    if (!patWon) ui({ signinMsg: "Login cancelled — no new token was stored.", userCode: "" });
   } catch (e) {
     useGh.setState({ userCode: "", signinMsg: "Sign-in failed: " + errText(e, 300) });
     toastErr("GitHub sign-in failed", errText(e));
   } finally {
-    useGh.setState({ signingIn: false });
+    ui({ signingIn: false });
   }
 }
 
@@ -227,7 +233,7 @@ export async function signInWithPat(pat: string): Promise<boolean> {
     useApp.getState().setSecret("github", t);
     if (gh().signingIn) {
       // Stop a pending device flow so its later response cannot replace this token.
-      oauthCancel = true;
+      flowGen++;
       patWon = true;
     }
     useGh.setState({
@@ -261,7 +267,7 @@ export async function loadRepos() {
   useGh.setState({ loadingRepos: true });
   try {
     const raw = await tauriInvoke("github_list_repos", { token: t });
-    if (!token()) return; // session was cleared while loading
+    if (token() !== t) return; // session cleared or account switched while loading
     const parsed = Array.isArray(raw) ? raw : jsonObj(raw) || [];
     const arr: any[] = Array.isArray(parsed) ? parsed : [];
     const repos: GhRepo[] = [];
@@ -304,7 +310,7 @@ export async function loadStatus(name: string, force: boolean) {
   inflight.add(name);
   try {
     const raw = await tauriInvoke("github_repo_status", { token: t, repo: name });
-    if (!token()) return; // session was cleared while loading
+    if (token() !== t) return; // session cleared or account switched while loading
     const st = jsonObj(raw);
     const value = st && !Array.isArray(st) ? st : { repo: name, error: "unexpected status response" };
     useGh.setState({ status: { ...gh().status, [name]: value } });
