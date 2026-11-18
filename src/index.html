@@ -444,8 +444,15 @@
             </div>
             <div class="gh-repo-list" id="gh-repo-list"><p class="hint">No repositories loaded — click Refresh repos.</p></div>
 
+            <div class="field"><span class="lbl">Review mode</span>
+              <select id="gh-review-mode">
+                <option value="actions" selected>GitHub Actions only (recommended: no backend needed)</option>
+                <option value="backend">Backend only (webhook; needs a public HTTPS backend)</option>
+                <option value="both">Both (a PR may get two reviews)</option>
+              </select>
+            </div>
             <div class="grid2">
-              <div class="field"><span class="lbl">Webhook secret (auto-generated when empty)</span>
+              <div class="field"><span class="lbl">Webhook secret (auto-generated when empty; backend/both modes)</span>
                 <div class="row">
                   <input id="gh-webhook-secret" type="password" placeholder="auto-generated 32-byte hex" autocomplete="off" style="flex:1" />
                   <button id="btn-gh-secret-gen" class="btn btn-outline btn-sm" type="button">Generate</button>

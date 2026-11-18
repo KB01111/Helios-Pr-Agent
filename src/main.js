@@ -839,9 +839,18 @@ function ghBaseUrl() {
 function ghOpenrouterKey() {
   return (($("int-or-key") ? $("int-or-key").value : "").trim()) || Secrets.openrouter || "";
 }
+function ghReviewMode() {
+  const v = ($("gh-review-mode") ? $("gh-review-mode").value : "actions") || "actions";
+  return v === "backend" || v === "both" ? v : "actions";
+}
 function ghHookHint() {
   const el = $("gh-hook-target");
   if (!el) return;
+  if (ghReviewMode() === "actions") {
+    el.textContent = "GitHub Actions mode: no webhook and no public backend needed. Reviews run inside GitHub.";
+    el.className = "hint";
+    return;
+  }
   const base = ghBaseUrl();
   let local = false;
   try {
@@ -1013,9 +1022,13 @@ function ghFillRowStatus(box, name) {
   const workflow = (st && st.workflow) || {};
   const secrets = (st && st.secrets) || {};
   const generic = (st && st.error) || "";
-  box.appendChild(ghStepPill("hook", st ? (webhook.configured ? "ok" : "warn") : "", webhook.error || generic));
-  box.appendChild(ghStepPill("workflow", st ? (workflow.configured ? "ok" : "warn") : "",
-    workflow.error || generic || (workflow.file ? "file: " + workflow.file : "")));
+  // A repo reviewed only by the GitHub Action needs no webhook, and a
+  // backend-only repo needs no workflow/secrets: show those steps as n/a.
+  const mode = st && st.mode;
+  box.appendChild(ghStepPill("hook", st ? (webhook.configured ? "ok" : (mode === "actions" ? "" : "warn")) : "",
+    webhook.error || generic || (mode === "actions" ? "not needed: reviews run in GitHub Actions" : "")));
+  box.appendChild(ghStepPill("workflow", st ? (workflow.configured ? "ok" : (mode === "backend" ? "" : "warn")) : "",
+    workflow.error || generic || (workflow.file ? "file: " + workflow.file : (mode === "backend" ? "not needed: the backend posts reviews" : ""))));
   let secTitle = secrets.error || generic;
   if (!secTitle && st && !secrets.configured) {
     const missing = [];
@@ -1024,10 +1037,11 @@ function ghFillRowStatus(box, name) {
     if (workflow.provider === "openrabbit" && !secrets.llm_api_key) missing.push("LLM_API_KEY");
     if (missing.length) secTitle = "missing repo secret(s): " + missing.join(", ");
   }
-  box.appendChild(ghStepPill("secrets", st ? (secrets.configured ? "ok" : "warn") : "", secTitle));
+  box.appendChild(ghStepPill("secrets", st ? (secrets.configured ? "ok" : (mode === "backend" ? "" : "warn")) : "", secTitle));
   const overall = document.createElement("span");
   overall.className = "pill ok";
-  overall.textContent = "configured ✓";
+  overall.textContent = "configured ✓" + (mode && mode !== "none" ? " (" + mode + ")" : "");
+  if (mode === "both") overall.title = "Both paths are active: a PR may receive two reviews.";
   if (!(st && st.configured)) overall.classList.add("hidden");
   box.appendChild(overall);
 }
@@ -1258,14 +1272,31 @@ async function ghUpsertAgent(repos) {
     toastErr("Agent sync failed", String(e).slice(0, 200));
   }
 }
+/* Describe a leftover review path from an earlier setup, or "" if none.
+ * `mode` is the mode just applied; `st` is the repo's fresh status payload. */
+function ghStaleReviewPath(mode, st) {
+  if (!st || mode === "both" || !st.mode || st.mode === mode || st.mode === "none") return "";
+  if (mode === "actions" && st.webhook && st.webhook.configured) {
+    return "a webhook from an earlier setup is still active, so the backend may also review PRs. " +
+      "Delete the webhook in the repo's Settings > Webhooks and remove the repo from the backend agent's targets.";
+  }
+  if (mode === "backend" && st.workflow && st.workflow.configured) {
+    return "the PR Agent workflow from an earlier setup is still committed, so GitHub Actions will also review PRs. " +
+      "Delete " + (st.workflow.path || "the workflow file") + " from the repo.";
+  }
+  return "";
+}
 async function ghConfigure(retryOnly) {
   if (ghBatchRunning) return;
   const token = Secrets.github;
   if (!token) { toastErr("GitHub setup", "Sign in with GitHub first."); return; }
+  const mode = ghReviewMode();
+  const useWebhook = mode !== "actions";   // webhook + backend agent
+  const useActions = mode !== "backend";   // workflow file + Actions secrets
   const base = ghBaseUrl();
   let parsedBase = null;
   try { parsedBase = new URL(base); } catch (_) {}
-  if (!parsedBase || !/^https?:$/.test(parsedBase.protocol)) {
+  if (useWebhook && (!parsedBase || !/^https?:$/.test(parsedBase.protocol))) {
     toastErr("GitHub setup", "Set a valid http(s) base URL in the GitHub webhook URL card (or Settings backend URL).");
     return;
   }
@@ -1275,13 +1306,13 @@ async function ghConfigure(retryOnly) {
     return;
   }
   let secret = ($("gh-webhook-secret") ? $("gh-webhook-secret").value : "").trim();
-  if (!secret) {
+  if (useWebhook && !secret) {
     secret = ghRandomSecret();
     if ($("gh-webhook-secret")) $("gh-webhook-secret").value = secret;
     ghOut("[config] generated a 32-byte webhook secret (hex).");
   }
   const orKey = ghOpenrouterKey();
-  if (!orKey) {
+  if (useActions && !orKey) {
     toastErr("GitHub setup", "Add the OpenRouter API key in the OpenRouter row above first.");
     return;
   }
@@ -1301,8 +1332,12 @@ async function ghConfigure(retryOnly) {
   if ($("btn-gh-repos-refresh")) $("btn-gh-repos-refresh").disabled = true;
   if ($("btn-gh-status-refresh")) $("btn-gh-status-refresh").disabled = true;
   try {
-    ghOut("=== Setup started: " + repos.length + " repo(s) · provider=" + provider + " · webhook base=" + base + " ===");
-    if (saveSecret) {
+    ghOut("=== Setup started: " + repos.length + " repo(s) · mode=" + mode +
+      (useActions ? " · provider=" + provider : "") + (useWebhook ? " · webhook base=" + base : "") + " ===");
+    if (mode === "both") {
+      ghOut("[warn] 'both' posts a review from the GitHub Action AND from the backend agent on every PR.");
+    }
+    if (useWebhook && saveSecret) {
       await ghSaveEnv("GITHUB_WEBHOOK_SECRET", secret);
       ghOut("[env] restart the backend to pick up .env changes.");
     }
@@ -1320,7 +1355,7 @@ async function ghConfigure(retryOnly) {
       try {
         const raw = await tauriInvoke("github_setup_repo", {
           token, repo, backendUrl: base, webhookSecret: secret,
-          openrouterKey: orKey, workflowProvider: provider,
+          openrouterKey: orKey, workflowProvider: provider, reviewMode: mode,
         });
         const r = jsonObj(raw);
         if (!r) throw new Error("unexpected setup response");
@@ -1350,12 +1385,21 @@ async function ghConfigure(retryOnly) {
       // Refresh this repo's badges once; a status failure must not abort the batch.
       await ghLoadStatus(repo, true);
       ghUpdateRow(repo);
+      // Switching modes never deletes the other path's webhook/workflow, so a
+      // repo can end up with two reviewers. Say so instead of staying silent.
+      const stale = ghStaleReviewPath(mode, ghStatus.get(repo));
+      if (stale) {
+        ghOut("[" + repo + "] warning: " + stale);
+        toastErr("Possible duplicate reviews", repo + ": " + stale);
+      }
     }
 
     ghOut("=== Done: " + successful.length + " succeeded, " + batchFailed.length + " failed ===");
     if (successful.length) toastOk("GitHub setup", successful.length + " repo(s) configured.");
     if (batchFailed.length) toastErr("GitHub setup", batchFailed.length + " repo(s) failed — use Retry failed.");
-    if (!ghBatchCancel && $("gh-agent-create") && $("gh-agent-create").checked && successful.length) {
+    // The backend agent only matters when the backend reviews PRs; in Actions
+    // mode it would just be a second, uncoordinated reviewer.
+    if (useWebhook && !ghBatchCancel && $("gh-agent-create") && $("gh-agent-create").checked && successful.length) {
       await ghUpsertAgent(successful);
     }
   } catch (e) {
@@ -1576,6 +1620,7 @@ function wire() {
   on("btn-int-or-save", () => intSave([["OPENROUTER_API_KEY", "int-or-key"]], "OpenRouter"));
   if ($("int-cloud-base")) $("int-cloud-base").addEventListener("input", intHookUrl);
   if ($("int-cloud-base")) $("int-cloud-base").addEventListener("input", ghHookHint);
+  if ($("gh-review-mode")) $("gh-review-mode").addEventListener("change", ghHookHint);
   if ($("int-or-key")) $("int-or-key").addEventListener("input", ghKeyHint);
   on("btn-int-hook-copy", async () => {
     const url = intHookUrl();
