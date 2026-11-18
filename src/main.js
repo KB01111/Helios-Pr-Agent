@@ -1272,6 +1272,20 @@ async function ghUpsertAgent(repos) {
     toastErr("Agent sync failed", String(e).slice(0, 200));
   }
 }
+/* Describe a leftover review path from an earlier setup, or "" if none.
+ * `mode` is the mode just applied; `st` is the repo's fresh status payload. */
+function ghStaleReviewPath(mode, st) {
+  if (!st || mode === "both" || !st.mode || st.mode === mode || st.mode === "none") return "";
+  if (mode === "actions" && st.webhook && st.webhook.configured) {
+    return "a webhook from an earlier setup is still active, so the backend may also review PRs. " +
+      "Delete the webhook in the repo's Settings > Webhooks and remove the repo from the backend agent's targets.";
+  }
+  if (mode === "backend" && st.workflow && st.workflow.configured) {
+    return "the PR Agent workflow from an earlier setup is still committed, so GitHub Actions will also review PRs. " +
+      "Delete " + (st.workflow.path || "the workflow file") + " from the repo.";
+  }
+  return "";
+}
 async function ghConfigure(retryOnly) {
   if (ghBatchRunning) return;
   const token = Secrets.github;
@@ -1371,6 +1385,13 @@ async function ghConfigure(retryOnly) {
       // Refresh this repo's badges once; a status failure must not abort the batch.
       await ghLoadStatus(repo, true);
       ghUpdateRow(repo);
+      // Switching modes never deletes the other path's webhook/workflow, so a
+      // repo can end up with two reviewers. Say so instead of staying silent.
+      const stale = ghStaleReviewPath(mode, ghStatus.get(repo));
+      if (stale) {
+        ghOut("[" + repo + "] warning: " + stale);
+        toastErr("Possible duplicate reviews", repo + ": " + stale);
+      }
     }
 
     ghOut("=== Done: " + successful.length + " succeeded, " + batchFailed.length + " failed ===");
