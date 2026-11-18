@@ -76,6 +76,9 @@ struct Inner {
     generation: AtomicU64,
     tray_ok: AtomicBool,
     status: Mutex<Status>,
+    /// Serialises start/stop so a concurrent pair can never leave `running` set for a
+    /// generation whose worker has already exited.
+    lifecycle: Mutex<()>,
     config: Mutex<Option<Config>>,
     wake_lock: Mutex<()>,
     wake: Condvar,
@@ -123,12 +126,13 @@ impl Inner {
     }
 
     fn stop(&self) -> Status {
-        self.generation.fetch_add(1, Ordering::SeqCst);
         let was_running = {
-            let mut s = lock(&self.status);
-            std::mem::replace(&mut s.running, false)
+            let _life = lock(&self.lifecycle);
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            let was = std::mem::replace(&mut lock(&self.status).running, false);
+            self.wake.notify_all();
+            was
         };
-        self.wake.notify_all();
         if was_running {
             self.log("daemon stopped");
             // Tell the backend right away so it stops deferring events to us.
@@ -344,6 +348,8 @@ fn start(
     };
     let cfg = Config { backend_url: backend_url.clone(), api_token: token, interval, sidecar };
 
+    // Held until the worker is spawned (or spawning failed) so stop() cannot interleave.
+    let _life = lock(&inner.lifecycle);
     // A new generation supersedes any previous loop (restart with new settings).
     let generation = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
     let model = if cfg.sidecar.is_some() { "sidecar" } else { "rules" };
@@ -363,7 +369,11 @@ fn start(
     std::thread::Builder::new()
         .name("pr-agent-daemon".into())
         .spawn(move || run_loop(worker, generation, cfg))
-        .map_err(|e| format!("could not start daemon thread: {}", e))?;
+        .map_err(|e| {
+            // No worker exists: do not leave the status claiming the daemon is running.
+            lock(&inner.status).running = false;
+            format!("could not start daemon thread: {}", e)
+        })?;
     Ok(inner.snapshot())
 }
 

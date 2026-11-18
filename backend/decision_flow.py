@@ -279,11 +279,40 @@ def _resolve_plan(eid: str, action: str, who: str | None) -> dict[str, Any]:
         return {"state": patch["state"], "action": action}
 
 
-def _mark_failed(eid: str, error: str) -> None:
+def _mark_failed(eid: str, error: str, only_if: tuple[str, ...] = ("pending", "dispatching"), stale_s: float = 0.0) -> None:
+    """Mark an evaluation failed — but only if it is still in one of ``only_if`` (and,
+    when ``stale_s`` is set, still untouched for that long), re-checked under the lock so
+    a dispatch that just completed is never overwritten with ``failed``."""
     try:
-        store.eval_update(eid, {"state": "failed", "error": error[:300]})
+        with store.eval_lock(eid) as token:
+            if token is None:
+                return
+            rec = store.eval_get(eid)
+            if rec is None or rec.get("state") not in only_if:
+                return
+            updated = _parse(rec.get("updated_at"))
+            if stale_s and (updated is None or (_utcnow() - updated).total_seconds() <= stale_s):
+                return
+            store.eval_update(eid, {"state": "failed", "error": error[:300]})
     except Exception as exc:
         log.warning("could not mark evaluation %s failed: %s", eid, exc)
+
+
+def _guard_desktop_decision(
+    rec: dict[str, Any], decision: dict[str, Any], conf_floor: float
+) -> tuple[dict[str, Any], str]:
+    """The desktop is trusted for *scoring*, never for guardrails: re-check its decision
+    against the stored facts and fall back to the cloud policy if it would skip or
+    downgrade something the guardrails protect."""
+    facts = rec.get("facts")
+    if not isinstance(facts, dict):
+        return decision, "desktop"
+    server = decider.decide(facts, conf_floor)
+    unsafe = server["reason_code"] == "SAFETY_FLAGGED" and decision["decision"] != decider.ESCALATE_HUMAN
+    bad_skip = decision["decision"] == decider.SKIP and server["decision"] != decider.SKIP
+    if unsafe or bad_skip:
+        return server, "desktop-overridden"
+    return decision, "desktop"
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +337,12 @@ async def _dispatch(eid: str, mode_of: Callable[[dict[str, Any]], str | None], d
         prepared.append({**agent, "runtime_mode": mode})
     try:
         run_ids = await _dispatch_agents(prepared, rec["pr"], {"eval_id": eid, "decision": decision}) if prepared else []
+        # enqueue_dispatch marks a run failed (instead of raising) when the queue is full.
+        records = await asyncio.to_thread(lambda: [store.rget_json(f"run:{r}") for r in run_ids])
+        if any(isinstance(r, dict) and r.get("status") == "failed" for r in records):
+            raise RuntimeError("run could not be queued (queue full?)")
     except Exception as exc:
-        await asyncio.to_thread(_mark_failed, eid, f"dispatch failed: {type(exc).__name__}")
+        await asyncio.to_thread(_mark_failed, eid, f"dispatch failed: {type(exc).__name__}", ("dispatching",))
         raise
     await asyncio.to_thread(store.eval_update, eid, {"state": "dispatched", "run_ids": run_ids})
     return run_ids
@@ -366,7 +399,9 @@ async def gate_webhook(pr: dict[str, Any], agents: list[dict[str, Any]]) -> dict
 
     facts = await fetch_facts(repo, number, str(pr.get("title", "")))
     if facts is None:
-        await asyncio.to_thread(store.eval_update, eid, {"state": "bypassed", "error": "PR files unavailable"})
+        # Fail open: release the registration so the legacy path (and GitHub's own
+        # redelivery, should that fail) is not blocked by a dedupe record.
+        await asyncio.to_thread(store.eval_delete, eid)
         return None
     auto = await asyncio.to_thread(get_autonomy)
     status = await asyncio.to_thread(desktop_status)
@@ -378,7 +413,11 @@ async def gate_webhook(pr: dict[str, Any], agents: list[dict[str, Any]]) -> dict
     await asyncio.to_thread(store.eval_update, eid, {"facts": facts})
     decision = decider.decide(facts, auto["conf_floor"])
     plan = await asyncio.to_thread(apply_decision, eid, decision, "cloud", ("pending",))
-    return await _execute_plan(eid, plan, decision)
+    try:
+        return await _execute_plan(eid, plan, decision)
+    except Exception as exc:  # already recorded as `failed`; a human can retry from the inbox
+        log.warning("dispatch for %s failed: %s", eid, type(exc).__name__)
+        return {"failed": "dispatch", "id": eid, "decision": decision}
 
 
 async def sweep() -> dict[str, int]:
@@ -407,7 +446,7 @@ async def sweep() -> dict[str, int]:
         elif state in ("pending", "dispatching"):
             updated = _parse(rec.get("updated_at"))
             if updated is not None and (now - updated).total_seconds() > STUCK_AFTER_S:
-                await asyncio.to_thread(_mark_failed, eid, f"interrupted while {state}")
+                await asyncio.to_thread(_mark_failed, eid, f"interrupted while {state}", (state,), STUCK_AFTER_S)
                 counts["failed"] += 1
     return counts
 
@@ -468,7 +507,7 @@ def build_router() -> APIRouter:
         limit: int = Query(default=50, ge=1, le=200),
     ) -> list[dict[str, Any]]:
         _auth(request)
-        records = store.eval_list(500)
+        records = store.eval_list(2000 if state else 500)
         if state:
             records = [r for r in records if r.get("state") == state]
         return [_brief(r) for r in records[:limit]]
@@ -570,7 +609,12 @@ def build_router() -> APIRouter:
             decision = decider.validate_decision(body.decision)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
-        plan = await asyncio.to_thread(apply_decision, eid, decision, body.decided_by, ("deferred",))
+        rec = await asyncio.to_thread(store.eval_get, eid)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="evaluation not found")
+        auto = await asyncio.to_thread(get_autonomy)
+        decision, decided_by = _guard_desktop_decision(rec, decision, auto["conf_floor"])
+        plan = await asyncio.to_thread(apply_decision, eid, decision, decided_by, ("deferred",))
         if "conflict" in plan:
             raise _conflict(plan)
         return await _execute_plan(eid, plan, decision)

@@ -25,9 +25,9 @@
 const PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "labeled"]);
 const DEFAULT_DELAYS_MS = [0, 1000, 3000];
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
-const MAX_PARKED_ATTEMPTS = 60; // ~1 hour of per-minute cron replays
 const KV_REPLAY_EVERY_MIN = 5; // KV free tier allows ~1000 list() calls/day
 const KV_REPLAY_BATCH = 10; // stay well inside the 50-subrequest limit
+const KV_REPLAY_WINDOW = 100; // keys listed per replay (one list() call)
 
 const enc = new TextEncoder();
 const json = (obj, status = 200) =>
@@ -149,26 +149,35 @@ export async function handleWebhook(request, env, ctx) {
 
   const delivery = request.headers.get("x-github-delivery") || crypto.randomUUID();
   const item = { body: new TextDecoder().decode(raw), event, delivery, signature };
-  ctx.waitUntil(deliver(env, item));
+  if (env.PENDING) {
+    // Failures are parked in KV and replayed by the cron, so ack GitHub right away.
+    ctx.waitUntil(deliver(env, item));
+    return json({ accepted: true, delivery }, 202);
+  }
+  // Nothing to park failures in: deliver before answering, so an outage shows up as a
+  // failed delivery in GitHub (where it can be redelivered) instead of a silent 202.
+  if ((await deliver(env, item)) === "lost") return json({ error: "backend unavailable", delivery }, 502);
   return json({ accepted: true, delivery }, 202);
 }
 
-/** Replay parked deliveries (throttled to protect the KV free tier). */
-export async function replayParked(env) {
+/**
+ * Replay parked deliveries (throttled to protect the KV free tier). Each run takes the
+ * next window of KV_REPLAY_BATCH keys (rotating with the clock), so a backlog larger than
+ * one batch is worked through instead of retrying the same first keys until they expire.
+ */
+export async function replayParked(env, slot = 0) {
   if (!env.PENDING) return { replayed: 0 };
-  const listed = await env.PENDING.list({ prefix: "pending:", limit: KV_REPLAY_BATCH });
+  const listed = await env.PENDING.list({ prefix: "pending:", limit: KV_REPLAY_WINDOW });
+  const names = listed.keys.map((k) => k.name);
+  if (!names.length) return { replayed: 0 };
+  const start = (slot * KV_REPLAY_BATCH) % names.length;
   let replayed = 0;
-  for (const { name } of listed.keys) {
+  for (let i = 0; i < Math.min(KV_REPLAY_BATCH, names.length); i++) {
+    const name = names[(start + i) % names.length];
     const stored = await env.PENDING.get(name, "json");
     if (!stored) continue;
     const result = await forward(env, stored);
-    if (result === "retry" && (stored.attempts || 0) + 1 < MAX_PARKED_ATTEMPTS) {
-      await env.PENDING.put(name, JSON.stringify({ ...stored, attempts: (stored.attempts || 0) + 1 }), {
-        expirationTtl: 24 * 3600,
-      });
-      continue;
-    }
-    if (result === "retry") console.error(`giving up on parked delivery ${stored.delivery}`);
+    if (result === "retry") continue; // stays parked until it succeeds or its 24h TTL ends
     await env.PENDING.delete(name);
     replayed += result === "ok" ? 1 : 0;
   }
@@ -193,7 +202,8 @@ export async function sweepBackend(env) {
 
 export async function runCron(env, scheduledTime = Date.now()) {
   const minute = Math.floor(scheduledTime / 60000);
-  const parked = minute % KV_REPLAY_EVERY_MIN === 0 ? await replayParked(env) : { replayed: 0 };
+  const parked =
+    minute % KV_REPLAY_EVERY_MIN === 0 ? await replayParked(env, minute / KV_REPLAY_EVERY_MIN) : { replayed: 0 };
   const sweep = await sweepBackend(env);
   return { ...parked, ...sweep };
 }

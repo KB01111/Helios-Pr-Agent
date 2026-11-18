@@ -1,7 +1,7 @@
 // Run with: node --test cloudflare-worker/
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { runCron, verifySignature, deliver } from "./worker.js";
+import worker, { runCron, verifySignature, deliver, replayParked } from "./worker.js";
 
 const SECRET = "whsec_test";
 const baseEnv = { GITHUB_WEBHOOK_SECRET: SECRET, BACKEND_URL: "https://backend.example.com", RETRY_DELAYS_MS: "0,0,0" };
@@ -184,4 +184,34 @@ test("insecure or missing BACKEND_URL never forwards", async () => {
 test("health and unknown routes", async () => {
   assert.equal((await worker.fetch(new Request("https://e/health"), baseEnv, {})).status, 200);
   assert.equal((await worker.fetch(new Request("https://e/nope"), baseEnv, {})).status, 404);
+});
+
+test("without KV an unavailable backend is a visible 502, not a silent 202", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 503 }));
+  try {
+    const resp = await post(prBody());
+    assert.equal(resp.status, 502);
+    assert.equal(f.calls.length, 3);
+  } finally {
+    f.restore();
+  }
+});
+
+test("replay rotates through a backlog bigger than one batch", async () => {
+  const kv = fakeKv();
+  for (let i = 0; i < 25; i++) {
+    await kv.put(`pending:${String(i).padStart(2, "0")}`, JSON.stringify({ body: "{}", event: "pull_request", delivery: `d${i}`, signature: "s" }));
+  }
+  const tried = new Set();
+  const f = stubFetch((url, init) => {
+    tried.add(init.headers["x-github-delivery"]);
+    return new Response("{}", { status: 503 }); // backend still down: nothing is removed
+  });
+  try {
+    for (let slot = 0; slot < 3; slot++) await replayParked({ ...baseEnv, PENDING: kv }, slot);
+    assert.equal(tried.size, 25); // every parked delivery got a turn, not just the first ten
+    assert.equal(kv.store.size, 25);
+  } finally {
+    f.restore();
+  }
 });

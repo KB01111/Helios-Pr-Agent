@@ -251,3 +251,67 @@ def test_autonomy_validation(env):
     assert env["client"].put("/autonomy", json={"level": "yolo"}).status_code == 422
     assert env["client"].put("/autonomy", json={"level": "auto", "conf_auto": 0.6, "conf_floor": 0.9}).status_code == 422
     assert env["client"].get("/autonomy").json()["level"] == "assist"
+
+
+def test_desktop_cannot_skip_or_downgrade_what_the_guardrails_protect(env):
+    heartbeat(env["client"])
+    env["facts"] = SAFETY
+    first = hook(env["client"]).json()
+    skip = {"decision": "SKIP", "confidence": 0.99, "provider": "none",
+            "reason_code": "DOCS_ONLY", "policy_version": "v1", "latency_ms": 1}
+    out = env["client"].post(f"/decisions/{first['id']}/submit", json={"decision": skip}).json()
+    assert out["escalated"] is True and out["decision"]["reason_code"] == "SAFETY_FLAGGED"
+    rec = store.eval_get(first["id"])
+    assert rec["decided_by"] == "desktop-overridden" and env["dispatched"] == []
+
+
+def test_a_desktop_skip_is_refused_when_the_cloud_policy_would_not_skip(env):
+    heartbeat(env["client"])
+    first = hook(env["client"]).json()  # TINY source change
+    skip = {"decision": "SKIP", "confidence": 0.99, "provider": "none",
+            "reason_code": "DOCS_ONLY", "policy_version": "v1", "latency_ms": 1}
+    out = env["client"].post(f"/decisions/{first['id']}/submit", json={"decision": skip}).json()
+    assert out["decision"]["decision"] == "FAST_REVIEW" and len(out["runs"]) == 1
+
+
+def test_a_full_run_queue_marks_the_evaluation_failed_not_dispatched(env, monkeypatch):
+    monkeypatch.setattr(main, "enqueue_dispatch", lambda agent, pr, run_id: main._fail_run(run_id, "run queue is full"))
+    resp = env["client"].post("/webhooks/github", json={
+        "action": "opened",
+        "pull_request": {"number": 7, "title": "t", "head": {"sha": SHA, "ref": "f"}},
+        "repository": {"full_name": "o/r"}, "sender": {"type": "User"},
+    })
+    assert resp.json()["failed"] == "dispatch"
+    rec = [r for r in store.eval_list() if r["pr_number"] == 7][0]
+    assert rec["state"] == "failed"
+
+
+def test_bypass_releases_the_registration_so_a_redelivery_is_evaluated(env, monkeypatch):
+    async def none(*_args):
+        return None
+
+    monkeypatch.setattr(decision_flow, "fetch_facts", none)
+    hook(env["client"])
+    assert store.eval_list() == []
+    monkeypatch.setattr(decision_flow, "fetch_facts", lambda *a: _facts(env))
+    assert "runs" in hook(env["client"]).json()
+
+
+async def _facts(env):
+    return env["facts"]
+
+
+def test_a_stale_failure_never_overwrites_a_completed_dispatch(env):
+    _created, rec = store.eval_register("o/r", 5, SHA, {"state": "pending"})
+    store.eval_update(rec["id"], {"state": "dispatched"})
+    decision_flow._mark_failed(rec["id"], "late", ("pending", "dispatching"))
+    assert store.eval_get(rec["id"])["state"] == "dispatched"
+
+
+def test_lock_release_is_compare_and_delete(env):
+    with store.eval_lock("abc") as token:
+        assert token
+        store.rset("evallock:abc", "someone-else")  # lease expired and was re-acquired
+    assert store.rget("evallock:abc") == "someone-else"
+    assert store.rdelete_if_equal("evallock:abc", "someone-else") is True
+    assert store.rget("evallock:abc") is None

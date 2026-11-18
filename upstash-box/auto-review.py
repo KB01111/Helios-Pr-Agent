@@ -28,7 +28,9 @@ for env_file in ("/workspace/home/.box-env", os.path.join(HOME, ".box-env")):
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+                    # The file is refreshed on every provision (reused boxes included), so it
+                    # must win over variables baked into the box when it was first created.
+                    os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -79,6 +81,16 @@ def review_with_openrouter(title, diff):
     with urllib.request.urlopen(req, timeout=300) as r:
         body = json.loads(r.read().decode())
     return body["choices"][0]["message"]["content"]
+
+
+def save_state(done):
+    """Persist the reviewed-set. A failed write must never abort the run or undo a review
+    that was already posted (the backend claim is the cross-runner guard)."""
+    try:
+        with open(STATE_PATH, "w") as f:
+            json.dump(done, f)
+    except OSError as e:
+        print(f"could not save {STATE_PATH}: {e}", flush=True)
 
 
 def claim_call(payload):
@@ -139,8 +151,7 @@ def main():
                 print(f"[{repo}#{pr['number']}] already handled elsewhere ({state}); skipping", flush=True)
                 if state != "external_claimed":  # another runner's short lease may still lapse
                     done[key] = True
-                    with open(STATE_PATH, "w") as f:
-                        json.dump(done, f)
+                    save_state(done)
                 continue
             try:
                 diff = gh(f"/repos/{repo}/pulls/{pr['number']}", diff=True)
@@ -149,8 +160,7 @@ def main():
                    method="POST",
                    payload={"body": "## 🤖 Auto-review (" + MODEL + ")\n\n" + review})
                 done[key] = True
-                with open(STATE_PATH, "w") as f:
-                    json.dump(done, f)
+                save_state(done)
                 finish_claim(repo, pr["number"], sha, claim_id, "complete")
                 print(f"[{repo}#{pr['number']}] reviewed", flush=True)
             except Exception as e:

@@ -601,6 +601,30 @@ def eval_register(
     return False, rec
 
 
+_COMPARE_AND_DELETE = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
+def rdelete_if_equal(key: str, token: str) -> bool:
+    """Atomically delete ``key`` only if it still holds ``token``.
+
+    A plain GET-then-DELETE could remove a lease that expired and was re-acquired by
+    someone else between the two calls.
+    """
+    if _REDIS is not None:
+        return bool(_REDIS.eval(_COMPARE_AND_DELETE, 1, key, token))
+    if _SDK is not None and hasattr(_SDK, "eval"):
+        return bool(_SDK.eval(_COMPARE_AND_DELETE, keys=[key], args=[token]))  # type: ignore[attr-defined]
+    if _use_rest():
+        return bool(int(_rest_cmd("EVAL", _COMPARE_AND_DELETE, "1", key, token)))  # type: ignore[arg-type]
+    with _MEM_LOCK:
+        if _mem_get(key) == token:
+            _MEM.pop(key, None)
+            return True
+        return False
+
+
 def eval_get(eid: str) -> dict | None:
     rec = rget_json(_eval_key(eid))
     return rec if isinstance(rec, dict) else None
@@ -639,8 +663,7 @@ def eval_lock(eid: str, lease_s: int = EVAL_LOCK_LEASE_S):
         yield token
     finally:
         try:
-            if rget(key) == token:
-                rdelete(key)
+            rdelete_if_equal(key, token)
         except Exception as exc:  # the lease simply expires
             log.warning("store.eval_lock release failed: %s", exc)
 

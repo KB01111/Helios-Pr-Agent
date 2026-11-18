@@ -240,13 +240,24 @@
       box.appendChild(pill(kind + ": " + (total ? c.agree + " agreed / " + c.override + " overridden" : "no feedback yet")));
     }
   }
+  let inboxSeq = 0;
   async function refreshInbox() {
+    // Only the newest response may render: periodic and action-triggered refreshes can overlap.
+    const seq = ++inboxSeq;
     try {
-      const all = await apiGet("/decisions?limit=100");
-      renderInbox(all.filter((r) => r.state === "escalated" || r.state === "failed"));
-      renderRecent(all);
-      renderStats(await apiGet("/decisions/stats"));
-    } catch (e) { $("esc-count").textContent = "backend unreachable"; $("esc-count").className = "badge err"; }
+      // Query the waiting states directly so old unresolved items never fall off a "newest N" window.
+      const [escalated, failed, recent, stats] = await Promise.all([
+        apiGet("/decisions?state=escalated&limit=200"),
+        apiGet("/decisions?state=failed&limit=200"),
+        apiGet("/decisions?limit=25"),
+        apiGet("/decisions/stats"),
+      ]);
+      if (seq !== inboxSeq) return;
+      renderInbox(escalated.concat(failed));
+      renderRecent(recent);
+      renderStats(stats);
+    } catch (e) {
+      if (seq !== inboxSeq) return; $("esc-count").textContent = "backend unreachable"; $("esc-count").className = "badge err"; }
   }
 
   /* ---------- wiring ---------- */
