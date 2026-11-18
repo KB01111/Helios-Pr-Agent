@@ -38,5 +38,5 @@ jobs:
           # Pin model via env (overrides .pr_agent.toml if both set - keep in sync)
           CONFIG__MODEL: "openrouter/thinkingmachines/inkling-2-small:free"
           CONFIG__FALLBACK_MODELS: '["openrouter/free"]'
-          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "200000"
+          CONFIG__MAX_MODEL_TOKENS: "200000"
           CONFIG__REASONING_EFFORT: "low"

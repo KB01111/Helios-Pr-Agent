@@ -602,7 +602,7 @@ jobs:
           OPENROUTER__KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CONFIG__MODEL: "openrouter/thinkingmachines/inkling-2-small:free"
           CONFIG__FALLBACK_MODELS: '["openrouter/free"]'
-          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "200000"
+          CONFIG__MAX_MODEL_TOKENS: "200000"
           CONFIG__REASONING_EFFORT: "low"
 "#;
 
@@ -1572,15 +1572,55 @@ fn github_repo_status_blocking(token: String, repo: String) -> Result<String, St
         .get("configured")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let (configured, mode) = derive_status(webhook_ok, workflow_ok, secrets_ok);
 
     serde_json::to_string(&serde_json::json!({
         "repo": repo,
         "webhook": webhook,
         "workflow": workflow,
         "secrets": secrets,
-        "configured": webhook_ok && workflow_ok && secrets_ok,
+        "configured": configured,
+        "mode": mode,
     }))
     .map_err(|e| e.to_string())
+}
+
+/// What a repo needs depends on how it is reviewed: the GitHub Action needs
+/// workflow + secrets (no backend), the backend path needs only the webhook.
+/// Returns (configured, mode) where mode is none | actions | backend | both.
+fn derive_status(webhook_ok: bool, workflow_ok: bool, secrets_ok: bool) -> (bool, &'static str) {
+    let actions_ok = workflow_ok && secrets_ok;
+    let mode = match (webhook_ok, workflow_ok) {
+        (true, true) => "both",
+        (false, true) => "actions",
+        (true, false) => "backend",
+        (false, false) => "none",
+    };
+    let configured = match mode {
+        "both" | "actions" => actions_ok,
+        "backend" => true,
+        _ => false,
+    };
+    (configured, mode)
+}
+
+/// Which setup steps a review mode performs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SetupPlan {
+    webhook: bool,
+    actions: bool,
+}
+
+/// `actions` (default): GitHub Action only - no public backend needed.
+/// `backend`: webhook only - the backend posts the review.
+/// `both`: both paths; a PR may receive two reviews.
+fn setup_plan(mode: &str) -> Result<SetupPlan, String> {
+    match mode.trim() {
+        "" | "actions" => Ok(SetupPlan { webhook: false, actions: true }),
+        "backend" => Ok(SetupPlan { webhook: true, actions: false }),
+        "both" => Ok(SetupPlan { webhook: true, actions: true }),
+        _ => Err("review_mode must be 'actions', 'backend' or 'both'".into()),
+    }
 }
 
 static SODIUM_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
@@ -1915,6 +1955,7 @@ async fn github_setup_repo(
     webhook_secret: String,
     openrouter_key: String,
     workflow_provider: String,
+    review_mode: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         github_setup_repo_blocking(
@@ -1924,6 +1965,7 @@ async fn github_setup_repo(
             webhook_secret,
             openrouter_key,
             workflow_provider,
+            review_mode.unwrap_or_default(),
         )
     })
     .await
@@ -1937,7 +1979,9 @@ fn github_setup_repo_blocking(
     webhook_secret: String,
     openrouter_key: String,
     workflow_provider: String,
+    review_mode: String,
 ) -> Result<String, String> {
+    let plan = setup_plan(&review_mode)?;
     let token = token.trim();
     if token.is_empty() {
         return Err("GitHub token is required".into());
@@ -1947,27 +1991,31 @@ fn github_setup_repo_blocking(
         return Err("repo must look like owner/name".into());
     }
     let backend = backend_url.trim().trim_end_matches('/').to_string();
-    if !(backend.starts_with("http://") || backend.starts_with("https://")) {
-        return Err("backend_url must start with http(s)://".into());
-    }
-    if webhook_secret.trim().is_empty() {
-        return Err("webhook_secret is required".into());
-    }
-    if webhook_secret.contains('\r') || webhook_secret.contains('\n') {
-        return Err("webhook_secret must be a single line".into());
-    }
-    if openrouter_key.trim().is_empty() {
-        return Err("openrouter_key is required".into());
-    }
-    if openrouter_key.contains('\r') || openrouter_key.contains('\n') {
-        return Err("openrouter_key must be a single line".into());
-    }
     // backend/.env stores trimmed values, so trim here too or webhook
     // signatures and API keys would not match what the backend loads.
     let webhook_secret = webhook_secret.trim();
     let openrouter_key = openrouter_key.trim();
-    if webhook_secret.len() > 512 {
-        return Err("webhook_secret is too long (max 512 bytes)".into());
+    if plan.webhook {
+        if !(backend.starts_with("http://") || backend.starts_with("https://")) {
+            return Err("backend_url must start with http(s)://".into());
+        }
+        if webhook_secret.is_empty() {
+            return Err("webhook_secret is required".into());
+        }
+        if webhook_secret.contains('\r') || webhook_secret.contains('\n') {
+            return Err("webhook_secret must be a single line".into());
+        }
+        if webhook_secret.len() > 512 {
+            return Err("webhook_secret is too long (max 512 bytes)".into());
+        }
+    }
+    if plan.actions {
+        if openrouter_key.is_empty() {
+            return Err("openrouter_key is required".into());
+        }
+        if openrouter_key.contains('\r') || openrouter_key.contains('\n') {
+            return Err("openrouter_key must be a single line".into());
+        }
     }
     let provider = workflow_provider.trim();
     let workflow_path = match provider {
@@ -1980,13 +2028,21 @@ fn github_setup_repo_blocking(
     let repo_api = format!("https://api.github.com/repos/{}", repo);
     let webhook_url = format!("{}/webhooks/github", backend);
 
-    let (webhook_status, webhook_error) =
-        gh_setup_webhook(&client, token, &repo_api, &webhook_url, webhook_secret);
-    let (secrets_status, secrets_error) =
-        gh_setup_secrets(&client, token, &repo_api, provider, openrouter_key);
+    let (webhook_status, webhook_error) = if plan.webhook {
+        gh_setup_webhook(&client, token, &repo_api, &webhook_url, webhook_secret)
+    } else {
+        ("skipped", None)
+    };
+    let (secrets_status, secrets_error) = if plan.actions {
+        gh_setup_secrets(&client, token, &repo_api, provider, openrouter_key)
+    } else {
+        ("skipped", None)
+    };
 
     let (default_branch, workflow_status, workflow_error): (String, &'static str, Option<String>) =
-        match gh_request_json(&client, token, reqwest::Method::GET, &repo_api, &[], None) {
+        if !plan.actions {
+            (String::new(), "skipped", None)
+        } else { match gh_request_json(&client, token, reqwest::Method::GET, &repo_api, &[], None) {
             Ok((200, body)) => {
                 let repo_json: serde_json::Value =
                     serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
@@ -2006,7 +2062,7 @@ fn github_setup_repo_blocking(
                 Some(format!("repo lookup: {}", gh_error_text(status, &body))),
             ),
             Err(e) => (String::new(), "failed", Some(format!("repo lookup: {}", e))),
-        };
+        } };
 
     let mut errors = serde_json::Map::new();
     if let Some(error) = webhook_error {
@@ -2026,9 +2082,10 @@ fn github_setup_repo_blocking(
         "secrets": secrets_status,
         "workflow": workflow_status,
         "default_branch": default_branch,
-        "workflow_path": workflow_path,
+        "workflow_path": if plan.actions { serde_json::Value::String(workflow_path.to_string()) } else { serde_json::Value::Null },
         "workflow_provider": provider,
-        "webhook_url": webhook_url,
+        "webhook_url": if plan.webhook { serde_json::Value::String(webhook_url) } else { serde_json::Value::Null },
+        "review_mode": review_mode.trim(),
     });
     if !errors.is_empty() {
         if let Some(map) = result.as_object_mut() {
@@ -2227,5 +2284,37 @@ mod runtime_tests {
         assert_eq!(healthy.unwrap(), python);
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "healthy state");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod setup_mode_tests {
+    use super::*;
+
+    #[test]
+    fn plan_maps_modes_to_steps() {
+        assert_eq!(setup_plan("").unwrap(), SetupPlan { webhook: false, actions: true });
+        assert_eq!(setup_plan("actions").unwrap(), SetupPlan { webhook: false, actions: true });
+        assert_eq!(setup_plan("backend").unwrap(), SetupPlan { webhook: true, actions: false });
+        assert_eq!(setup_plan(" both ").unwrap(), SetupPlan { webhook: true, actions: true });
+        assert!(setup_plan("everything").is_err());
+    }
+
+    #[test]
+    fn status_depends_on_the_chosen_mode() {
+        // Action-only repos are complete without a webhook.
+        assert_eq!(derive_status(false, true, true), (true, "actions"));
+        // A workflow without its secret would silently skip reviews.
+        assert_eq!(derive_status(false, true, false), (false, "actions"));
+        // Backend-only repos need no workflow or Actions secrets.
+        assert_eq!(derive_status(true, false, false), (true, "backend"));
+        assert_eq!(derive_status(true, true, true), (true, "both"));
+        assert_eq!(derive_status(false, false, false), (false, "none"));
+    }
+
+    #[test]
+    fn workflow_template_uses_current_token_setting() {
+        assert!(PR_AGENT_WORKFLOW.contains("CONFIG__MAX_MODEL_TOKENS"));
+        assert!(!PR_AGENT_WORKFLOW.contains("CUSTOM_MODEL_MAX_TOKENS"));
     }
 }

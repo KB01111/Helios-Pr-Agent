@@ -124,6 +124,17 @@ reject query-string credentials so they cannot leak through proxy logs.
 The GitHub card in **Integrations** signs in, lists your repos, and configures the
 selected ones end to end — no copy-pasting webhook URLs or Actions secrets.
 
+**Review mode** (selector on the card) decides what is configured per repo:
+
+| Mode | Configures | Needs a public backend? |
+|---|---|---|
+| **GitHub Actions only** (default) | Actions secret + workflow file | No |
+| Backend only | Webhook (+ backend agent) | Yes, public HTTPS |
+| Both | Everything | Yes. A PR gets two reviews (Action + backend comment) |
+
+Pick one path per repo to avoid duplicate reviews. Repo status badges understand the
+mode: steps a mode does not need show as "—" instead of failing.
+
 Prerequisites:
 
 - An OAuth App at `github.com/settings/developers` with **Device Flow enabled** (callback
@@ -310,6 +321,7 @@ Health: `GET /health` · status: `GET /config/status` (auth when a token is set)
 | `BACKEND_API_TOKEN` | Bearer auth on agent/run/quota/config-status + `/config/test` endpoints | empty = open (local dev only) |
 | `ALLOWED_ORIGINS` | CORS allowlist, comma-separated. Desktop dev: `tauri://localhost,http://tauri.localhost,http://localhost:1420`. Browsers need their origin listed. Most app calls go through the Rust proxy, but the live SSE stream opens directly from the webview and needs its origin here | `[]` (no cross-origin; set `*` only for local dev) |
 | `DECIDER_ENABLED` / `DECIDER_DEFER_GRACE_S` | calibrated decision layer on/off; seconds to wait for the desktop daemon before the cloud decides | `1` / `120` |
+| `REVIEW_DIFF_MAX_CHARS` | diff budget for backend `review_only` reviews. Large files share it fairly; lockfiles/binaries are dropped; a new push updates the previous review comment instead of adding another | `60000` |
 | `QUOTA_LIMIT` | vCPU-seconds per provider per month | `18000` |
 | `PORT` / `LOG_LEVEL` | server | `8000` / `INFO` |
 
