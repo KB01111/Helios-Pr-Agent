@@ -79,7 +79,7 @@ class _PagedClient:
         page = params["page"]
         self.pages.append(page)
         start = (page - 1) * 100
-        rows = [{"id": i, "body": pr.REVIEW_MARKER if i == self.marker_at else "x"} for i in range(start, min(start + 100, 250))]
+        rows = [{"id": i, "body": pr.review_marker("agent-a") if i == self.marker_at else "x"} for i in range(start, min(start + 100, 250))]
         return _Resp(200, rows)
 
 
@@ -87,7 +87,7 @@ def test_previous_review_is_found_past_the_first_page():
     import asyncio
 
     client = _PagedClient(marker_at=230)
-    found = asyncio.run(pr._find_previous_review(client, "u", {}))
+    found = asyncio.run(pr._find_previous_review(client, "u", {}, pr.review_marker("agent-a")))
     assert found == 230  # nosec B101
     assert client.pages == [1, 2, 3]  # nosec B101
 
@@ -112,3 +112,13 @@ def test_head_moved_detects_a_newer_push(monkeypatch):
     assert asyncio.run(pr._head_moved("o/r", 1, "oldsha", "t")) is True  # nosec B101
     assert asyncio.run(pr._head_moved("o/r", 1, "newsha", "t")) is False  # nosec B101
     assert asyncio.run(pr._head_moved("o/r", 1, "", "t")) is False  # nosec B101
+
+
+def test_each_agent_finds_only_its_own_review():
+    import asyncio
+
+    client = _PagedClient(marker_at=10)  # carries agent-a's marker
+    other = asyncio.run(pr._find_previous_review(client, "u", {}, pr.review_marker("agent-b")))
+    assert other is None  # nosec B101
+    assert pr.review_marker("agent-a") != pr.review_marker("agent-b")  # nosec B101
+    assert "-->" not in pr.review_marker("a>b -->x")[:-4]  # nosec B101  # input cannot close the comment early

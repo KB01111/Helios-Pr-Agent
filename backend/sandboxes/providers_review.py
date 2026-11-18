@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from .safety import safe_repo
+from .safety import safe_label, safe_repo
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +20,12 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_DIFF_BUDGET = 60000
 # Hidden marker so a new push updates the previous review instead of stacking
 # another comment on the PR.
-REVIEW_MARKER = "<!-- pr-agent-control:review -->"
+# The marker is per agent so two agents on one repo keep separate reviews.
+REVIEW_MARKER_PREFIX = "<!-- pr-agent-control:review:"
+
+
+def review_marker(agent_key: object) -> str:
+    return f"{REVIEW_MARKER_PREFIX}{safe_label(agent_key, 'pr-agent')} -->"
 
 _NOISY_SUFFIXES = (
     ".lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock",
@@ -206,14 +211,15 @@ class ReviewOnlyProvider:
             logs.append("review_only: PR head moved on while reviewing; skipping the stale comment.")
             return _result(logs, truncated, "completed_no_comment", False, agent_name)
         try:
-            body = f"{REVIEW_MARKER}\n## \U0001f916 {agent_name} (review_only, 0 CPU-sec)\n\n{review}"
+            marker = review_marker(agent_config.get("id") or agent_name)
+            body = f"{marker}\n##\U0001f916 {agent_name} (review_only, 0 CPU-sec)\n\n{review}"
             headers = {
                 "Authorization": f"Bearer {github_token}",
                 "Accept": "application/vnd.github+json",
             }
             comments_url = f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments"
             async with httpx.AsyncClient(timeout=30.0) as client:
-                existing_id = await _find_previous_review(client, comments_url, headers)
+                existing_id = await _find_previous_review(client, comments_url, headers, marker)
                 if existing_id:
                     resp = await client.patch(
                         f"{GITHUB_API}/repos/{repo}/issues/comments/{existing_id}",
@@ -234,8 +240,8 @@ class ReviewOnlyProvider:
         return _result(logs, truncated, status, posted, agent_name)
 
 
-async def _find_previous_review(client: Any, comments_url: str, headers: dict) -> int | None:
-    """Id of the newest comment carrying our marker, or None (best effort)."""
+async def _find_previous_review(client: Any, comments_url: str, headers: dict, marker: str) -> int | None:
+    """Id of the newest comment carrying this agent's marker, or None (best effort)."""
     found: int | None = None
     try:
         # Comments come oldest first; walk every page (bounded) so a busy PR
@@ -246,7 +252,7 @@ async def _find_previous_review(client: Any, comments_url: str, headers: dict) -
                 break
             batch = resp.json() or []
             for comment in batch:
-                if isinstance(comment, dict) and REVIEW_MARKER in str(comment.get("body", "")):
+                if isinstance(comment, dict) and marker in str(comment.get("body", "")):
                     found = int(comment["id"])
             if len(batch) < 100:
                 break
