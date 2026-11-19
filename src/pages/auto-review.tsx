@@ -95,6 +95,9 @@ function enableRepos(repos: string[]) {
  */
 async function enableWithSwitch(input: string[]) {
   const statuses = () => useGh.getState().status;
+  // The whole switch belongs to this sign-in: setup results and removals must not mix tokens.
+  const tok = useApp.getState().secrets.github;
+  const signInChanged = () => useApp.getState().secrets.github !== tok;
   // Classify only from a loaded status: a repo that was never read could be an OpenRabbit one.
   const unread = () =>
     input.filter((r) => {
@@ -107,11 +110,20 @@ async function enableWithSwitch(input: string[]) {
     toastErr("Enable", `Could not read the status of ${skipped.length} repo(s) (${skipped[0]}…), so they were skipped. Retry from the list.`);
   }
   const repos = input.filter((r) => !skipped.includes(r));
-  if (!repos.length) return;
+  if (!repos.length || signInChanged()) return;
 
-  const rabbit = repos.filter((r) => repoState(statuses()[r]) === "openrabbit");
+  // Classify by the workflow that is actually committed, not by the badge: an OpenRabbit
+  // repo that lacks OPENROUTER_API_KEY shows "Missing API key" but still has OpenRabbit.
+  const rabbit = repos.filter((r) => {
+    const wf = statuses()[r]?.workflow;
+    return !!wf && wf.configured && wf.provider === "openrabbit";
+  });
   const installed = await enableRepos(repos);
   for (const r of rabbit) {
+    if (signInChanged()) {
+      toastErr("Switch to PR Agent", "The GitHub sign-in changed during setup, so OpenRabbit was left in place. Check the repos and retry.");
+      break;
+    }
     if (!installed.includes(r)) {
       toastErr("Switch to PR Agent", `${r}: PR Agent setup did not finish, so OpenRabbit was left in place.`);
       continue;
@@ -453,7 +465,7 @@ function RepoRow({
   if (repo.admin) {
     if (state === "off" || state === "unknown" || state === "backend") primary = { label: "Enable", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "outdated" || state === "custom" || differs) primary = { label: "Update", run: () => enableRepos([name]), variant: "default" };
-    else if (state === "needs-key") primary = { label: "Add key", run: () => enableRepos([name]), variant: "default" };
+    else if (state === "needs-key") primary = { label: "Add key", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "openrabbit") primary = { label: "Switch to PR Agent", run: () => enableWithSwitch([name]), variant: "outline" };
     else if (state === "error") primary = { label: "Retry", run: () => loadStatus(name, true), variant: "outline" };
   }
