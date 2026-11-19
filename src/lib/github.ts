@@ -321,8 +321,11 @@ export async function loadStatus(name: string, force: boolean): Promise<void> {
   if (!force && gh().status[name]) return;
   const pending = inflight.get(name);
   if (pending) {
+    const sg0 = sessionGen;
     await pending; // dedupe ordinary requests...
     if (!force) return;
+    // ...and do not resume under another account: the caller asked about this session's token.
+    if (sg0 !== sessionGen || token() !== t) return;
     // ...but a forced refresh must not be satisfied by a request that started earlier.
     return loadStatus(name, true);
   }
@@ -350,10 +353,12 @@ export async function loadStatus(name: string, force: boolean): Promise<void> {
 
 export async function loadStatusMany(names: string[], force: boolean) {
   const queue = names.slice();
-  // Stop taking repos from the queue once the GitHub session changed (sign-out, other account).
+  // Stop taking repos from the queue once the GitHub session or token changed
+  // (sign-out, other account, PAT swap). A PAT sign-in changes the token only.
   const sg = sessionGen;
+  const tk = token();
   const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
-    while (queue.length && sg === sessionGen) await loadStatus(queue.shift() as string, force);
+    while (queue.length && sg === sessionGen && token() === tk) await loadStatus(queue.shift() as string, force);
   });
   await Promise.all(workers);
 }

@@ -109,8 +109,9 @@ fixed template it also:
   `github_action_config.pr_actions`), editing one persistent review comment instead of
   adding a new one per push; describe/improve run only when the PR opens or is marked
   ready for review, not on pushes or reopens;
-- cancels the previous run for the same PR when a new commit arrives. Only pushes cancel
-  each other, so a quick push cannot drop a description that is still being written;
+- queues runs per PR instead of cancelling them: one run at a time, and while one runs only
+  the newest waiting run is kept. A description being written is never dropped, and an older
+  review can never overwrite the review of a newer commit;
 - skips draft PRs until they are ready for review (optional);
 - only answers `/commands` on pull requests (not plain issues) from owners, members and
   collaborators, and skips cleanly with a warning when the secret is missing (e.g. fork PRs);

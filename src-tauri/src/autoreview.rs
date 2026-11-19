@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the rendered template changes in a way existing repos should pick up.
-pub const TEMPLATE_VERSION: u32 = 3;
+pub const TEMPLATE_VERSION: u32 = 4;
 /// First-line marker of a workflow this app manages.
 pub const MANAGED_MARKER: &str = "# pr-agent-control: ";
 /// Pinned so a compromised upstream branch cannot receive repository secrets.
@@ -181,11 +181,11 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # A new push cancels the review still running for the previous commit. Runs for other
-  # events (opened, ready_for_review, comments) use their own group and are never cancelled,
-  # so a quick push cannot drop the PR description that is still being written.
-  group: ${{{{ github.workflow }}}}-${{{{ github.event_name == 'pull_request' && format('pr-{{0}}-{{1}}', github.event.pull_request.number, github.event.action == 'synchronize' && 'push' || 'open') || format('run-{{0}}', github.run_id) }}}}
-  cancel-in-progress: ${{{{ github.event.action == 'synchronize' }}}}
+  # Runs for one PR are queued, one at a time. Nothing is cancelled mid-run, so a PR
+  # description being written is never dropped, and a review can never overwrite the
+  # review of a newer commit. While one runs, only the newest waiting run is kept.
+  group: ${{{{ github.workflow }}}}-${{{{ github.event_name == 'pull_request' && format('pr-{{0}}', github.event.pull_request.number) || format('run-{{0}}', github.run_id) }}}}
+  cancel-in-progress: false
 
 jobs:
   pr_agent_job:
@@ -307,9 +307,9 @@ mod tests {
         // Describe runs once when the PR opens or becomes ready, not on pushes or reopens.
         assert!(yaml.contains(&format!("github_action_config.auto_describe: {}", OPEN_ONLY)));
         assert!(yaml.contains("github_action_config.auto_improve: \"false\""));
-        assert!(yaml.contains("group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}-{1}'"));
-        // Only pushes cancel an earlier run, so open-only work is never dropped.
-        assert!(yaml.contains("cancel-in-progress: ${{ github.event.action == 'synchronize' }}"));
+        // One queue per PR: no run is cancelled mid-flight, so nothing is dropped or reordered.
+        assert!(yaml.contains("group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)"));
+        assert!(yaml.contains("cancel-in-progress: false"));
         assert!(!yaml.contains("EXTRA_INSTRUCTIONS"));
     }
 
