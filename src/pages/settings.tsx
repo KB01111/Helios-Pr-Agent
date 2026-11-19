@@ -14,6 +14,8 @@ export function SettingsPage({ active }: { active: boolean }) {
   const backend = useApp((s) => s.backend);
   const apiToken = useApp((s) => s.secrets.api);
   const openrouter = useApp((s) => s.secrets.openrouter);
+  const commandcode = useApp((s) => s.secrets.commandcode);
+  const opencodeGo = useApp((s) => s.secrets.opencodeGo);
   const setSecret = useApp((s) => s.setSecret);
 
   const [urlDraft, setUrlDraft] = React.useState(backendUrl);
@@ -73,7 +75,7 @@ export function SettingsPage({ active }: { active: boolean }) {
           </Field>
         </FieldGrid>
         <Hint>
-          Session secrets (OpenRouter, GitHub, Box, API token) live in <b>memory + sessionStorage</b> only and never touch
+          Session secrets (OpenRouter, Command Code, OpenCode Go, GitHub, Box, API token) live in <b>memory + sessionStorage</b> only and never touch
           localStorage. Credentials you explicitly save in the Integrations tab are written to <code>backend/.env</code>{" "}
           (git-ignored) by the Rust backend. Closing the window wipes sessionStorage; “Clear session secrets” wipes it
           immediately.
@@ -104,6 +106,22 @@ export function SettingsPage({ active }: { active: boolean }) {
             value={openrouter}
             placeholder="sk-or-…"
             onChange={(e) => setSecret("openrouter", e.target.value)}
+          />
+        </Field>
+        <Field label="COMMANDCODE_API_KEY" htmlFor="sett-cc" hint="Session only — shared with the Review tab.">
+          <SecretInput
+            id="sett-cc"
+            value={commandcode}
+            placeholder="Command Code API key"
+            onChange={(e) => setSecret("commandcode", e.target.value)}
+          />
+        </Field>
+        <Field label="OPENCODE_GO_API_KEY" htmlFor="sett-oc" hint="Session only — shared with the Review tab.">
+          <SecretInput
+            id="sett-oc"
+            value={opencodeGo}
+            placeholder="oc_sk_…"
+            onChange={(e) => setSecret("opencodeGo", e.target.value)}
           />
         </Field>
       </Section>

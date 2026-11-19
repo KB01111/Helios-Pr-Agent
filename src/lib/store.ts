@@ -1,9 +1,11 @@
 import { create } from "zustand";
 
-export type SecretName = "openrouter" | "github" | "box" | "api";
+export type SecretName = "openrouter" | "commandcode" | "opencodeGo" | "github" | "box" | "api";
 
 const SS_KEYS: Record<SecretName, string> = {
   openrouter: "pragent.openrouter",
+  commandcode: "pragent.commandcode",
+  opencodeGo: "pragent.opencode_go",
   github: "pragent.github",
   box: "pragent.box",
   api: "pragent.api",
@@ -51,6 +53,8 @@ function loadSecrets(): Record<SecretName, string> {
   }
   return {
     openrouter: ssGet(SS_KEYS.openrouter),
+    commandcode: ssGet(SS_KEYS.commandcode),
+    opencodeGo: ssGet(SS_KEYS.opencodeGo),
     github: ssGet(SS_KEYS.github),
     box: ssGet(SS_KEYS.box),
     api: ssGet(SS_KEYS.api),
@@ -81,6 +85,7 @@ export const TAB_IDS: TabId[] = [
 export const DEFAULT_MODEL = "openrouter/thinkingmachines/inkling-2-small:free";
 
 export interface ReviewConfig {
+  llmProvider: string; // an LLM_PROVIDERS id
   modelChoice: string; // a known option value or "custom"
   customModel: string;
   fallbacks: string;
@@ -225,12 +230,13 @@ export const useApp = create<AppState>((set, get) => ({
   wipeSecrets: () => {
     for (const k of Object.keys(SS_KEYS) as SecretName[]) ssSet(SS_KEYS[k], "");
     set({
-      secrets: { openrouter: "", github: "", box: "", api: "" },
+      secrets: { openrouter: "", commandcode: "", opencodeGo: "", github: "", box: "", api: "" },
       clearNonce: get().clearNonce + 1,
     });
   },
 
   review: {
+    llmProvider: "openrouter",
     modelChoice: DEFAULT_MODEL,
     customModel: "",
     fallbacks: "openrouter/free",
@@ -271,15 +277,69 @@ export const useApp = create<AppState>((set, get) => ({
   },
 }));
 
-export const KNOWN_MODELS = [
-  { value: DEFAULT_MODEL, label: `${DEFAULT_MODEL} (default)` },
-  { value: "openrouter/free", label: "openrouter/free (router)" },
-  { value: "openrouter/auto", label: "openrouter/auto (router)" },
-  { value: "custom", label: "custom…" },
-];
+export type LlmProviderId = "openrouter" | "commandcode" | "opencode_go";
+
+export interface LlmProvider {
+  label: string;
+  envKey: string;
+  secret: SecretName;
+  keyPlaceholder: string;
+  models: { value: string; label: string }[];
+}
+
+export const LLM_PROVIDERS: Record<LlmProviderId, LlmProvider> = {
+  openrouter: {
+    label: "OpenRouter",
+    envKey: "OPENROUTER_API_KEY",
+    secret: "openrouter",
+    keyPlaceholder: "sk-or-…",
+    models: [
+      { value: DEFAULT_MODEL, label: `${DEFAULT_MODEL} (default)` },
+      { value: "openrouter/free", label: "openrouter/free (router)" },
+      { value: "openrouter/auto", label: "openrouter/auto (router)" },
+    ],
+  },
+  commandcode: {
+    label: "Command Code",
+    envKey: "COMMANDCODE_API_KEY",
+    secret: "commandcode",
+    keyPlaceholder: "Command Code API key",
+    models: [
+      { value: "openai/deepseek/deepseek-v4-flash", label: "openai/deepseek/deepseek-v4-flash (default)" },
+      { value: "openai/Qwen/Qwen3.7-Max", label: "openai/Qwen/Qwen3.7-Max" },
+    ],
+  },
+  opencode_go: {
+    label: "OpenCode Go",
+    envKey: "OPENCODE_GO_API_KEY",
+    secret: "opencodeGo",
+    keyPlaceholder: "oc_sk_…",
+    models: [{ value: "openai/kimi-k3", label: "openai/kimi-k3 (default)" }],
+  },
+};
+
+export function toProviderId(id: string): LlmProviderId {
+  return Object.prototype.hasOwnProperty.call(LLM_PROVIDERS, id) ? (id as LlmProviderId) : "openrouter";
+}
+
+export function providerOf(id: string): LlmProvider {
+  return LLM_PROVIDERS[toProviderId(id)];
+}
+
+export function modelsForProvider(id: string): { value: string; label: string }[] {
+  return [...providerOf(id).models, { value: "custom", label: "custom…" }];
+}
+
+export function defaultModelFor(id: string): string {
+  return providerOf(id).models[0].value;
+}
+
+export function selectedProvider(): LlmProviderId {
+  return toProviderId(useApp.getState().review.llmProvider);
+}
 
 export function selectedModel(): string {
   const r = useApp.getState().review;
-  if (r.modelChoice === "custom") return r.customModel.trim() || DEFAULT_MODEL;
+  if (r.modelChoice === "custom") return r.customModel.trim() || defaultModelFor(selectedProvider());
   return r.modelChoice;
 }

@@ -1,5 +1,14 @@
 import { apiGet, apiMut, backendUrl } from "./api";
-import { KNOWN_MODELS, selectedModel, useApp, type Agent, type Run } from "./store";
+import {
+  defaultModelFor,
+  providerOf,
+  selectedModel,
+  selectedProvider,
+  toProviderId,
+  useApp,
+  type Agent,
+  type Run,
+} from "./store";
 import { errText, tauriInvoke } from "./tauri";
 import { toastErr, toastOk } from "./toast";
 
@@ -29,14 +38,21 @@ export async function loadConfig(): Promise<string> {
   const { setReview } = useApp.getState();
   try {
     const cfg = await tauriInvoke("get_config");
-    const known = KNOWN_MODELS.map((m) => m.value).filter((v) => v !== "custom");
+    const llmProvider = toProviderId(cfg.llm_provider || "openrouter");
+    const known = providerOf(llmProvider).models.map((m) => m.value);
     const isKnown = known.includes(cfg.model);
+    let fallbackList: string[] = cfg.fallback_models || [];
+    if (llmProvider !== "openrouter") {
+      fallbackList = fallbackList.filter((f) => !String(f).startsWith("openrouter/"));
+      if (!fallbackList.length) fallbackList = [defaultModelFor(llmProvider)];
+    }
     setReview({
       path: cfg.path,
       raw: cfg.raw,
+      llmProvider,
       modelChoice: isKnown ? cfg.model : "custom",
       customModel: isKnown ? "" : cfg.model,
-      fallbacks: (cfg.fallback_models || []).join(", "),
+      fallbacks: fallbackList.join(", "),
       maxTokens: String(cfg.max_model_tokens || cfg.custom_model_max_tokens || "200000"),
       effort: cfg.reasoning_effort || "low",
       autoDescribe: !!cfg.auto_describe,
@@ -54,6 +70,7 @@ export async function saveConfig(): Promise<string> {
   const r = useApp.getState().review;
   const maxTokens = r.maxTokens.trim() || "200000";
   const payload = {
+    llm_provider: selectedProvider(),
     model: selectedModel(),
     fallback_models: r.fallbacks.split(",").map((s) => s.trim()).filter(Boolean),
     max_model_tokens: maxTokens,

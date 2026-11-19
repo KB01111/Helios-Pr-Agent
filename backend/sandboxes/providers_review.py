@@ -1,10 +1,11 @@
-"""Review-only provider: zero-CPU GitHub diff review via OpenRouter.
+"""Review-only provider: zero-CPU GitHub diff review via the configured LLM provider.
 
 No sandbox is provisioned. Fetches the PR diff from GitHub, asks the
 LLM for a review, and posts it as an issue comment.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any
@@ -16,7 +17,35 @@ from .safety import safe_label, safe_repo
 log = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+OPENROUTER_URL = f"{OPENROUTER_API_BASE}/chat/completions"
+DEFAULT_LLM_PROVIDER = "openrouter"
+DEFAULT_LLM_MODEL = "thinkingmachines/inkling-2-small:free"
+OPENCODE_SESSION_HEADER = "x-opencode-session"
+
+# Command Code and OpenCode Go speak OpenAI Chat Completions; they are called
+# directly (no LiteLLM), so the leading "openai/" route prefix is stripped.
+LLM_PROVIDERS: dict[str, dict[str, Any]] = {
+    "openrouter": {
+        "label": "OpenRouter",
+        "key_envs": ("OPENROUTER_API_KEY",),
+        "api_base": OPENROUTER_API_BASE,
+        "default_model": DEFAULT_LLM_MODEL,
+    },
+    "commandcode": {
+        "label": "Command Code",
+        "key_envs": ("COMMANDCODE_API_KEY", "CMD_API_KEY"),
+        "api_base": "https://api.commandcode.ai/provider/v1",
+        "default_model": "openai/deepseek/deepseek-v4-flash",
+    },
+    "opencode_go": {
+        "label": "OpenCode Go",
+        "key_envs": ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"),
+        "api_base": "https://opencode.ai/inference/go/openai/v1",
+        "default_model": "openai/kimi-k3",
+    },
+}
+
 DEFAULT_DIFF_BUDGET = 60000
 # Hidden marker so a new push updates the previous review instead of stacking
 # another comment on the PR.
@@ -103,6 +132,45 @@ def prepare_diff(diff: str, budget: int | None = None) -> tuple[str, list[str]]:
     return "".join(ordered), notes
 
 
+def resolve_llm_provider(raw: str | None) -> str:
+    """Known provider id from LLM_PROVIDER; anything else falls back to OpenRouter."""
+    value = (raw or "").strip().lower()
+    if not value:
+        return DEFAULT_LLM_PROVIDER
+    if value in LLM_PROVIDERS:
+        return value
+    log.warning("LLM_PROVIDER is not a supported provider; using %s", DEFAULT_LLM_PROVIDER)
+    return DEFAULT_LLM_PROVIDER
+
+
+def llm_key_for(provider: str) -> tuple[str, str]:
+    """(key, env var it came from). The key is "" when unset; only the env name may be logged."""
+    envs = LLM_PROVIDERS[provider]["key_envs"]
+    for env in envs:
+        value = os.environ.get(env, "").strip()
+        if value:
+            return value, env
+    return "", envs[0]
+
+
+def opencode_session_id(repo: str, pr_number: int) -> str:
+    """Stable per-PR session id for OpenCode Go (ses_ + 24 hex chars)."""
+    digest = hashlib.sha256(f"{repo}#{pr_number}".encode()).hexdigest()
+    return f"ses_{digest[:24]}"
+
+
+def llm_chat_request(provider: str, model: str, repo: str, pr_number: int) -> tuple[str, dict[str, str], str]:
+    """(chat completions URL, extra headers, model id to send) for one review call."""
+    base = LLM_PROVIDERS[provider]["api_base"]
+    if provider == "openrouter":
+        return f"{base}/chat/completions", {}, model
+    headers: dict[str, str] = {}
+    if provider == "opencode_go":
+        headers[OPENCODE_SESSION_HEADER] = opencode_session_id(repo, pr_number)
+    send_model = model[len("openai/"):] if model.startswith("openai/") else model
+    return f"{base}/chat/completions", headers, send_model
+
+
 class ReviewOnlyProvider:
     provider_name = "review_only"
 
@@ -115,14 +183,20 @@ class ReviewOnlyProvider:
         title = pr_context.get("title", "")
 
         github_token = os.environ.get("GITHUB_TOKEN")
-        llm_key = os.environ.get("OPENROUTER_API_KEY")
-        llm_model = os.environ.get("LLM_MODEL", "thinkingmachines/inkling-2-small:free")
+        llm_provider = resolve_llm_provider(os.environ.get("LLM_PROVIDER"))
+        llm_key, llm_key_env = llm_key_for(llm_provider)
+        configured_model = os.environ.get("LLM_MODEL", "").strip()
+        if not configured_model or (
+            llm_provider != "openrouter" and configured_model.startswith("openrouter/")
+        ):
+            configured_model = LLM_PROVIDERS[llm_provider]["default_model"]
+        llm_model = configured_model
 
         if not github_token:
             logs.append("review_only: GITHUB_TOKEN missing — cannot fetch diff.")
             return _result(logs, "", "failed", False, agent_name)
         if not llm_key:
-            logs.append("review_only: OPENROUTER_API_KEY missing — cannot call LLM.")
+            logs.append(f"review_only: {llm_key_env} missing — cannot call LLM.")
             return _result(logs, "", "failed", False, agent_name)
         if not repo or pr_number is None:
             logs.append("review_only: pr_context missing repo/pr_number.")
@@ -176,15 +250,17 @@ class ReviewOnlyProvider:
                 + "Respond with a concise code review: summary, issues found "
                 "(with file/line refs), and suggested fixes."
             )
+            llm_url, extra_headers, send_model = llm_chat_request(llm_provider, llm_model, repo, pr_number)
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
-                    OPENROUTER_URL,
+                    llm_url,
                     headers={
                         "Authorization": f"Bearer {llm_key}",
                         "Content-Type": "application/json",
+                        **extra_headers,
                     },
                     json={
-                        "model": llm_model,
+                        "model": send_model,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},

@@ -57,6 +57,15 @@ try:
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
     from backend import decision_flow as decision_flow  # type: ignore[no-redef]
 
+try:
+    from sandboxes.providers_review import LLM_PROVIDERS, llm_key_for, resolve_llm_provider
+except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+    from backend.sandboxes.providers_review import (  # type: ignore[no-redef]
+        LLM_PROVIDERS,
+        llm_key_for,
+        resolve_llm_provider,
+    )
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("pr-agent.backend")
 
@@ -65,7 +74,6 @@ log = logging.getLogger("pr-agent.backend")
 # ---------------------------------------------------------------------------
 
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "thinkingmachines/inkling-2-small:free")
 
 # --- Deployment hardening (1-click config) ---
 # Comma-separated CORS allowlist, e.g. ALLOWED_ORIGINS=https://app.example.com,tauri://localhost
@@ -139,8 +147,19 @@ def _get_webhook_secret() -> str:
     return os.getenv("GITHUB_WEBHOOK_SECRET", "") or GITHUB_WEBHOOK_SECRET
 
 
+def _get_llm_provider() -> str:
+    return resolve_llm_provider(os.getenv("LLM_PROVIDER"))
+
+
 def _get_llm_model() -> str:
-    return os.getenv("LLM_MODEL", "") or LLM_MODEL
+    provider = _get_llm_provider()
+    configured = (os.getenv("LLM_MODEL", "") or "").strip()
+    # A blank value, or a stale OpenRouter route after switching providers, should
+    # fall back to the selected provider's default instead of sending an
+    # OpenRouter model id to Command Code / OpenCode Go.
+    if not configured or (provider != "openrouter" and configured.startswith("openrouter/")):
+        return LLM_PROVIDERS[provider]["default_model"]
+    return configured
 
 
 def _get_quota_limit() -> int:
@@ -778,7 +797,9 @@ def approve_run(run_id: str, request: Request, body: ApproveBody = Body(default_
 
 
 class ConfigTestBody(BaseModel):
-    provider: str = Field(description="One of: github, redis, vercel, upstash_box, openrouter")
+    provider: str = Field(
+        description="One of: github, redis, vercel, upstash_box, openrouter, commandcode, opencode_go"
+    )
 
 
 def _configured(value: str | None, min_len: int = 1) -> bool:
@@ -810,6 +831,13 @@ def config_status(request: Request) -> dict[str, Any]:
         "openrouter": {
             "configured": _configured(os.getenv("OPENROUTER_API_KEY", ""), min_len=8),
         },
+        "commandcode": {
+            "configured": _configured(llm_key_for("commandcode")[0], min_len=8),
+        },
+        "opencode_go": {
+            "configured": _configured(llm_key_for("opencode_go")[0], min_len=8),
+        },
+        "llm_provider": _get_llm_provider(),
         "model": _get_llm_model(),
         "auth_required": bool(_get_api_token()),
         "allowed_origins": ALLOWED_ORIGINS,
@@ -1027,6 +1055,52 @@ async def _test_openrouter() -> dict[str, Any]:
         }
 
 
+async def _test_openai_compatible(provider: str, models_url: str) -> dict[str, Any]:
+    import httpx
+
+    label = LLM_PROVIDERS[provider]["label"]
+    envs = " or ".join(LLM_PROVIDERS[provider]["key_envs"])
+    key, _ = llm_key_for(provider)
+    if not _configured(key, min_len=8):
+        return {
+            "provider": provider, "ok": False, "configured": False,
+            "details": f"{envs} missing — add it on the Integrations card",
+        }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                models_url,
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        if resp.status_code == 200:
+            return {
+                "provider": provider, "ok": True, "configured": True,
+                "details": f"{label} key valid",
+            }
+        if resp.status_code in (401, 403):
+            return {
+                "provider": provider, "ok": False, "configured": True,
+                "details": f"{label} key rejected (HTTP {resp.status_code})",
+            }
+        return {
+            "provider": provider, "ok": False, "configured": True,
+            "details": f"{label} API unexpected HTTP {resp.status_code}",
+        }
+    except Exception as exc:
+        return {
+            "provider": provider, "ok": False, "configured": True,
+            "details": f"{label} API unreachable ({type(exc).__name__})",
+        }
+
+
+async def _test_commandcode() -> dict[str, Any]:
+    return await _test_openai_compatible("commandcode", "https://api.commandcode.ai/provider/v1/models")
+
+
+async def _test_opencode_go() -> dict[str, Any]:
+    return await _test_openai_compatible("opencode_go", "https://opencode.ai/inference/go/v1/models")
+
+
 @app.post("/config/test")
 async def config_test(body: ConfigTestBody, request: Request) -> dict[str, Any]:
     """Live connectivity check for one provider. Never returns secret values."""
@@ -1042,9 +1116,13 @@ async def config_test(body: ConfigTestBody, request: Request) -> dict[str, Any]:
         return await _test_upstash_box()
     if provider == "openrouter":
         return await _test_openrouter()
+    if provider == "commandcode":
+        return await _test_commandcode()
+    if provider == "opencode_go":
+        return await _test_opencode_go()
     raise HTTPException(
         status_code=400,
-        detail="unknown provider (use: github, redis, vercel, upstash_box, openrouter)",
+        detail="unknown provider (use: github, redis, vercel, upstash_box, openrouter, commandcode, opencode_go)",
     )
 
 

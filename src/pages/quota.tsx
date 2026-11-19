@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { fetchQuota } from "@/lib/actions";
-import { DEFAULT_MODEL, selectedModel, useApp, type QuotaSlot } from "@/lib/store";
+import { DEFAULT_MODEL, selectedModel, selectedProvider, useApp, type QuotaSlot } from "@/lib/store";
 import { errText, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 
@@ -52,6 +52,12 @@ export function QuotaPage({ active }: { active: boolean }) {
     if (!secrets.box) return fail("Enter UPSTASH_BOX_API_KEY first.");
     const repoList = repos.trim() || picked.join(", ");
     if (!statusOnly) {
+      if (selectedProvider() !== "openrouter") {
+        return fail(
+          "Box runs currently support OpenRouter only — switch the Review provider to OpenRouter.",
+          "Switch the Review provider to OpenRouter.",
+        );
+      }
       if (!secrets.github) return fail("Enter GITHUB_TOKEN first (Settings → Connect).", "Connect GitHub first.");
       if (!secrets.openrouter) return fail("Enter OPENROUTER_API_KEY first.");
       if (!repoList) return fail("Enter at least one repo.");

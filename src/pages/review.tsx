@@ -8,7 +8,15 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { loadConfig, saveConfig } from "@/lib/actions";
-import { DEFAULT_MODEL, KNOWN_MODELS, useApp } from "@/lib/store";
+import {
+  LLM_PROVIDERS,
+  defaultModelFor,
+  modelsForProvider,
+  selectedProvider,
+  toProviderId,
+  useApp,
+  type LlmProviderId,
+} from "@/lib/store";
 import { errText, openUrl, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 
@@ -23,7 +31,9 @@ const EFFORTS = [
 export function ReviewPage({ active }: { active: boolean }) {
   const review = useApp((s) => s.review);
   const setReview = useApp((s) => s.setReview);
-  const openrouter = useApp((s) => s.secrets.openrouter);
+  const providerId = toProviderId(review.llmProvider);
+  const provider = LLM_PROVIDERS[providerId];
+  const llmKey = useApp((s) => s.secrets[provider.secret]);
   const github = useApp((s) => s.secrets.github);
   const setSecret = useApp((s) => s.setSecret);
 
@@ -50,9 +60,17 @@ export function ReviewPage({ active }: { active: boolean }) {
     }
   };
 
+  const changeProvider = (id: LlmProviderId) =>
+    setReview({
+      llmProvider: id,
+      modelChoice: defaultModelFor(id),
+      customModel: "",
+      fallbacks: id === "openrouter" ? "openrouter/free" : defaultModelFor(id),
+    });
+
   const runLocal = async () => {
     if (!url) return toastErr("Review", "Enter a PR URL first.");
-    if (!openrouter) return toastErr("Review", "Enter OPENROUTER_API_KEY first (session only).");
+    if (!llmKey) return toastErr("Review", `Enter ${provider.envKey} first (session only).`);
     if (!github) {
       setOut("GitHub token required. Connect GitHub in Settings → GitHub, then retry.");
       return toastErr("Review", "Connect GitHub first (Settings → GitHub).");
@@ -63,7 +81,8 @@ export function ReviewPage({ active }: { active: boolean }) {
         prUrl: url,
         command: cmd,
         question: question(),
-        openrouterKey: openrouter,
+        llmProvider: selectedProvider(),
+        llmKey,
         githubToken: github,
       });
       setOut(r || "(empty output)");
@@ -82,7 +101,7 @@ export function ReviewPage({ active }: { active: boolean }) {
   return (
     <Page active={active}>
       <Section
-        title="1 · Model (OpenRouter free)"
+        title="1 · Model & provider"
         description="Written to the repo's .pr_agent.toml and applied to every review the app runs."
         action={<Badge variant="outline">.pr_agent.toml</Badge>}
         footer={
@@ -97,13 +116,27 @@ export function ReviewPage({ active }: { active: boolean }) {
           </ButtonRow>
         }
       >
+        <Field label="LLM provider" htmlFor="llm-provider">
+          <Select value={providerId} onValueChange={(v) => changeProvider(toProviderId(v))}>
+            <SelectTrigger id="llm-provider" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(LLM_PROVIDERS) as LlmProviderId[]).map((id) => (
+                <SelectItem key={id} value={id}>
+                  {LLM_PROVIDERS[id].label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
         <Field label="Model" htmlFor="model">
           <Select value={review.modelChoice} onValueChange={(v) => setReview({ modelChoice: v })}>
             <SelectTrigger id="model" className="w-full">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {KNOWN_MODELS.map((m) => (
+              {modelsForProvider(providerId).map((m) => (
                 <SelectItem key={m.value} value={m.value}>
                   {m.label}
                 </SelectItem>
@@ -116,7 +149,7 @@ export function ReviewPage({ active }: { active: boolean }) {
             <Input
               id="custom-model"
               value={review.customModel}
-              placeholder={`openrouter/org/model:free  (blank → ${DEFAULT_MODEL})`}
+              placeholder={`${defaultModelFor(providerId)}  (blank → default)`}
               onChange={(e) => setReview({ customModel: e.target.value })}
               autoComplete="off"
             />
@@ -232,12 +265,12 @@ export function ReviewPage({ active }: { active: boolean }) {
               </SelectContent>
             </Select>
           </Field>
-          <Field label="OPENROUTER_API_KEY" htmlFor="or-key" hint="Session only — never saved to disk.">
+          <Field label={provider.envKey} htmlFor="or-key" hint="Session only — never saved to disk.">
             <SecretInput
               id="or-key"
-              value={openrouter}
-              placeholder="sk-or-…"
-              onChange={(e) => setSecret("openrouter", e.target.value)}
+              value={llmKey}
+              placeholder={provider.keyPlaceholder}
+              onChange={(e) => setSecret(provider.secret, e.target.value)}
             />
           </Field>
         </FieldGrid>
