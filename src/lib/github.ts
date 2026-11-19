@@ -659,6 +659,8 @@ export interface DisableOptions {
   removeSecrets: boolean;
   /** Exact webhook URL registered for this backend; only that hook is removed. */
   webhookUrl?: string;
+  /** Remove only the OpenRabbit workflow (switching reviewers), keep pr-agent.yml. */
+  keepPrAgent?: boolean;
 }
 
 /** Remove the review workflow (and optionally webhook/secrets) from each repo. */
@@ -691,6 +693,7 @@ export async function disableRepos(repos: string[], opts: DisableOptions): Promi
             removeWebhook: opts.removeWebhook,
             removeSecrets: opts.removeSecrets,
             webhookUrl: opts.webhookUrl,
+            keepPrAgent: opts.keepPrAgent,
           }),
         );
         if (stale()) break;

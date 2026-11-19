@@ -2215,6 +2215,7 @@ async fn github_disable_repo(
     remove_webhook: Option<bool>,
     remove_secrets: Option<bool>,
     webhook_url: Option<String>,
+    keep_pr_agent: Option<bool>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         github_disable_repo_blocking(
@@ -2223,6 +2224,7 @@ async fn github_disable_repo(
             remove_webhook.unwrap_or(true),
             remove_secrets.unwrap_or(false),
             webhook_url,
+            keep_pr_agent.unwrap_or(false),
         )
     })
     .await
@@ -2235,6 +2237,7 @@ fn github_disable_repo_blocking(
     remove_webhook: bool,
     remove_secrets: bool,
     webhook_url: Option<String>,
+    keep_pr_agent: bool,
 ) -> Result<String, String> {
     let token = token.trim();
     if token.is_empty() {
@@ -2252,15 +2255,20 @@ fn github_disable_repo_blocking(
         Ok(branch) => {
             let mut removed = 0;
             let mut failed = Vec::new();
-            for path in [".github/workflows/pr-agent.yml", ".github/workflows/openrabbit.yml"] {
-                match gh_delete_file(
-                    &client,
-                    token,
-                    &repo_api,
-                    &branch,
-                    path,
+            // Switching reviewers removes only the OpenRabbit file and keeps PR Agent's.
+            let (paths, message): (&[&str], &str) = if keep_pr_agent {
+                (
+                    &[".github/workflows/openrabbit.yml"],
+                    "chore: remove OpenRabbit workflow, replaced by PR Agent (PR Agent Control)",
+                )
+            } else {
+                (
+                    &[".github/workflows/pr-agent.yml", ".github/workflows/openrabbit.yml"],
                     "chore: disable PR Agent auto review (PR Agent Control)",
-                ) {
+                )
+            };
+            for path in paths.iter().copied() {
+                match gh_delete_file(&client, token, &repo_api, &branch, path, message) {
                     Ok("removed") => removed += 1,
                     Ok(_) => {}
                     Err(e) => failed.push(e),

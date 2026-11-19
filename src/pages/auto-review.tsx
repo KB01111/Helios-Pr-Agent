@@ -88,15 +88,27 @@ function enableRepos(repos: string[]) {
   });
 }
 
-/** OpenRabbit repos: remove that workflow first so a PR does not get two reviewers. */
-async function switchToPrAgent(repo: string) {
-  const removed = await disableRepos([repo], { removeWebhook: false, removeSecrets: false });
-  if (!removed) {
-    // Installing PR Agent now would leave two reviewers on every PR.
-    toastErr("Switch to PR Agent", `Could not remove the OpenRabbit workflow from ${repo}; nothing was installed.`);
-    return;
+/**
+ * Install PR Agent on every repo. Repos reviewed by OpenRabbit are switched safely:
+ * the OpenRabbit workflow is removed only after PR Agent is confirmed installed, so
+ * invalid settings or a failed install never leave a repo without a reviewer.
+ */
+async function enableWithSwitch(repos: string[]) {
+  const rabbit = repos.filter((r) => repoState(useGh.getState().status[r]) === "openrabbit");
+  await enableRepos(repos);
+  for (const r of rabbit) {
+    if (repoState(useGh.getState().status[r]) !== "on") {
+      toastErr("Switch to PR Agent", `${r}: PR Agent was not installed, so OpenRabbit was left in place.`);
+      continue;
+    }
+    const removed = await disableRepos([r], { removeWebhook: false, removeSecrets: false, keepPrAgent: true });
+    if (!removed) {
+      toastErr(
+        "Switch to PR Agent",
+        `${r}: PR Agent is installed but OpenRabbit could not be removed, so both may review. Delete .github/workflows/openrabbit.yml.`,
+      );
+    }
   }
-  await enableRepos([repo]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -428,7 +440,7 @@ function RepoRow({
     if (state === "off" || state === "unknown" || state === "backend") primary = { label: "Enable", run: () => enableRepos([name]), variant: "default" };
     else if (state === "outdated" || state === "custom" || differs) primary = { label: "Update", run: () => enableRepos([name]), variant: "default" };
     else if (state === "needs-key") primary = { label: "Add key", run: () => enableRepos([name]), variant: "default" };
-    else if (state === "openrabbit") primary = { label: "Switch to PR Agent", run: () => switchToPrAgent(name), variant: "outline" };
+    else if (state === "openrabbit") primary = { label: "Switch to PR Agent", run: () => enableWithSwitch([name]), variant: "outline" };
     else if (state === "error") primary = { label: "Retry", run: () => loadStatus(name, true), variant: "outline" };
   }
   const active = isActive(state) || state === "needs-key";
@@ -539,6 +551,13 @@ function DisableDialog({ repos, onClose }: { repos: string[]; onClose: () => voi
   const [removeWebhook, setRemoveWebhook] = React.useState(true);
   const [removeSecrets, setRemoveSecrets] = React.useState(false);
   const open = repos.length > 0;
+  // The dialog stays mounted: start every confirmation from the safe defaults.
+  React.useEffect(() => {
+    if (open) {
+      setRemoveWebhook(true);
+      setRemoveSecrets(false);
+    }
+  }, [open, repos]);
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
       <DialogContent>
@@ -595,7 +614,7 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
   const [pulls, setPulls] = React.useState<PullSummary[] | null>(null);
   const [error, setError] = React.useState("");
   const [picked, setPicked] = React.useState<number | null>(null);
-  const [posted, setPosted] = React.useState("");
+  const [posted, setPosted] = React.useState<{ repo: string; number: number; url: string } | null>(null);
 
   React.useEffect(() => {
     if (!repo) return;
@@ -603,7 +622,7 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
     setPulls(null);
     setError("");
     setPicked(null);
-    setPosted("");
+    setPosted(null);
     listPulls(repo)
       .then((p) => {
         if (!live) return;
@@ -618,10 +637,12 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
 
   const run = (cmd: PrCommand) => async () => {
     if (!repo || picked == null) return;
+    const number = picked;
     try {
-      const url = await prCommand(repo, picked, cmd);
-      setPosted(url);
-      toastOk("Command posted", `${cmd} on ${repo}#${picked} — the Action starts in a few seconds.`);
+      const url = await prCommand(repo, number, cmd);
+      // Remember which PR the link belongs to; it is shown only for that selection.
+      setPosted({ repo, number, url });
+      toastOk("Command posted", `${cmd} on ${repo}#${number} — the Action starts in a few seconds.`);
     } catch (e) {
       toastErr("Command failed", errText(e, 220));
     }
@@ -664,8 +685,8 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
             ))}
           </div>
         )}
-        {posted ? (
-          <Button variant="link" size="sm" className="justify-self-start px-0" onClick={() => openUrl(posted)}>
+        {posted && posted.repo === repo && posted.number === picked ? (
+          <Button variant="link" size="sm" className="justify-self-start px-0" onClick={() => openUrl(posted.url)}>
             <ExternalLink /> Open the comment on GitHub
           </Button>
         ) : null}
@@ -723,7 +744,6 @@ function ReposCard({ active }: { active: boolean }) {
   const counts = {
     active: views.filter((v) => isActive(v.state)).length,
     attention: views.filter((v) => needsAttention(v.state, v.differs)).length,
-    unchecked: views.filter((v) => v.state === "unknown" && v.repo.admin).length,
   };
   const q = query.trim().toLowerCase();
   const visible = views.filter((v) => {
@@ -733,8 +753,10 @@ function ReposCard({ active }: { active: boolean }) {
     if (filter === "off") return v.state === "off";
     return true;
   });
+  // The button's count and its action use the same candidates: the repos shown, not yet checked.
+  const uncheckedVisible = visible.filter((v) => v.state === "unknown" && v.repo.admin);
   const checkMore = () => {
-    const todo = visible.filter((v) => v.state === "unknown" && v.repo.admin).slice(0, AUTO_CHECK).map((v) => v.repo.full_name);
+    const todo = uncheckedVisible.slice(0, AUTO_CHECK).map((v) => v.repo.full_name);
     if (!todo.length) return toastOk("Status", "Every listed repository has been checked.");
     return loadStatusMany(todo, false);
   };
@@ -796,8 +818,8 @@ function ReposCard({ active }: { active: boolean }) {
             <AsyncButton variant="outline" size="sm" disabled={batchRunning || loadingRepos} onClick={loadRepos}>
               <RefreshCw /> Refresh list
             </AsyncButton>
-            <AsyncButton variant="outline" size="sm" disabled={batchRunning || !counts.unchecked} onClick={checkMore}>
-              <RefreshCw /> Check status{counts.unchecked ? ` (${Math.min(counts.unchecked, AUTO_CHECK)} more)` : ""}
+            <AsyncButton variant="outline" size="sm" disabled={batchRunning || !uncheckedVisible.length} onClick={checkMore}>
+              <RefreshCw /> Check status{uncheckedVisible.length ? ` (${Math.min(uncheckedVisible.length, AUTO_CHECK)} more)` : ""}
             </AsyncButton>
             {updatable.length ? (
               <AsyncButton size="sm" disabled={batchRunning || !optionsOk} onClick={() => enableRepos(updatable)}>
@@ -823,7 +845,7 @@ function ReposCard({ active }: { active: boolean }) {
           {selected.length ? (
             <div className="bg-muted/40 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2">
               <span className="text-sm font-medium">{selected.length} selected</span>
-              <AsyncButton size="sm" disabled={batchRunning || !optionsOk} onClick={() => enableRepos(selected.slice())}>
+              <AsyncButton size="sm" disabled={batchRunning || !optionsOk} onClick={() => enableWithSwitch(selected.slice())}>
                 <Rocket /> Enable / update ({selected.length})
               </AsyncButton>
               {selectedActive.length ? (
