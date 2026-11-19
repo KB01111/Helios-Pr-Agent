@@ -8,8 +8,9 @@ repositories, plus the PR-Agent harness itself. Two review engines supported:
 - **OpenRabbit** ([aryanbrite/openrabbit](https://github.com/aryanbrite/openrabbit)) — simplest
   zero-host setup, fully automatic reviews on every PR via GitHub Actions.
 
-Both run on **OpenRouter free models** (default
-`thinkingmachines/inkling-2-small:free`). No paid API needed.
+Both run on **OpenRouter free models** by default
+(`thinkingmachines/inkling-2-small:free`). No paid API needed. The app can also use
+**Command Code** and **OpenCode Go** keys for local and backend reviews.
 
 ## Download (Windows)
 
@@ -52,7 +53,9 @@ Python 3.12+ for local CLI reviews (or set `PR_AGENT_BASE_PYTHON` to a 3.12+ int
   `pr-agent[github]==0.50.0` there, so the backend's Python packages are not touched.
   Override the location with `PR_AGENT_VENV` (and the base interpreter with
   `PR_AGENT_BASE_PYTHON`).
-- **OpenRouter key** in the Review card (session only).
+- An **LLM key** in the Review card (session only): OpenRouter (`sk-or-...`),
+  Command Code, or OpenCode Go (`oc_sk_...`). The provider selector chooses which
+  key and endpoint the run uses.
 
 <!-- coderabbit-ai-generated:v1 -->
 
@@ -79,7 +82,8 @@ private repos, the GitHub token needs `repo` scope.
 4. **Quota** — Upstash Box / Vercel Sandbox vCPU-second usage.
 5. **Providers** — write `.github/workflows/pr-agent.yml` or `openrabbit.yml` into any local
    repo, ready to commit.
-6. **Integrations** — paste provider tokens; **Connect** writes them to `backend/.env` via
+6. **Integrations** — paste provider tokens (GitHub, Vercel, Box, Redis, OpenRouter,
+   Command Code, OpenCode Go); **Connect** writes them to `backend/.env` via
    the Rust backend, then **Test** hits the live provider APIs. The GitHub card also
    configures webhooks, secrets, and workflows for selected repos in one click (see below).
 7. **Settings** — backend URL/API token, GitHub OAuth (device flow or PAT), and desktop keys.
@@ -99,7 +103,7 @@ private repos, the GitHub token needs `repo` scope.
 
 ## 1-click setup (Integrations tab)
 
-The desktop app's **Integrations** tab connects all five providers without touching
+The desktop app's **Integrations** tab connects all seven providers without touching
 a terminal. Status dots show what is configured; **Test** hits a live check;
 **Connect** writes the token to `backend/.env` via the Tauri backend (git-ignored,
 never `localStorage`) — restart/redeploy the backend afterwards so it picks up
@@ -112,6 +116,35 @@ the new values.
 | Upstash Box | `UPSTASH_BOX_API_KEY` | key format + non-destructive API reachability probe |
 | Redis | `REDIS_URL` (FastAPI Cloud / Redis Cloud) or Upstash REST URL + token | `PING` (fallback write/read roundtrip) |
 | OpenRouter | `OPENROUTER_API_KEY` | `GET openrouter.ai/api/v1/auth/key` |
+| Command Code | `COMMANDCODE_API_KEY` (`CMD_API_KEY` is accepted) | `GET api.commandcode.ai/provider/v1/models` |
+| OpenCode Go | `OPENCODE_GO_API_KEY` (`OPENCODE_API_KEY` is accepted) | `GET opencode.ai/inference/go/v1/models` |
+
+### LLM provider routing
+
+The Review card's provider selector writes the matching PR-Agent route into
+`.pr_agent.toml` (the key is always injected by environment variable):
+
+| Provider | PR-Agent model prefix | PR-Agent config | Key env |
+|---|---|---|---|
+| OpenRouter | `openrouter/` | `[openrouter]` | `OPENROUTER__KEY` |
+| Command Code | `openai/` | `[openai] api_base = "https://api.commandcode.ai/provider/v1"` | `OPENAI__KEY` |
+| OpenCode Go | `openai/` | `[openai] api_base = "https://opencode.ai/inference/go/openai/v1"` | `OPENAI__KEY` |
+
+The Review card's selector controls local CLI runs. For backend/webhook reviews,
+use the Integrations card's **Backend LLM provider** control (or set
+`LLM_PROVIDER` in `backend/.env`, default `openrouter`); restart/redeploy the
+backend afterwards. The Integrations status line shows the backend's current value.
+
+Command Code and OpenCode Go use their OpenAI-compatible `/chat/completions`
+endpoints. Claude models on Command Code are served from `/messages`, which
+PR-Agent's generic OpenAI route does not use; pick an OpenAI/open model id there.
+OpenCode Go recommends an `x-opencode-session` header. The direct backend
+`review_only` path sends it, and local CLI runs set `LITELLM__EXTRA_HEADERS` so
+PR-Agent's LiteLLM handler forwards the same stable per-PR id.
+
+The Upstash Box runner and the generated GitHub Actions workflow still use
+OpenRouter. The desktop app blocks Box provisioning unless the Review provider is
+OpenRouter, so a Command Code / OpenCode Go model is never sent to the wrong endpoint.
 
 `GET /config/status` returns booleans/mode only — secret values are never echoed.
 With `BACKEND_API_TOKEN` set, agent CRUD, run history/approval, quota,
@@ -315,7 +348,11 @@ Health: `GET /health` · status: `GET /config/status` (auth when a token is set)
 |---|---|---|
 | `GITHUB_WEBHOOK_SECRET` | verifying `X-Hub-Signature-256` on `/webhooks/github` | empty = dev mode (accepts unsigned, logs warning) |
 | `GITHUB_TOKEN` | fetching diffs + posting review comments | — |
-| `OPENROUTER_API_KEY` / `LLM_MODEL` | reviews | model default `thinkingmachines/inkling-2-small:free` |
+| `LLM_PROVIDER` | selects the review LLM: `openrouter`, `commandcode`, or `opencode_go` | `openrouter` |
+| `LLM_MODEL` | override the selected provider's model | blank = provider default (`thinkingmachines/inkling-2-small:free`, `openai/deepseek/deepseek-v4-flash`, or `openai/kimi-k3`) |
+| `OPENROUTER_API_KEY` | OpenRouter reviews | — |
+| `COMMANDCODE_API_KEY` (or `CMD_API_KEY`) | Command Code reviews | — |
+| `OPENCODE_GO_API_KEY` (or `OPENCODE_API_KEY`) | OpenCode Go reviews | — |
 | `REDIS_URL` **or** `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | shared state (agents, runs, quota). `REDIS_URL` wins when both are set; FastAPI Cloud injects it from the Redis Cloud integration | unset = in-memory fallback |
 | `UPSTASH_BOX_API_KEY` | interactive (warm-box) runs | — |
 | `VERCEL_TOKEN` (or `VERCEL_API_TOKEN`), `VERCEL_TEAM_ID` | ephemeral sandbox runs | — |

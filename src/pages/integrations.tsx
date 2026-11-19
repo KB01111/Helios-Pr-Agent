@@ -21,13 +21,13 @@ import {
   type ReviewMode,
   type WorkflowProvider,
 } from "@/lib/github";
-import { useApp } from "@/lib/store";
+import { LLM_PROVIDERS, useApp, type LlmProviderId } from "@/lib/store";
 import { errText, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
 type Dot = "ok" | "warn" | "err" | "idle";
-type ProviderKey = "github" | "vercel" | "upstash_box" | "redis" | "openrouter";
+type ProviderKey = "github" | "vercel" | "upstash_box" | "redis" | "openrouter" | "commandcode" | "opencode_go";
 
 /* ------------------------------------------------------------------ */
 /* Connections                                                         */
@@ -70,6 +70,9 @@ const EMPTY_DRAFTS = {
   redisUrl: "",
   redisToken: "",
   orKey: "",
+  ccKey: "",
+  ocKey: "",
+  llmProvider: "openrouter",
 };
 type Drafts = typeof EMPTY_DRAFTS;
 
@@ -87,6 +90,8 @@ function ConnectionsCard({
     upstash_box: "warn",
     redis: "warn",
     openrouter: "warn",
+    commandcode: "warn",
+    opencode_go: "warn",
   });
   const [badge, setBadge] = React.useState<{ text: string; tone: "outline" | "success" | "danger" }>({
     text: "not checked",
@@ -115,6 +120,8 @@ function ConnectionsCard({
       box: !!(data && data.upstash_box && data.upstash_box.configured),
       redis: !!redis.configured,
       openrouter: !!(data && data.openrouter && data.openrouter.configured),
+      commandcode: !!(data && data.commandcode && data.commandcode.configured),
+      opencodeGo: !!(data && data.opencode_go && data.opencode_go.configured),
     };
     setDots({
       github: ok.githubFull ? "ok" : "warn",
@@ -122,9 +129,14 @@ function ConnectionsCard({
       upstash_box: ok.box ? "ok" : "warn",
       redis: ok.redis ? "ok" : "warn",
       openrouter: ok.openrouter ? "ok" : "warn",
+      commandcode: ok.commandcode ? "ok" : "warn",
+      opencode_go: ok.opencodeGo ? "ok" : "warn",
     });
-    const n = [ok.githubFull, ok.vercel, ok.box, ok.redis, ok.openrouter].filter(Boolean).length;
-    setBadge({ text: `${n}/5 connected`, tone: n === 5 ? "success" : "outline" });
+    const all = [ok.githubFull, ok.vercel, ok.box, ok.redis, ok.openrouter, ok.commandcode, ok.opencodeGo];
+    const n = all.filter(Boolean).length;
+    setBadge({ text: `${n}/7 connected`, tone: n === 7 ? "success" : "outline" });
+    const llm = (data && data.llm_provider) || "openrouter";
+    if (data && data.llm_provider) setDrafts((d) => ({ ...d, llmProvider: String(data.llm_provider) }));
     setOut(
       [
         `github: ${github.token_set ? "token set" : "token MISSING"} · ${github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"}`,
@@ -136,10 +148,13 @@ function ConnectionsCard({
             : "not configured — FastAPI Cloud injects REDIS_URL; for local/self-hosted save a Redis URL (or the Upstash REST pair) then Test"
         }`,
         `openrouter: ${ok.openrouter ? "configured" : "not configured"}`,
+        `commandcode: ${ok.commandcode ? "configured" : "not configured"}`,
+        `opencode_go: ${ok.opencodeGo ? "configured" : "not configured"}`,
+        `llm provider (backend): ${llm}`,
         `auth: ${data && data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"}`,
       ].join("\n"),
     );
-  }, []);
+  }, [setDrafts]);
 
   React.useEffect(() => {
     void refresh();
@@ -179,6 +194,8 @@ function ConnectionsCard({
           for (const [key, val] of todo) {
             if (key === "GITHUB_TOKEN") setSecret("github", val);
             if (key === "OPENROUTER_API_KEY") setSecret("openrouter", val);
+            if (key === "COMMANDCODE_API_KEY") setSecret("commandcode", val);
+            if (key === "OPENCODE_GO_API_KEY") setSecret("opencodeGo", val);
             if (key === "UPSTASH_BOX_API_KEY") setSecret("box", val);
           }
           if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
@@ -191,7 +208,11 @@ function ConnectionsCard({
         const savedKeys = todo.map(([k]) => k).join(", ");
         setOut(`Saved ${savedKeys} to ${Array.from(paths).join(", ")}.\nRestart/redeploy the backend so it picks up the new values, then Test.`);
         toastOk("Saved", `${savedKeys} → backend/.env`);
-        void refresh();
+        // The backend still reports the old provider until it restarts: keep the saved choice in the select.
+        const savedLlm = todo.find(([key]) => key === "LLM_PROVIDER")?.[1];
+        void refresh().then(() => {
+          if (savedLlm) patch({ llmProvider: savedLlm });
+        });
       } catch (e) {
         setOut(`Save failed: ${errText(e, 300)}\n(Outside the desktop app? Set these env vars where the backend runs instead.)`);
         toastErr("Save failed", errText(e, 220));
@@ -394,6 +415,79 @@ function ConnectionsCard({
         <ButtonRow>
           <AsyncButton size="sm" onClick={save([["OPENROUTER_API_KEY", "orKey"]], "OpenRouter")}>
             <Plug /> Connect OpenRouter
+          </AsyncButton>
+        </ButtonRow>
+      </div>
+      <Separator />
+
+      {/* Command Code */}
+      <div className="grid gap-3">
+        <ConnectionHead
+          name="Command Code"
+          hint="LLM key for reviews (OpenAI-compatible)"
+          dot={dots.commandcode}
+          onTest={test("commandcode")}
+        />
+        <Field label="API key" htmlFor="int-cc-key">
+          <SecretInput
+            id="int-cc-key"
+            value={drafts.ccKey}
+            placeholder={LLM_PROVIDERS.commandcode.keyPlaceholder}
+            onChange={(e) => patch({ ccKey: e.target.value })}
+          />
+        </Field>
+        <ButtonRow>
+          <AsyncButton size="sm" onClick={save([["COMMANDCODE_API_KEY", "ccKey"]], "Command Code")}>
+            <Plug /> Connect Command Code
+          </AsyncButton>
+        </ButtonRow>
+      </div>
+      <Separator />
+
+      {/* OpenCode Go */}
+      <div className="grid gap-3">
+        <ConnectionHead
+          name="OpenCode Go"
+          hint="LLM key for reviews (OpenAI-compatible)"
+          dot={dots.opencode_go}
+          onTest={test("opencode_go")}
+        />
+        <Field label="API key" htmlFor="int-oc-key">
+          <SecretInput
+            id="int-oc-key"
+            value={drafts.ocKey}
+            placeholder={LLM_PROVIDERS.opencode_go.keyPlaceholder}
+            onChange={(e) => patch({ ocKey: e.target.value })}
+          />
+        </Field>
+        <ButtonRow>
+          <AsyncButton size="sm" onClick={save([["OPENCODE_GO_API_KEY", "ocKey"]], "OpenCode Go")}>
+            <Plug /> Connect OpenCode Go
+          </AsyncButton>
+        </ButtonRow>
+      </div>
+      <Separator />
+
+      {/* Backend LLM provider */}
+      <div className="grid gap-3">
+        <ConnectionHead name="Backend LLM provider" hint="which LLM the backend uses for reviews" dot="idle" />
+        <Field label="LLM provider" htmlFor="int-llm-provider" hint="Saved as LLM_PROVIDER in backend/.env — restart the backend after saving.">
+          <Select value={drafts.llmProvider} onValueChange={(v) => patch({ llmProvider: v })}>
+            <SelectTrigger id="int-llm-provider" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(LLM_PROVIDERS) as LlmProviderId[]).map((id) => (
+                <SelectItem key={id} value={id}>
+                  {LLM_PROVIDERS[id].label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        <ButtonRow>
+          <AsyncButton size="sm" onClick={save([["LLM_PROVIDER", "llmProvider"]], "LLM provider", ["llmProvider"])}>
+            <Plug /> Save LLM provider
           </AsyncButton>
         </ButtonRow>
       </div>
@@ -803,7 +897,7 @@ function WebhookCard() {
 export function IntegrationsPage({ active }: { active: boolean }) {
   const [drafts, setDrafts] = React.useState<Drafts>(EMPTY_DRAFTS);
   const clearNonce = useApp((s) => s.clearNonce);
-  React.useEffect(() => setDrafts(EMPTY_DRAFTS), [clearNonce]);
+  React.useEffect(() => setDrafts((d) => ({ ...EMPTY_DRAFTS, llmProvider: d.llmProvider })), [clearNonce]);
 
   return (
     <Page active={active}>

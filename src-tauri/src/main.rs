@@ -215,6 +215,77 @@ fn get_val(src: &str, key: &str) -> Option<String> {
     None
 }
 
+/// API base for each provider id. Shared by save_config and run_local_review.
+fn llm_api_base(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "openrouter" => Ok("https://openrouter.ai/api/v1"),
+        "commandcode" => Ok("https://api.commandcode.ai/provider/v1"),
+        "opencode_go" => Ok("https://opencode.ai/inference/go/openai/v1"),
+        _ => Err(unknown_llm_provider(provider)),
+    }
+}
+
+fn unknown_llm_provider(provider: &str) -> String {
+    if provider.is_empty() {
+        "llm_provider is required (use: openrouter, commandcode, opencode_go)".into()
+    } else {
+        format!("unknown llm_provider `{}` (use: openrouter, commandcode, opencode_go)", provider)
+    }
+}
+
+/// Value of `api_base` inside the `[openai]` section only.
+fn openai_api_base(src: &str) -> Option<String> {
+    let doc = src.parse::<toml_edit::Document>().ok()?;
+    doc.get("openai")?.get("api_base")?.as_str().map(str::to_owned)
+}
+
+/// Legacy configs have no `[openai]` section and fall back to OpenRouter.
+fn detect_llm_provider(src: &str) -> &'static str {
+    match openai_api_base(src) {
+        Some(base) if base.contains("api.commandcode.ai") => "commandcode",
+        Some(base) if base.contains("opencode.ai/inference/go") => "opencode_go",
+        _ => "openrouter",
+    }
+}
+
+fn default_llm_model(provider: &str) -> &'static str {
+    match provider {
+        "commandcode" => "openai/deepseek/deepseek-v4-flash",
+        "opencode_go" => "openai/kimi-k3",
+        _ => "openrouter/thinkingmachines/inkling-2-small:free",
+    }
+}
+
+fn validate_run_provider(raw: &str, provider: &str) -> Result<(), String> {
+    let saved_provider = detect_llm_provider(raw);
+    let doc = raw.parse::<toml_edit::Document>().map_err(|e| e.to_string())?;
+    let model = doc
+        .get("config")
+        .and_then(|c| c.get("model"))
+        .and_then(|m| m.as_str());
+    if saved_provider != provider
+        || (provider != "openrouter"
+            && model.is_none_or(|m| {
+                m.starts_with("openrouter/") || m == "thinkingmachines/inkling-2-small:free"
+            }))
+    {
+        return Err("Save config with the selected provider and a matching model before running a local review.".into());
+    }
+    Ok(())
+}
+
+/// Env vars PR-Agent needs for the selected provider's key.
+fn llm_provider_env(provider: &str, key: &str) -> Result<Vec<(&'static str, String)>, String> {
+    match provider {
+        "openrouter" => Ok(vec![("OPENROUTER__KEY", key.to_string())]),
+        "commandcode" | "opencode_go" => Ok(vec![
+            ("OPENAI__KEY", key.to_string()),
+            ("OPENAI__API_BASE", llm_api_base(provider)?.to_string()),
+        ]),
+        _ => Err(unknown_llm_provider(provider)),
+    }
+}
+
 #[tauri::command]
 async fn get_config() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(get_config_blocking)
@@ -258,7 +329,8 @@ fn get_config_blocking() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "path": path.to_string_lossy(),
         "raw": raw,
-        "model": get_val(&raw, "model").unwrap_or_else(|| "openrouter/thinkingmachines/inkling-2-small:free".into()),
+        "llm_provider": detect_llm_provider(&raw),
+        "model": get_val(&raw, "model").unwrap_or_else(|| default_llm_model(detect_llm_provider(&raw)).into()),
         "fallback_models": fallbacks,
         "max_model_tokens": get_val(&raw, "max_model_tokens")
             .or_else(|| get_val(&raw, "custom_model_max_tokens"))
@@ -279,7 +351,33 @@ async fn save_config(cfg: serde_json::Value) -> Result<String, String> {
 }
 
 fn save_config_blocking(cfg: serde_json::Value) -> Result<String, String> {
-    let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or("openrouter/thinkingmachines/inkling-2-small:free"));
+    let content = render_config_toml(&cfg)?;
+    let path = config_path_for_write()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if path.is_file() {
+        let backup = path.with_extension("toml.bak");
+        std::fs::copy(&path, &backup).map_err(|e| format!("failed to back up config: {}", e))?;
+    }
+    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn render_config_toml(cfg: &serde_json::Value) -> Result<String, String> {
+    let provider = cfg
+        .get("llm_provider")
+        .and_then(|v| v.as_str())
+        .map(|p| p.trim().to_lowercase())
+        .unwrap_or_else(|| "openrouter".to_string());
+    let llm_section = match provider.as_str() {
+        "openrouter" => "[openrouter]\n# key is injected via env OPENROUTER__KEY / secrets.OPENROUTER_API_KEY - don't hardcode\n".to_string(),
+        _ => format!(
+            "[openai]\n# key is injected via env OPENAI__KEY / secrets - don't hardcode\napi_base = \"{}\"\n",
+            llm_api_base(&provider)?
+        ),
+    };
+    let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or_else(|| default_llm_model(&provider)));
     let fallbacks = cfg.get("fallback_models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let fb: Vec<String> = fallbacks.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", toml_escape(s)))).collect();
     let max_tokens_raw = cfg
@@ -294,7 +392,7 @@ fn save_config_blocking(cfg: serde_json::Value) -> Result<String, String> {
     let effort = toml_escape(cfg.get("reasoning_effort").and_then(|v| v.as_str()).unwrap_or("low"));
     let b = |k: &str, d: bool| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
-    let content = format!(
+    Ok(format!(
         r#"[config]
 # Managed by PR Agent Control app
 model = "{model}"
@@ -303,9 +401,7 @@ max_model_tokens = {max_tokens}
 custom_model_max_tokens = {max_tokens}
 reasoning_effort = "{effort}"
 
-[openrouter]
-# key is injected via env OPENROUTER__KEY / secrets.OPENROUTER_API_KEY - don't hardcode
-
+{llm_section}
 [pr_reviewer]
 persistent_comment = false
 inline_code_comments = true
@@ -320,18 +416,7 @@ auto_improve = {ai}
         ad = b("auto_describe", true),
         ar = b("auto_review", true),
         ai = b("auto_improve", false),
-    );
-
-    let path = config_path_for_write()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    if path.is_file() {
-        let backup = path.with_extension("toml.bak");
-        std::fs::copy(&path, &backup).map_err(|e| format!("failed to back up config: {}", e))?;
-    }
-    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+    ))
 }
 
 #[tauri::command]
@@ -460,27 +545,45 @@ fn missing_pr_agent_message(python: &str, details: &str) -> String {
 async fn run_local_review(
     pr_url: String,
     command: String,
-    openrouter_key: String,
+    llm_provider: String,
+    llm_key: String,
     github_token: String,
     question: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        run_local_review_blocking(pr_url, command, openrouter_key, github_token, question)
+        run_local_review_blocking(pr_url, command, llm_provider, llm_key, github_token, question)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+/// Stable per-PR session id for OpenCode Go. The API only needs a stable string;
+/// a small deterministic hash keeps local CLI runs on the same conversation.
+fn opencode_session_id(pr_url: &str) -> String {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x8422_2325_cbf2_9ce4;
+    for byte in pr_url.as_bytes() {
+        h1 = (h1 ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+        h2 = (h2.rotate_left(7) ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    format!("ses_{:016x}{:08x}", h1, (h2 & 0xffff_ffff) as u32)
+}
+
 fn run_local_review_blocking(
     pr_url: String,
     command: String,
-    openrouter_key: String,
+    llm_provider: String,
+    llm_key: String,
     github_token: String,
     question: Option<String>,
 ) -> Result<String, String> {
+    let provider = llm_provider.trim().to_lowercase();
+    let llm_env = llm_provider_env(&provider, llm_key.trim())?;
     let cmd_args = command_args(&command, question);
     let url = pr_url.trim();
     let config_path = config_path_for_write()?;
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    validate_run_provider(&raw, &provider)?;
     let python_label = pr_agent_python().display().to_string();
 
     let build = |program: &str, module: Option<&str>| {
@@ -493,13 +596,24 @@ fn run_local_review_blocking(
         // The target repo's default branch may not contain a .pr_agent.toml.
         // Pass the app's config explicitly so the selected model/limits apply.
         c.arg("--extra_config_url").arg(&config_path);
-        c.args(&cmd_args)
-            .env("OPENROUTER__KEY", &openrouter_key)
-            // Without this, PR-Agent can print a model/provider error and still
-            // exit 0, which the app would report as a successful review.
-            .env("CONFIG__PROPAGATE_TOOL_ERRORS", "true")
-            // Free models can take longer than the 120 s default on a large PR.
-            .env("CONFIG__AI_TIMEOUT", "300");
+        c.args(&cmd_args);
+        for (name, value) in &llm_env {
+            c.env(name, value);
+        }
+        if provider == "opencode_go" {
+            // PR-Agent's LiteLLM handler forwards [litellm] extra_headers on every
+            // request; this is the supported way to send OpenCode's session header.
+            let headers = serde_json::json!({
+                "x-opencode-session": opencode_session_id(url),
+            })
+            .to_string();
+            c.env("LITELLM__EXTRA_HEADERS", headers);
+        }
+        // Without this, PR-Agent can print a model/provider error and still
+        // exit 0, which the app would report as a successful review.
+        c.env("CONFIG__PROPAGATE_TOOL_ERRORS", "true");
+        // Free models can take longer than the 120 s default on a large PR.
+        c.env("CONFIG__AI_TIMEOUT", "300");
         if !github_token.trim().is_empty() {
             c.env("GITHUB__USER_TOKEN", github_token.trim());
         }
@@ -1094,9 +1208,9 @@ fn backend_config_test_blocking(
 ) -> Result<String, String> {
     let base = backend_base(&backend_url)?;
     let p = provider.trim().to_lowercase();
-    let allowed = ["github", "redis", "vercel", "upstash_box", "openrouter"];
+    let allowed = ["github", "redis", "vercel", "upstash_box", "openrouter", "commandcode", "opencode_go"];
     if !allowed.contains(&p.as_str()) {
-        return Err("unknown provider (use: github, redis, vercel, upstash_box, openrouter)".into());
+        return Err("unknown provider (use: github, redis, vercel, upstash_box, openrouter, commandcode, opencode_go)".into());
     }
     require_secure_for_token(&base, !api_token.trim().is_empty())?;
     let mut req = gh_client()?
@@ -1131,6 +1245,11 @@ fn allowed_env_key(key: &str) -> bool {
             | "VERCEL_API_TOKEN"
             | "VERCEL_TEAM_ID"
             | "OPENROUTER_API_KEY"
+            | "COMMANDCODE_API_KEY"
+            | "CMD_API_KEY"
+            | "OPENCODE_GO_API_KEY"
+            | "OPENCODE_API_KEY"
+            | "LLM_PROVIDER"
             | "LLM_MODEL"
             | "ALLOWED_ORIGINS"
             | "BACKEND_API_TOKEN"
@@ -2328,5 +2447,148 @@ mod setup_mode_tests {
     fn workflow_template_uses_current_token_setting() {
         assert!(PR_AGENT_WORKFLOW.contains("CONFIG__MAX_MODEL_TOKENS"));
         assert!(!PR_AGENT_WORKFLOW.contains("CUSTOM_MODEL_MAX_TOKENS"));
+    }
+}
+
+#[cfg(test)]
+mod llm_provider_tests {
+    use super::*;
+
+    #[test]
+    fn env_allowlist_accepts_new_provider_keys() {
+        for key in ["COMMANDCODE_API_KEY", "CMD_API_KEY", "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "LLM_PROVIDER"] {
+            assert!(allowed_env_key(key), "{} should be allowed", key);
+        }
+        assert!(!allowed_env_key("OPENAI__KEY"));
+    }
+
+    #[test]
+    fn api_base_per_provider() {
+        assert_eq!(llm_api_base("openrouter").unwrap(), "https://openrouter.ai/api/v1");
+        assert_eq!(llm_api_base("commandcode").unwrap(), "https://api.commandcode.ai/provider/v1");
+        assert_eq!(llm_api_base("opencode_go").unwrap(), "https://opencode.ai/inference/go/openai/v1");
+        assert!(llm_api_base("").is_err());
+        assert!(llm_api_base("anthropic").is_err());
+    }
+
+    #[test]
+    fn provider_env_per_provider() {
+        let or = llm_provider_env("openrouter", "k").unwrap();
+        assert_eq!(or, vec![("OPENROUTER__KEY", "k".to_string())]);
+
+        let cc = llm_provider_env("commandcode", "k").unwrap();
+        assert_eq!(
+            cc,
+            vec![
+                ("OPENAI__KEY", "k".to_string()),
+                ("OPENAI__API_BASE", "https://api.commandcode.ai/provider/v1".to_string()),
+            ]
+        );
+
+        let oc = llm_provider_env("opencode_go", "k").unwrap();
+        assert_eq!(oc[1].1, "https://opencode.ai/inference/go/openai/v1");
+
+        assert!(llm_provider_env("", "k").is_err());
+        assert!(llm_provider_env("bogus", "k").is_err());
+    }
+
+    #[test]
+    fn detects_provider_from_openai_section_only() {
+        let commandcode = "[config]\nmodel = \"openai/deepseek/deepseek-v4-flash\"\n\n[openai]\napi_base = \"https://api.commandcode.ai/provider/v1\"\n";
+        assert_eq!(detect_llm_provider(commandcode), "commandcode");
+
+        let opencode = "[openai]\napi_base = \"https://opencode.ai/inference/go/openai/v1\"\n";
+        assert_eq!(detect_llm_provider(opencode), "opencode_go");
+
+        // An api_base in another section must not be mistaken for the provider.
+        let other_section = "[openrouter]\napi_base = \"https://api.commandcode.ai/provider/v1\"\n";
+        assert_eq!(detect_llm_provider(other_section), "openrouter");
+
+        let commented = "[openai] # provider endpoint\napi_base = 'https://api.commandcode.ai/provider/v1' # endpoint\n";
+        assert_eq!(detect_llm_provider(commented), "commandcode");
+
+        let legacy = "[config]\nmodel = \"openrouter/free\"\n[openrouter]\n";
+        assert_eq!(detect_llm_provider(legacy), "openrouter");
+    }
+
+    #[test]
+    fn render_openrouter_keeps_openrouter_section() {
+        let toml = render_config_toml(&serde_json::json!({
+            "model": "openrouter/free",
+            "llm_provider": "openrouter",
+        }))
+        .unwrap();
+        assert!(toml.contains("[openrouter]\n"));
+        assert!(!toml.contains("[openai]"));
+        assert_eq!(detect_llm_provider(&toml), "openrouter");
+    }
+
+    #[test]
+    fn render_openai_compatible_provider_writes_openai_section() {
+        let toml = render_config_toml(&serde_json::json!({
+            "model": "openai/Qwen/Qwen3.7-Max",
+            "llm_provider": "commandcode",
+        }))
+        .unwrap();
+        assert!(toml.contains("[openai]\n"));
+        assert!(toml.contains("api_base = \"https://api.commandcode.ai/provider/v1\""));
+        assert!(!toml.contains("[openrouter]"));
+        assert!(toml.contains("model = \"openai/Qwen/Qwen3.7-Max\""));
+        assert_eq!(detect_llm_provider(&toml), "commandcode");
+    }
+
+    #[test]
+    fn render_defaults_to_openrouter_and_rejects_unknown_provider() {
+        let toml = render_config_toml(&serde_json::json!({ "model": "openrouter/free" })).unwrap();
+        assert!(toml.contains("[openrouter]"));
+        assert!(render_config_toml(&serde_json::json!({ "llm_provider": "nope" })).is_err());
+    }
+
+    #[test]
+    fn provider_defaults_and_local_run_consistency() {
+        for provider in ["openrouter", "commandcode", "opencode_go"] {
+            let raw = render_config_toml(&serde_json::json!({"llm_provider": provider})).unwrap();
+            let doc = raw.parse::<toml_edit::Document>().unwrap();
+            assert_eq!(doc["config"]["model"].as_str(), Some(default_llm_model(provider)));
+            assert!(validate_run_provider(&raw, provider).is_ok());
+            for other in ["openrouter", "commandcode", "opencode_go"] {
+                if other != provider {
+                    assert!(validate_run_provider(&raw, other).is_err());
+                }
+            }
+        }
+        let stale = render_config_toml(&serde_json::json!({
+            "llm_provider": "commandcode", "model": "openrouter/free"
+        })).unwrap();
+        assert!(validate_run_provider(&stale, "commandcode").is_err());
+        let missing = "[openai] # provider\napi_base = 'https://opencode.ai/inference/go/openai/v1'\n";
+        assert!(validate_run_provider(missing, "opencode_go").is_err());
+        let explicit = render_config_toml(&serde_json::json!({
+            "llm_provider": "opencode_go", "model": "openai/custom"
+        })).unwrap();
+        assert_eq!(get_val(&explicit, "model").as_deref(), Some("openai/custom"));
+        assert!(validate_run_provider(&explicit, "opencode_go").is_ok());
+    }
+
+    #[test]
+    fn opencode_session_id_is_stable_per_pr() {
+        let a = opencode_session_id("https://github.com/owner/repo/pull/7");
+        let b = opencode_session_id("https://github.com/owner/repo/pull/7");
+        let c = opencode_session_id("https://github.com/owner/repo/pull/8");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("ses_"));
+        assert_eq!(a.len(), 4 + 24);
+    }
+
+    #[test]
+    fn backend_test_rejects_unknown_provider_before_network() {
+        let err = backend_config_test_blocking(
+            "https://example.invalid".into(),
+            "nope".into(),
+            String::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("commandcode, opencode_go"));
     }
 }

@@ -29,6 +29,9 @@ Routes each PR agent run to the cheapest provider with quota headroom.
 ## Env vars
 
 - `GITHUB_TOKEN` — diff fetch + comment post (review path).
-- `OPENROUTER_API_KEY`, `LLM_MODEL` — review generation.
+- `LLM_PROVIDER` (`openrouter` default, `commandcode`, `opencode_go`) and
+  `LLM_MODEL` — review generation. `LLM_MODEL` blank uses the provider default.
+- `OPENROUTER_API_KEY`, or `COMMANDCODE_API_KEY` (`CMD_API_KEY`), or
+  `OPENCODE_GO_API_KEY` (`OPENCODE_API_KEY`) — key for the selected provider.
 - `UPSTASH_BOX_API_KEY` — warm-box exec (else graceful review fallback).
 - `VERCEL_TOKEN` (`VERCEL_API_TOKEN` accepted), `VERCEL_TEAM_ID?`, `VERCEL_PROJECT_ID?`.

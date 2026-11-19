@@ -39,7 +39,7 @@ import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/comp
 import { checkBackend, fetchQuota, loadConfig, refreshAgents, syncRuns } from "@/lib/actions";
 import { useGh, loadRepos } from "@/lib/github";
 import { forgetSecrets } from "@/lib/session";
-import { DEFAULT_MODEL, useApp, type TabId } from "@/lib/store";
+import { useApp, type TabId } from "@/lib/store";
 import { AgentsPage } from "@/pages/agents";
 import { AutonomyPage } from "@/pages/autonomy";
 import { IntegrationsPage } from "@/pages/integrations";
@@ -67,7 +67,7 @@ const TABS: TabDef[] = [
     group: "Workspace",
     sub: (
       <>
-        Model <code>{DEFAULT_MODEL}</code> via OpenRouter · secrets live in memory/session only
+        Model and provider are set in the Review tab · secrets live in memory/session only
       </>
     ),
   },
