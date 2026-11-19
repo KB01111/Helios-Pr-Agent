@@ -21,8 +21,8 @@ The installers are unsigned, so Windows SmartScreen may ask for confirmation.
 
 | Path | What it is |
 |---|---|
-| `src/` | Tauri frontend: React + TypeScript + Tailwind v4 + [shadcn/ui](https://ui.shadcn.com), built with Vite (sidebar UI: Review, Agents & repo sync, Runs, Autonomy, Quota, Providers, Integrations, Settings). `src/components/ui/` holds the shadcn components; add more with `npx shadcn@latest add <name>` |
-| `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), and the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`) |
+| `src/` | Tauri frontend: React + TypeScript + Tailwind v4 + [shadcn/ui](https://ui.shadcn.com), built with Vite (sidebar UI: Auto review, Review, Agents & repo sync, Runs, Autonomy, Quota, Providers, Integrations, Settings). `src/components/ui/` holds the shadcn components; add more with `npx shadcn@latest add <name>` |
+| `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`, `github_disable_repo`), the auto-review workflow generator (`src-tauri/src/autoreview.rs`) and PR commands (`github_list_pulls`, `github_pr_command`) |
 | `backend/` | FastAPI webhook/event brain, agent/run API, quota, and Redis-backed shared state (`REDIS_URL` on FastAPI Cloud, or Upstash REST) |
 | `cloudflare-worker/` | Free-tier edge receiver + cron for the cloud fallback (signature check, retrying forward, deferred-event sweep) |
 | `upstash-box/` | Node provisioner + Python cron script that auto-reviews open PRs on a schedule (runs on Upstash Box free tier) |
@@ -68,6 +68,49 @@ Windows and a POSIX shell elsewhere, using the selected Python interpreter. For
 private repos, the GitHub token needs `repo` scope.
 
 <!-- /coderabbit-ai-generated:v1 -->
+
+## Auto review: deploy PR Agent to your repos
+
+The **Auto review** page (the app's start page) is the quickest way to get every pull
+request reviewed. Reviews run in GitHub Actions, so nothing needs hosting.
+
+1. **Connect GitHub** — device flow or a PAT with `repo` scope (session only).
+2. **OpenRouter key** — paste a free key ([openrouter.ai/settings/keys](https://openrouter.ai/settings/keys)).
+   It is stored encrypted as each repo's `OPENROUTER_API_KEY` Actions secret. Updating a repo
+   that already has the secret works without the key.
+3. **Pick what the reviewer does** — review every PR, write the PR description, suggest
+   improvements, re-review on every push, skip drafts, model, and free-text review
+   instructions. **Preview workflow** shows the exact YAML that will be committed.
+4. **Enable** a repo (or tick several and use **Enable / update**). The app commits
+   `.github/workflows/pr-agent.yml` to the default branch and sets the secret.
+
+Each repo shows its live state: *Auto review on*, *Update available* (older template or a
+hand-edited file), *settings differ* (the repo runs other settings than the page),
+*Missing API key*, *On · custom workflow* (a `pr-agent.yml` this app did not write),
+*OpenRabbit* or *backend webhook*. **Update all** brings every outdated repo to the current
+settings in one go. Per repo you can also:
+
+- **Run on a pull request** — pick an open PR and post `/review`, `/describe` or `/improve`;
+  the workflow replies on the PR.
+- **View runs** — opens the workflow's Actions page.
+- **Turn off** — deletes the workflow file with a commit (optionally also the
+  `…/webhooks/github` webhook and the repo secrets).
+
+The generated workflow writes its settings as JSON on its first line
+(`# pr-agent-control: {...}`), which is how the app reads them back. Compared with the old
+fixed template it also:
+
+- re-reviews on `synchronize` (PR-Agent ignores that action unless it is listed in
+  `github_action_config.pr_actions`), editing one persistent review comment instead of
+  adding a new one per push; describe/improve still run only when the PR opens;
+- cancels the previous run for the same PR when a new commit arrives;
+- skips draft PRs until they are ready for review (optional);
+- only answers `/commands` on pull requests (not plain issues) from owners, members and
+  collaborators, and skips cleanly with a warning when the secret is missing (e.g. fork PRs);
+- rejects review instructions containing `${{` so they cannot inject Actions expressions.
+
+The webhook/backend modes and the OpenRabbit reviewer remain under Integrations → GitHub
+1-click repo setup (below).
 
 ## Use it
 

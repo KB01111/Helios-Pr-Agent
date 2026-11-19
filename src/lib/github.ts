@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { apiGet, apiMut, backendUrl } from "./api";
 import { agentList, refreshAgents } from "./actions";
+import { optionsProblem, useAutoReview, type WorkflowOptions } from "./autoreview";
 import { lsGet, lsSet, useApp } from "./store";
 import { errText, jsonObj, openUrl, tauriInvoke } from "./tauri";
 import { toastErr, toastOk } from "./toast";
@@ -33,6 +34,10 @@ export interface ConfigureOptions {
   saveToken: boolean;
   agentName: string;
   agentCreate: boolean;
+  /** What the PR Agent workflow does; defaults to the saved Auto review settings. */
+  workflowOptions?: WorkflowOptions;
+  /** Explicit repo list (otherwise the selection, or the failed repos on retry). */
+  repos?: string[];
   /** Called when a webhook secret had to be generated so the form can show it. */
   onSecretGenerated?: (secret: string) => void;
 }
@@ -343,7 +348,7 @@ export async function loadStatus(name: string, force: boolean): Promise<void> {
   }
 }
 
-async function loadStatusMany(names: string[], force: boolean) {
+export async function loadStatusMany(names: string[], force: boolean) {
   const queue = names.slice();
   const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
     while (queue.length) await loadStatus(queue.shift() as string, force);
@@ -462,15 +467,32 @@ export async function configure(opts: ConfigureOptions) {
     toastErr("GitHub setup", "Set a valid http(s) base URL in the GitHub webhook URL card (or Settings backend URL).");
     return;
   }
-  const repos = (opts.retryOnly ? gh().failed : gh().selected).filter(Boolean);
+  const repos = (opts.repos ?? (opts.retryOnly ? gh().failed : gh().selected)).filter(Boolean);
   if (!repos.length) {
     toastErr("GitHub setup", opts.retryOnly ? "No failed repositories to retry." : "Select at least one repository.");
     return;
   }
-  const orKey = opts.orKey;
+  const orKey = opts.orKey.trim();
   if (useActions && !orKey) {
-    toastErr("GitHub setup", "Add the OpenRouter API key in the OpenRouter row above first.");
-    return;
+    // Without a key, setup keeps each repo's existing OPENROUTER_API_KEY secret.
+    // Only allow that when every target repo is known to have one.
+    const st = gh().status;
+    const lacking = repos.filter((r) => !(st[r] && st[r].secrets && st[r].secrets.openrouter_api_key));
+    if (lacking.length) {
+      toastErr(
+        "OpenRouter key needed",
+        `Enter your OpenRouter API key first — ${lacking.length} repo(s) do not have the OPENROUTER_API_KEY secret yet.`,
+      );
+      return;
+    }
+  }
+  const workflowOptions = opts.workflowOptions ?? useAutoReview.getState().options;
+  if (useActions && provider === "pr-agent") {
+    const problem = optionsProblem(workflowOptions);
+    if (problem) {
+      toastErr("Auto review settings", problem);
+      return;
+    }
   }
   if (provider !== "pr-agent" && provider !== "openrabbit") {
     toastErr("GitHub setup", "Choose a workflow provider (pr-agent or openrabbit).");
@@ -553,6 +575,7 @@ export async function configure(opts: ConfigureOptions) {
           openrouterKey: orKey,
           workflowProvider: provider,
           reviewMode: mode,
+          workflowOptions,
         });
         if (cancelled()) break; // secrets were cleared mid-request: leave shared state alone
         const r = jsonObj(raw);
@@ -613,4 +636,88 @@ export async function configure(opts: ConfigureOptions) {
 /** Where the webhook target would point (used for the "localhost" warning). */
 export function webhookBase(cloudBase: string): string {
   return (cloudBase.trim().replace(/\/+$/, "") || backendUrl());
+}
+
+/* ---------- turn auto review off ---------- */
+export interface DisableOptions {
+  removeWebhook: boolean;
+  removeSecrets: boolean;
+}
+
+/** Remove the review workflow (and optionally webhook/secrets) from each repo. */
+export async function disableRepos(repos: string[], opts: DisableOptions) {
+  const t = token();
+  if (!t) {
+    toastErr("Disable auto review", "Sign in with GitHub first.");
+    return;
+  }
+  if (gh().batchRunning || !repos.length) return;
+  const sg = sessionGen;
+  const stale = () => sg !== sessionGen || token() !== t;
+  useGh.setState({ batchRunning: true });
+  let ok = 0;
+  let bad = 0;
+  try {
+    ghOut(`=== Disabling auto review on ${repos.length} repo(s) ===`);
+    for (const repo of repos) {
+      if (stale()) break;
+      useGh.setState({ configuring: [...gh().configuring, repo] });
+      try {
+        const r = jsonObj(
+          await tauriInvoke("github_disable_repo", {
+            token: t,
+            repo,
+            removeWebhook: opts.removeWebhook,
+            removeSecrets: opts.removeSecrets,
+          }),
+        );
+        if (stale()) break;
+        if (!r) throw new Error("unexpected response");
+        const errs = r.errors ? Object.entries(r.errors).map(([k, v]) => `${k}: ${v}`).join(" · ") : "";
+        ghOut(`[${repo}] workflow: ${r.workflow} · webhook: ${r.webhook} · secrets: ${r.secrets}${errs ? " — " + errs : ""}`);
+        if (r.ok) ok++;
+        else bad++;
+      } catch (e) {
+        if (stale()) break;
+        bad++;
+        ghOut(`[${repo}] error: ${errText(e, 300)}`);
+      } finally {
+        if (!stale()) useGh.setState({ configuring: gh().configuring.filter((n) => n !== repo) });
+      }
+      await loadStatus(repo, true);
+    }
+    if (!stale()) {
+      ghOut(`=== Done: ${ok} disabled, ${bad} failed ===`);
+      if (ok) toastOk("Auto review disabled", `${ok} repo(s) — workflow removed.`);
+      if (bad) toastErr("Disable auto review", `${bad} repo(s) failed — see the activity log.`);
+    }
+  } finally {
+    if (!stale()) useGh.setState({ batchRunning: false, configuring: [] });
+  }
+}
+
+/* ---------- try it on a pull request ---------- */
+export interface PullSummary {
+  number: number;
+  title: string;
+  draft: boolean;
+  user: string;
+  html_url: string;
+  updated_at: string;
+}
+
+export async function listPulls(repo: string): Promise<PullSummary[]> {
+  const t = token();
+  if (!t) throw new Error("Sign in with GitHub first.");
+  const raw = jsonObj(await tauriInvoke("github_list_pulls", { token: t, repo }));
+  return Array.isArray(raw) ? (raw as PullSummary[]) : [];
+}
+
+export type PrCommand = "/review" | "/describe" | "/improve";
+
+/** Comment a PR-Agent command on a PR; the repo's workflow runs it. Returns the comment URL. */
+export async function prCommand(repo: string, number: number, command: PrCommand): Promise<string> {
+  const t = token();
+  if (!t) throw new Error("Sign in with GitHub first.");
+  return String((await tauriInvoke("github_pr_command", { token: t, repo, number, command })) || "");
 }

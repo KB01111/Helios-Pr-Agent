@@ -6,8 +6,11 @@
 
 mod local_runtime;
 
+mod autoreview;
 mod daemon;
 mod decider;
+
+use autoreview::WorkflowOptions;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -589,35 +592,6 @@ fn box_provision_blocking(
     }
 }
 
-const PR_AGENT_WORKFLOW: &str = r#"name: PR Agent
-on:
-  pull_request:
-    types: [opened, synchronize]
-  issue_comment:
-jobs:
-  pr_agent_job:
-    if: >-
-      ${{ github.event.sender.type != 'Bot' &&
-          (github.event_name != 'issue_comment' ||
-           contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-    steps:
-      - name: PR Agent action step
-        # Pinned so a compromised upstream branch cannot receive repository secrets.
-        uses: the-pr-agent/pr-agent@dec3e88c029c0a32957bd95aa694cb34d2b256e0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENROUTER__KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          CONFIG__MODEL: "openrouter/thinkingmachines/inkling-2-small:free"
-          CONFIG__FALLBACK_MODELS: '["openrouter/free"]'
-          CONFIG__MAX_MODEL_TOKENS: "200000"
-          CONFIG__REASONING_EFFORT: "low"
-"#;
-
 const OPENRABBIT_WORKFLOW: &str = r#"name: OpenRabbit Reviewer
 on:
   pull_request_target:
@@ -767,10 +741,16 @@ async fn get_workflow_template(provider: String) -> Result<String, String> {
 
 fn get_workflow_template_blocking(provider: String) -> Result<String, String> {
     match provider.as_str() {
-        "pr-agent" => Ok(PR_AGENT_WORKFLOW.to_string()),
+        "pr-agent" => Ok(autoreview::default_pr_agent_workflow()),
         "openrabbit" => Ok(OPENRABBIT_WORKFLOW.to_string()),
         _ => Err("unknown provider".into()),
     }
+}
+
+/// Render the PR Agent workflow for the given auto-review settings (preview only).
+#[tauri::command]
+fn preview_pr_agent_workflow(options: WorkflowOptions) -> Result<String, String> {
+    Ok(autoreview::render_pr_agent_workflow(&options.normalized()?))
 }
 
 #[tauri::command]
@@ -782,8 +762,8 @@ async fn write_workflow(provider: String) -> Result<String, String> {
 
 fn write_workflow_blocking(provider: String) -> Result<String, String> {
     let (file, content) = match provider.as_str() {
-        "pr-agent" => ("pr-agent.yml", PR_AGENT_WORKFLOW),
-        "openrabbit" => ("openrabbit.yml", OPENRABBIT_WORKFLOW),
+        "pr-agent" => ("pr-agent.yml", autoreview::default_pr_agent_workflow()),
+        "openrabbit" => ("openrabbit.yml", OPENRABBIT_WORKFLOW.to_string()),
         _ => return Err("unknown provider".into()),
     };
     let rel = format!(".github/workflows/{}", file);
@@ -1477,7 +1457,7 @@ fn github_repo_status_blocking(token: String, repo: String) -> Result<String, St
             &[("ref", default_branch.as_str())],
             None,
         ) {
-            Ok((200, _)) => {
+            Ok((200, file_body)) => {
                 let file = path.rsplit('/').next().unwrap_or(path);
                 workflow = serde_json::json!({
                     "configured": true,
@@ -1485,6 +1465,19 @@ fn github_repo_status_blocking(token: String, repo: String) -> Result<String, St
                     "path": path,
                     "provider": provider,
                 });
+                // For the PR Agent workflow, report the settings this app wrote
+                // (and whether the file predates the current template).
+                if provider == "pr-agent" {
+                    let info = serde_json::from_str::<serde_json::Value>(&file_body)
+                        .ok()
+                        .and_then(|v| gh_file_text(&v).ok())
+                        .map(|text| autoreview::describe_workflow(&text));
+                    if let (Some(serde_json::Value::Object(info)), Some(map)) =
+                        (info, workflow.as_object_mut())
+                    {
+                        map.extend(info);
+                    }
+                }
                 break;
             }
             Ok((404, _)) => {}
@@ -1588,6 +1581,7 @@ fn github_repo_status_blocking(token: String, repo: String) -> Result<String, St
 
     serde_json::to_string(&serde_json::json!({
         "repo": repo,
+        "default_branch": default_branch,
         "webhook": webhook,
         "workflow": workflow,
         "secrets": secrets,
@@ -1737,6 +1731,50 @@ fn gh_setup_webhook(
     }
 }
 
+/// No key supplied: succeed only if the repo already has the secrets the workflow needs.
+fn gh_keep_secrets(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    provider: &str,
+) -> (&'static str, Option<String>) {
+    let url = format!("{}/actions/secrets?per_page=100", repo_api);
+    let names: Vec<String> = match gh_request_json(client, token, reqwest::Method::GET, &url, &[], None) {
+        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("secrets").and_then(|s| s.as_array()).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect(),
+        Ok((status, body)) => {
+            return ("failed", Some(format!("actions secrets: {}", gh_error_text(status, &body))))
+        }
+        Err(e) => return ("failed", Some(format!("actions secrets: {}", e))),
+    };
+    let needed: &[&str] = if provider == "openrabbit" {
+        &["OPENROUTER_API_KEY", "LLM_API_KEY"]
+    } else {
+        &["OPENROUTER_API_KEY"]
+    };
+    let missing: Vec<&str> = needed
+        .iter()
+        .copied()
+        .filter(|n| !names.iter().any(|have| have == n))
+        .collect();
+    if missing.is_empty() {
+        ("kept", None)
+    } else {
+        (
+            "failed",
+            Some(format!(
+                "no OpenRouter key was given and the repo has no {} secret yet",
+                missing.join(" / ")
+            )),
+        )
+    }
+}
+
 /// Upsert Actions secrets with GitHub's sealed-box public key.
 fn gh_setup_secrets(
     client: &reqwest::blocking::Client,
@@ -1809,6 +1847,16 @@ fn gh_setup_secrets(
     }
 }
 
+/// Decode the base64 `content` of a GitHub contents API file response.
+fn gh_file_text(file_json: &serde_json::Value) -> Result<String, String> {
+    let encoded = file_json.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let cleaned: String = encoded.chars().filter(|c| !matches!(c, '\n' | '\r')).collect();
+    let bytes = STANDARD
+        .decode(cleaned)
+        .map_err(|_| "file content was not valid base64".to_string())?;
+    String::from_utf8(bytes).map_err(|_| "file content was not UTF-8".to_string())
+}
+
 /// Create, update or leave alone the workflow file on the default branch.
 fn gh_commit_workflow(
     client: &reqwest::blocking::Client,
@@ -1816,6 +1864,7 @@ fn gh_commit_workflow(
     repo_api: &str,
     branch: &str,
     provider: &str,
+    pr_agent_template: &str,
 ) -> (&'static str, Option<String>) {
     let (path, template, message) = match provider {
         "openrabbit" => (
@@ -1825,8 +1874,8 @@ fn gh_commit_workflow(
         ),
         _ => (
             ".github/workflows/pr-agent.yml",
-            PR_AGENT_WORKFLOW,
-            "chore: add PR Agent workflow (PR Agent Control)",
+            pr_agent_template,
+            "chore: configure PR Agent auto review (PR Agent Control)",
         ),
     };
     let url = format!("{}/contents/{}", repo_api, path);
@@ -1851,24 +1900,8 @@ fn gh_commit_workflow(
                 .get("sha")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let encoded = file_json
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let cleaned: String = encoded
-                .chars()
-                .filter(|c| !matches!(c, '\n' | '\r'))
-                .collect();
-            let current = match STANDARD.decode(cleaned) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return (
-                        "failed",
-                        Some("workflow: existing file content was not valid base64".into()),
-                    )
-                }
-            };
-            if current == template.as_bytes() {
+            // Unreadable content is simply replaced; only identical files are skipped.
+            if gh_file_text(&file_json).is_ok_and(|current| current == template) {
                 return ("unchanged", None);
             }
         }
@@ -1968,6 +2001,7 @@ async fn github_setup_repo(
     openrouter_key: String,
     workflow_provider: String,
     review_mode: Option<String>,
+    workflow_options: Option<WorkflowOptions>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         github_setup_repo_blocking(
@@ -1978,6 +2012,7 @@ async fn github_setup_repo(
             openrouter_key,
             workflow_provider,
             review_mode.unwrap_or_default(),
+            workflow_options.unwrap_or_default(),
         )
     })
     .await
@@ -1992,8 +2027,12 @@ fn github_setup_repo_blocking(
     openrouter_key: String,
     workflow_provider: String,
     review_mode: String,
+    workflow_options: WorkflowOptions,
 ) -> Result<String, String> {
     let plan = setup_plan(&review_mode)?;
+    // Validate before touching the repo so a bad setting cannot half-configure it.
+    let workflow_options = workflow_options.normalized()?;
+    let pr_agent_template = autoreview::render_pr_agent_workflow(&workflow_options);
     let token = token.trim();
     if token.is_empty() {
         return Err("GitHub token is required".into());
@@ -2021,10 +2060,10 @@ fn github_setup_repo_blocking(
             return Err("webhook_secret is too long (max 512 bytes)".into());
         }
     }
+    // An empty key is allowed: the secrets step then keeps the repo's existing
+    // secret (and fails for that repo if there is none), so settings can be
+    // updated without pasting the key again.
     if plan.actions {
-        if openrouter_key.is_empty() {
-            return Err("openrouter_key is required".into());
-        }
         if openrouter_key.contains('\r') || openrouter_key.contains('\n') {
             return Err("openrouter_key must be a single line".into());
         }
@@ -2045,7 +2084,9 @@ fn github_setup_repo_blocking(
     } else {
         ("skipped", None)
     };
-    let (secrets_status, secrets_error) = if plan.actions {
+    let (secrets_status, secrets_error) = if plan.actions && openrouter_key.is_empty() {
+        gh_keep_secrets(&client, token, &repo_api, provider)
+    } else if plan.actions {
         gh_setup_secrets(&client, token, &repo_api, provider, openrouter_key)
     } else {
         ("skipped", None)
@@ -2064,8 +2105,14 @@ fn github_setup_repo_blocking(
                     .filter(|b| !b.is_empty())
                     .unwrap_or("main")
                     .to_string();
-                let (status, error) =
-                    gh_commit_workflow(&client, token, &repo_api, &default_branch, provider);
+                let (status, error) = gh_commit_workflow(
+                    &client,
+                    token,
+                    &repo_api,
+                    &default_branch,
+                    provider,
+                    &pr_agent_template,
+                );
                 (default_branch, status, error)
             }
             Ok((status, body)) => (
@@ -2105,6 +2152,311 @@ fn github_setup_repo_blocking(
         }
     }
     serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+fn gh_default_branch(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+) -> Result<String, String> {
+    let (status, body) = gh_request_json(client, token, reqwest::Method::GET, repo_api, &[], None)?;
+    if status != 200 {
+        return Err(format!("repo lookup: {}", gh_error_text(status, &body)));
+    }
+    let repo_json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| "repo lookup: response was not JSON".to_string())?;
+    Ok(repo_json
+        .get("default_branch")
+        .and_then(|v| v.as_str())
+        .filter(|b| !b.is_empty())
+        .unwrap_or("main")
+        .to_string())
+}
+
+/// Delete one file from `branch` if it exists. Returns "removed" or "absent".
+fn gh_delete_file(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    branch: &str,
+    path: &str,
+    message: &str,
+) -> Result<&'static str, String> {
+    let url = format!("{}/contents/{}", repo_api, path);
+    let (status, body) =
+        gh_request_json(client, token, reqwest::Method::GET, &url, &[("ref", branch)], None)?;
+    match status {
+        404 => return Ok("absent"),
+        200 => {}
+        _ => return Err(format!("{}: {}", path, gh_error_text(status, &body))),
+    }
+    let sha = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("sha").and_then(|s| s.as_str()).map(str::to_string))
+        .ok_or_else(|| format!("{}: no file sha returned", path))?;
+    let payload = serde_json::json!({ "message": message, "sha": sha, "branch": branch });
+    let (status, body) =
+        gh_request_json(client, token, reqwest::Method::DELETE, &url, &[], Some(payload))?;
+    if status == 200 {
+        Ok("removed")
+    } else {
+        Err(format!("delete {}: {}", path, gh_error_text(status, &body)))
+    }
+}
+
+/// Turn auto review off for a repo: delete the review workflow files from the
+/// default branch and, when asked, the backend webhook(s) and the Actions secrets.
+/// Each step reports its own status; a failure in one does not stop the others.
+#[tauri::command]
+async fn github_disable_repo(
+    token: String,
+    repo: String,
+    remove_webhook: Option<bool>,
+    remove_secrets: Option<bool>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_disable_repo_blocking(
+            token,
+            repo,
+            remove_webhook.unwrap_or(true),
+            remove_secrets.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn github_disable_repo_blocking(
+    token: String,
+    repo: String,
+    remove_webhook: bool,
+    remove_secrets: bool,
+) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+    let mut errors = serde_json::Map::new();
+
+    let workflow_status = match gh_default_branch(&client, token, &repo_api) {
+        Ok(branch) => {
+            let mut removed = 0;
+            let mut failed = Vec::new();
+            for path in [".github/workflows/pr-agent.yml", ".github/workflows/openrabbit.yml"] {
+                match gh_delete_file(
+                    &client,
+                    token,
+                    &repo_api,
+                    &branch,
+                    path,
+                    "chore: disable PR Agent auto review (PR Agent Control)",
+                ) {
+                    Ok("removed") => removed += 1,
+                    Ok(_) => {}
+                    Err(e) => failed.push(e),
+                }
+            }
+            if !failed.is_empty() {
+                errors.insert("workflow".into(), failed.join("; ").into());
+                "failed"
+            } else if removed > 0 {
+                "removed"
+            } else {
+                "absent"
+            }
+        }
+        Err(e) => {
+            errors.insert("workflow".into(), e.into());
+            "failed"
+        }
+    };
+
+    let webhook_status = if !remove_webhook {
+        "skipped"
+    } else {
+        let hooks_url = format!("{}/hooks?per_page=100", repo_api);
+        match gh_request_json(&client, token, reqwest::Method::GET, &hooks_url, &[], None) {
+            Ok((200, body)) => {
+                let ids: Vec<u64> = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|h| {
+                        hook_url(h).is_some_and(|u| u.trim_end_matches('/').ends_with("/webhooks/github"))
+                    })
+                    .filter_map(|h| h.get("id").and_then(|id| id.as_u64()))
+                    .collect();
+                let mut failed = Vec::new();
+                for id in &ids {
+                    let url = format!("{}/hooks/{}", repo_api, id);
+                    match gh_request_json(&client, token, reqwest::Method::DELETE, &url, &[], None) {
+                        Ok((204, _)) | Ok((404, _)) => {}
+                        Ok((status, body)) => failed.push(format!("hook {}: {}", id, gh_error_text(status, &body))),
+                        Err(e) => failed.push(format!("hook {}: {}", id, e)),
+                    }
+                }
+                if !failed.is_empty() {
+                    errors.insert("webhook".into(), failed.join("; ").into());
+                    "failed"
+                } else if ids.is_empty() {
+                    "absent"
+                } else {
+                    "removed"
+                }
+            }
+            Ok((status, body)) => {
+                errors.insert("webhook".into(), gh_error_text(status, &body).into());
+                "failed"
+            }
+            Err(e) => {
+                errors.insert("webhook".into(), e.into());
+                "failed"
+            }
+        }
+    };
+
+    let secrets_status = if !remove_secrets {
+        "skipped"
+    } else {
+        let mut failed = Vec::new();
+        for name in ["OPENROUTER_API_KEY", "LLM_API_KEY"] {
+            let url = format!("{}/actions/secrets/{}", repo_api, name);
+            match gh_request_json(&client, token, reqwest::Method::DELETE, &url, &[], None) {
+                Ok((204, _)) | Ok((404, _)) => {}
+                Ok((status, body)) => failed.push(format!("{}: {}", name, gh_error_text(status, &body))),
+                Err(e) => failed.push(format!("{}: {}", name, e)),
+            }
+        }
+        if failed.is_empty() {
+            "removed"
+        } else {
+            errors.insert("secrets".into(), failed.join("; ").into());
+            "failed"
+        }
+    };
+
+    let mut result = serde_json::json!({
+        "repo": repo,
+        "ok": errors.is_empty(),
+        "workflow": workflow_status,
+        "webhook": webhook_status,
+        "secrets": secrets_status,
+    });
+    if !errors.is_empty() {
+        if let Some(map) = result.as_object_mut() {
+            map.insert("errors".into(), serde_json::Value::Object(errors));
+        }
+    }
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+/// Open pull requests (most recently updated first) for the "test on a PR" picker.
+#[tauri::command]
+async fn github_list_pulls(token: String, repo: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || github_list_pulls_blocking(token, repo))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_list_pulls_blocking(token: String, repo: String) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let client = gh_client()?;
+    let url = format!("https://api.github.com/repos/{}/pulls", repo);
+    let (status, body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("state", "open"), ("sort", "updated"), ("direction", "desc"), ("per_page", "20")],
+        None,
+    )?;
+    if status != 200 {
+        return Err(format!("list pull requests: {}", gh_error_text(status, &body)));
+    }
+    let items: Vec<serde_json::Value> = serde_json::from_str(&body)
+        .map_err(|_| "pull request list was not a JSON array".to_string())?;
+    let pulls: Vec<serde_json::Value> = items
+        .iter()
+        .filter_map(|p| {
+            Some(serde_json::json!({
+                "number": p.get("number")?.as_u64()?,
+                "title": p.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                "draft": p.get("draft").and_then(|v| v.as_bool()).unwrap_or(false),
+                "user": p.get("user").and_then(|u| u.get("login")).and_then(|v| v.as_str()).unwrap_or(""),
+                "html_url": p.get("html_url").and_then(|v| v.as_str()).unwrap_or(""),
+                "updated_at": p.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
+            }))
+        })
+        .collect();
+    serde_json::to_string(&pulls).map_err(|e| e.to_string())
+}
+
+/// Post a PR-Agent command (/review, /describe, /improve) as a comment on a PR.
+/// The repo's workflow picks it up through the issue_comment trigger.
+#[tauri::command]
+async fn github_pr_command(
+    token: String,
+    repo: String,
+    number: u64,
+    command: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || github_pr_command_blocking(token, repo, number, command))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_pr_command_blocking(
+    token: String,
+    repo: String,
+    number: u64,
+    command: String,
+) -> Result<String, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    if number == 0 {
+        return Err("pull request number is required".into());
+    }
+    let command = command.trim();
+    if !["/review", "/describe", "/improve"].contains(&command) {
+        return Err("command must be /review, /describe or /improve".into());
+    }
+    let client = gh_client()?;
+    let url = format!("https://api.github.com/repos/{}/issues/{}/comments", repo, number);
+    let (status, body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::POST,
+        &url,
+        &[],
+        Some(serde_json::json!({ "body": command })),
+    )?;
+    if status != 201 {
+        return Err(format!("post comment: {}", gh_error_text(status, &body)));
+    }
+    Ok(serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("html_url").and_then(|u| u.as_str()).map(str::to_string))
+        .unwrap_or_default())
 }
 
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
@@ -2241,6 +2593,7 @@ pub fn run() {
             check_tool,
             install_pr_agent,
             get_workflow_template,
+            preview_pr_agent_workflow,
             write_workflow,
             github_device_start,
             github_device_poll,
@@ -2256,7 +2609,10 @@ pub fn run() {
             backend_approve_run,
             github_list_repos,
             github_repo_status,
-            github_setup_repo
+            github_setup_repo,
+            github_disable_repo,
+            github_list_pulls,
+            github_pr_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2326,7 +2682,15 @@ mod setup_mode_tests {
 
     #[test]
     fn workflow_template_uses_current_token_setting() {
-        assert!(PR_AGENT_WORKFLOW.contains("CONFIG__MAX_MODEL_TOKENS"));
-        assert!(!PR_AGENT_WORKFLOW.contains("CUSTOM_MODEL_MAX_TOKENS"));
+        let yaml = autoreview::default_pr_agent_workflow();
+        assert!(yaml.contains("CONFIG__MAX_MODEL_TOKENS"));
+        assert!(!yaml.contains("CUSTOM_MODEL_MAX_TOKENS"));
+    }
+
+    #[test]
+    fn decodes_github_content_with_line_breaks() {
+        let encoded = format!("{}\n{}", &STANDARD.encode("hello world")[..8], &STANDARD.encode("hello world")[8..]);
+        let file = serde_json::json!({ "content": encoded, "sha": "abc" });
+        assert_eq!(gh_file_text(&file).unwrap(), "hello world");
     }
 }

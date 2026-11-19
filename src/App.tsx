@@ -7,6 +7,7 @@ import {
   Moon,
   Plug,
   RefreshCw,
+  Rocket,
   ScanSearch,
   Scale,
   Settings as SettingsIcon,
@@ -41,6 +42,7 @@ import { useGh, loadRepos } from "@/lib/github";
 import { forgetSecrets } from "@/lib/session";
 import { DEFAULT_MODEL, useApp, type TabId } from "@/lib/store";
 import { AgentsPage } from "@/pages/agents";
+import { AutoReviewPage } from "@/pages/auto-review";
 import { AutonomyPage } from "@/pages/autonomy";
 import { IntegrationsPage } from "@/pages/integrations";
 import { ProvidersPage } from "@/pages/providers";
@@ -59,6 +61,14 @@ interface TabDef {
 }
 
 const TABS: TabDef[] = [
+  {
+    id: "autoreview",
+    label: "Auto review",
+    title: "Auto review",
+    icon: Rocket,
+    group: "Workspace",
+    sub: "Deploy PR Agent to your GitHub repositories and review every pull request automatically.",
+  },
   {
     id: "review",
     label: "Review",
@@ -287,6 +297,7 @@ export function App() {
         <SidebarInset className="h-svh min-w-0 overflow-hidden">
           <Topbar />
           <main className="flex-1 overflow-y-auto p-4 sm:p-6">
+            <AutoReviewPage active={tab === "autoreview"} />
             <ReviewPage active={tab === "review"} />
             <AgentsPage active={tab === "agents"} />
             <RunsPage active={tab === "runs"} />
