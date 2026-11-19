@@ -90,7 +90,12 @@ function enableRepos(repos: string[]) {
 
 /** OpenRabbit repos: remove that workflow first so a PR does not get two reviewers. */
 async function switchToPrAgent(repo: string) {
-  await disableRepos([repo], { removeWebhook: false, removeSecrets: false });
+  const removed = await disableRepos([repo], { removeWebhook: false, removeSecrets: false });
+  if (!removed) {
+    // Installing PR Agent now would leave two reviewers on every PR.
+    toastErr("Switch to PR Agent", `Could not remove the OpenRabbit workflow from ${repo}; nothing was installed.`);
+    return;
+  }
   await enableRepos([repo]);
 }
 
@@ -427,6 +432,8 @@ function RepoRow({
     else if (state === "error") primary = { label: "Retry", run: () => loadStatus(name, true), variant: "outline" };
   }
   const active = isActive(state) || state === "needs-key";
+  // /review etc. are answered only by the PR Agent workflow with its secret in place.
+  const runsPrAgent = state === "on" || state === "outdated" || state === "custom";
 
   return (
     <div
@@ -483,6 +490,8 @@ function RepoRow({
         ) : null}
         {active ? (
           <>
+            {runsPrAgent ? (
+              <>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon-sm" onClick={() => onTry(name)} aria-label={`Run on a pull request in ${name}`}>
@@ -499,6 +508,8 @@ function RepoRow({
               </TooltipTrigger>
               <TooltipContent>View runs on GitHub</TooltipContent>
             </Tooltip>
+              </>
+            ) : null}
             {repo.admin ? (
               <Tooltip>
                 <TooltipTrigger asChild>

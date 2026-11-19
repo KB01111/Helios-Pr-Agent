@@ -575,7 +575,8 @@ export async function configure(opts: ConfigureOptions) {
           openrouterKey: orKey,
           workflowProvider: provider,
           reviewMode: mode,
-          workflowOptions,
+          // Only the PR Agent workflow uses these; other setups must not depend on them.
+          workflowOptions: useActions && provider === "pr-agent" ? workflowOptions : undefined,
         });
         if (cancelled()) break; // secrets were cleared mid-request: leave shared state alone
         const r = jsonObj(raw);
@@ -645,13 +646,14 @@ export interface DisableOptions {
 }
 
 /** Remove the review workflow (and optionally webhook/secrets) from each repo. */
-export async function disableRepos(repos: string[], opts: DisableOptions) {
+/** Resolves true only when every repo was processed without error. */
+export async function disableRepos(repos: string[], opts: DisableOptions): Promise<boolean> {
   const t = token();
   if (!t) {
     toastErr("Disable auto review", "Sign in with GitHub first.");
-    return;
+    return false;
   }
-  if (gh().batchRunning || !repos.length) return;
+  if (gh().batchRunning || !repos.length) return false;
   const sg = sessionGen;
   const stale = () => sg !== sessionGen || token() !== t;
   useGh.setState({ batchRunning: true });
@@ -691,6 +693,7 @@ export async function disableRepos(repos: string[], opts: DisableOptions) {
       if (ok) toastOk("Auto review disabled", `${ok} repo(s) — workflow removed.`);
       if (bad) toastErr("Disable auto review", `${bad} repo(s) failed — see the activity log.`);
     }
+    return bad === 0 && ok === repos.length;
   } finally {
     if (!stale()) useGh.setState({ batchRunning: false, configuring: [] });
   }

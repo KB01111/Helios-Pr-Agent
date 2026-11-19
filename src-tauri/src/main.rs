@@ -2030,9 +2030,6 @@ fn github_setup_repo_blocking(
     workflow_options: WorkflowOptions,
 ) -> Result<String, String> {
     let plan = setup_plan(&review_mode)?;
-    // Validate before touching the repo so a bad setting cannot half-configure it.
-    let workflow_options = workflow_options.normalized()?;
-    let pr_agent_template = autoreview::render_pr_agent_workflow(&workflow_options);
     let token = token.trim();
     if token.is_empty() {
         return Err("GitHub token is required".into());
@@ -2073,6 +2070,13 @@ fn github_setup_repo_blocking(
         "pr-agent" => ".github/workflows/pr-agent.yml",
         "openrabbit" => ".github/workflows/openrabbit.yml",
         _ => return Err("workflow_provider must be 'pr-agent' or 'openrabbit'".into()),
+    };
+    // Validate before touching the repo so a bad setting cannot half-configure it.
+    // Backend-only and OpenRabbit setups never use these options, so they are not checked.
+    let pr_agent_template = if plan.actions && provider == "pr-agent" {
+        autoreview::render_pr_agent_workflow(&workflow_options.normalized()?)
+    } else {
+        String::new()
     };
 
     let client = gh_client()?;
