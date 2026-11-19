@@ -454,12 +454,13 @@ function staleReviewPath(mode: ReviewMode, st: any): string {
 
 const errSuffix = (msg: unknown) => (msg ? " — " + String(msg).slice(0, 220) : "");
 
-export async function configure(opts: ConfigureOptions) {
-  if (gh().batchRunning) return;
+/** Resolves to the repos whose setup finished without a failed step. */
+export async function configure(opts: ConfigureOptions): Promise<string[]> {
+  if (gh().batchRunning) return [];
   const t = token();
   if (!t) {
     toastErr("GitHub setup", "Sign in with GitHub first.");
-    return;
+    return [];
   }
   const { mode, base, provider } = opts;
   const useWebhook = mode !== "actions"; // webhook + backend agent
@@ -472,12 +473,12 @@ export async function configure(opts: ConfigureOptions) {
   }
   if (useWebhook && (!parsedBase || !/^https?:$/.test(parsedBase.protocol))) {
     toastErr("GitHub setup", "Set a valid http(s) base URL in the GitHub webhook URL card (or Settings backend URL).");
-    return;
+    return [];
   }
   const repos = (opts.repos ?? (opts.retryOnly ? gh().failed : gh().selected)).filter(Boolean);
   if (!repos.length) {
     toastErr("GitHub setup", opts.retryOnly ? "No failed repositories to retry." : "Select at least one repository.");
-    return;
+    return [];
   }
   const orKey = opts.orKey.trim();
   const workflowOptions = opts.workflowOptions ?? useAutoReview.getState().options;
@@ -485,12 +486,12 @@ export async function configure(opts: ConfigureOptions) {
     const problem = optionsProblem(workflowOptions);
     if (problem) {
       toastErr("Auto review settings", problem);
-      return;
+      return [];
     }
   }
   if (provider !== "pr-agent" && provider !== "openrabbit") {
     toastErr("GitHub setup", "Choose a workflow provider (pr-agent or openrabbit).");
-    return;
+    return [];
   }
 
   const successful: string[] = [];
@@ -511,7 +512,7 @@ export async function configure(opts: ConfigureOptions) {
       if (lacking().length) {
         out("[config] no OpenRouter key entered — checking which repos already have the secret…");
         await loadStatusMany(lacking(), true);
-        if (cancelled()) return;
+        if (cancelled()) return [];
       }
       const missing = lacking();
       if (missing.length) {
@@ -525,7 +526,7 @@ export async function configure(opts: ConfigureOptions) {
             ? `Could not read the Actions secrets of ${unknown.length} repo(s) (${unknown[0]}…). Check the activity log, retry, or enter the key.`
             : `Enter your OpenRouter API key first — ${missing.length} repo(s) do not have the OPENROUTER_API_KEY secret yet.`,
         );
-        return;
+        return [];
       }
     }
     let secret = opts.secret.trim();
@@ -540,7 +541,7 @@ export async function configure(opts: ConfigureOptions) {
       } catch {
         backendHasSecret = null;
       }
-      if (cancelled()) return;
+      if (cancelled()) return [];
       if (backendHasSecret !== false) {
         toastErr(
           "GitHub setup",
@@ -548,7 +549,7 @@ export async function configure(opts: ConfigureOptions) {
             ? "The backend already has a webhook secret. Enter that secret in the field — or click Generate to replace it, then re-run setup for every repo."
             : `Could not check whether ${base} already has a webhook secret. Enter the secret in the field (or Generate one), then retry.`,
         );
-        return;
+        return [];
       }
       secret = ghRandomSecret();
       opts.onSecretGenerated?.(secret);
@@ -565,17 +566,17 @@ export async function configure(opts: ConfigureOptions) {
     }
     if (useWebhook && opts.saveSecret) {
       const saved = await saveEnv("GITHUB_WEBHOOK_SECRET", secret);
-      if (cancelled()) return;
+      if (cancelled()) return [];
       if (!saved) {
         // GitHub would sign deliveries with a secret the backend does not know.
         out("[setup] aborted: the webhook secret could not be saved to backend/.env, so no repository was changed.");
-        return;
+        return [];
       }
       out("[env] restart the backend to pick up .env changes.");
     }
     if (opts.saveToken) {
       await saveEnv("GITHUB_TOKEN", t);
-      if (cancelled()) return;
+      if (cancelled()) return [];
     }
 
     for (const repo of repos) {
@@ -651,6 +652,7 @@ export async function configure(opts: ConfigureOptions) {
     // A cancelled batch must not clear the state of a newer one.
     if (!cancelled()) useGh.setState({ batchRunning: false, configuring: [] });
   }
+  return successful;
 }
 
 /** Where the webhook target would point (used for the "localhost" warning). */

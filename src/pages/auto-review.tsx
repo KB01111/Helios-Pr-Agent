@@ -90,15 +90,30 @@ function enableRepos(repos: string[]) {
 
 /**
  * Install PR Agent on every repo. Repos reviewed by OpenRabbit are switched safely:
- * the OpenRabbit workflow is removed only after PR Agent is confirmed installed, so
- * invalid settings or a failed install never leave a repo without a reviewer.
+ * the OpenRabbit workflow is removed only for repos whose PR Agent setup reported
+ * success, so invalid settings or a failed step never leave a repo without a reviewer.
  */
-async function enableWithSwitch(repos: string[]) {
-  const rabbit = repos.filter((r) => repoState(useGh.getState().status[r]) === "openrabbit");
-  await enableRepos(repos);
+async function enableWithSwitch(input: string[]) {
+  const statuses = () => useGh.getState().status;
+  // Classify only from a loaded status: a repo that was never read could be an OpenRabbit one.
+  const unread = () =>
+    input.filter((r) => {
+      const s = repoState(statuses()[r]);
+      return s === "unknown" || s === "error";
+    });
+  if (unread().length) await loadStatusMany(unread(), true);
+  const skipped = unread();
+  if (skipped.length) {
+    toastErr("Enable", `Could not read the status of ${skipped.length} repo(s) (${skipped[0]}…), so they were skipped. Retry from the list.`);
+  }
+  const repos = input.filter((r) => !skipped.includes(r));
+  if (!repos.length) return;
+
+  const rabbit = repos.filter((r) => repoState(statuses()[r]) === "openrabbit");
+  const installed = await enableRepos(repos);
   for (const r of rabbit) {
-    if (repoState(useGh.getState().status[r]) !== "on") {
-      toastErr("Switch to PR Agent", `${r}: PR Agent was not installed, so OpenRabbit was left in place.`);
+    if (!installed.includes(r)) {
+      toastErr("Switch to PR Agent", `${r}: PR Agent setup did not finish, so OpenRabbit was left in place.`);
       continue;
     }
     const removed = await disableRepos([r], { removeWebhook: false, removeSecrets: false, keepPrAgent: true });
@@ -436,7 +451,7 @@ function RepoRow({
 
   let primary: { label: string; run: () => unknown; variant: "default" | "outline" } | null = null;
   if (repo.admin) {
-    if (state === "off" || state === "unknown" || state === "backend") primary = { label: "Enable", run: () => enableRepos([name]), variant: "default" };
+    if (state === "off" || state === "unknown" || state === "backend") primary = { label: "Enable", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "outdated" || state === "custom" || differs) primary = { label: "Update", run: () => enableRepos([name]), variant: "default" };
     else if (state === "needs-key") primary = { label: "Add key", run: () => enableRepos([name]), variant: "default" };
     else if (state === "openrabbit") primary = { label: "Switch to PR Agent", run: () => enableWithSwitch([name]), variant: "outline" };

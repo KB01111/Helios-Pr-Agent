@@ -72,9 +72,10 @@ private repos, the GitHub token needs `repo` scope.
 ## Auto review: deploy PR Agent to your repos
 
 The **Auto review** page (the app's start page) is the quickest way to get every pull
-request reviewed. Reviews run in GitHub Actions, so nothing needs hosting. Pull requests
-from forks are the exception: GitHub withholds repository secrets from them, so the
-workflow logs a warning and skips those runs.
+request reviewed. Reviews run in GitHub Actions, so nothing needs hosting. By default
+GitHub withholds repository secrets from pull requests that come from forks (private repos
+can opt in to sending them). Whenever `OPENROUTER_API_KEY` is unavailable to a run, the
+workflow logs a warning and skips PR Agent, so such fork PRs are not reviewed.
 
 1. **Connect GitHub** — device flow, or a PAT with the `repo` **and** `workflow` scopes
    (session only). `workflow` is required to create or update files in
