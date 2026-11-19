@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the rendered template changes in a way existing repos should pick up.
-pub const TEMPLATE_VERSION: u32 = 2;
+pub const TEMPLATE_VERSION: u32 = 3;
 /// First-line marker of a workflow this app manages.
 pub const MANAGED_MARKER: &str = "# pr-agent-control: ";
 /// Pinned so a compromised upstream branch cannot receive repository secrets.
@@ -143,15 +143,14 @@ pub fn render_pr_agent_workflow(opts: &WorkflowOptions) -> String {
     } else {
         ""
     };
-    // Pushes re-run the review only: describe/improve run once when the PR opens,
-    // otherwise every push would rewrite the description and re-post suggestions.
+    // Describe/improve run once, when the PR opens or is marked ready (so a draft that
+    // was skipped on open still gets them). Pushes and reopens only re-run the review,
+    // otherwise they would rewrite the description and re-post suggestions.
     let on_open_only = |enabled: bool| -> String {
-        if !enabled {
-            yaml_bool(false).to_string()
-        } else if opts.review_on_push {
-            "${{ github.event.action == 'synchronize' && 'false' || 'true' }}".to_string()
+        if enabled {
+            "${{ github.event.action == 'opened' || github.event.action == 'ready_for_review' }}".to_string()
         } else {
-            yaml_bool(true).to_string()
+            yaml_bool(false).to_string()
         }
     };
     let instructions = if opts.extra_instructions.is_empty() {
@@ -182,9 +181,11 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # A new push cancels the review still running for the previous commit.
-  group: ${{{{ github.workflow }}}}-${{{{ github.event_name == 'pull_request' && format('pr-{{0}}', github.event.pull_request.number) || format('run-{{0}}', github.run_id) }}}}
-  cancel-in-progress: true
+  # A new push cancels the review still running for the previous commit. Runs for other
+  # events (opened, ready_for_review, comments) use their own group and are never cancelled,
+  # so a quick push cannot drop the PR description that is still being written.
+  group: ${{{{ github.workflow }}}}-${{{{ github.event_name == 'pull_request' && format('pr-{{0}}-{{1}}', github.event.pull_request.number, github.event.action == 'synchronize' && 'push' || 'open') || format('run-{{0}}', github.run_id) }}}}
+  cancel-in-progress: ${{{{ github.event.action == 'synchronize' }}}}
 
 jobs:
   pr_agent_job:
@@ -275,6 +276,9 @@ pub fn describe_workflow(content: &str) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    const OPEN_ONLY: &str =
+        "${{ github.event.action == 'opened' || github.event.action == 'ready_for_review' }}";
+
     fn opts() -> WorkflowOptions {
         WorkflowOptions::default().normalized().unwrap()
     }
@@ -300,12 +304,12 @@ mod tests {
         assert!(yaml.contains(
             "github_action_config.pr_actions: '[\"opened\",\"reopened\",\"ready_for_review\",\"synchronize\"]'"
         ));
-        // Describe runs once on open, not on every push.
-        assert!(yaml.contains(
-            "github_action_config.auto_describe: ${{ github.event.action == 'synchronize' && 'false' || 'true' }}"
-        ));
+        // Describe runs once when the PR opens or becomes ready, not on pushes or reopens.
+        assert!(yaml.contains(&format!("github_action_config.auto_describe: {}", OPEN_ONLY)));
         assert!(yaml.contains("github_action_config.auto_improve: \"false\""));
-        assert!(yaml.contains("group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}'"));
+        assert!(yaml.contains("group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}-{1}'"));
+        // Only pushes cancel an earlier run, so open-only work is never dropped.
+        assert!(yaml.contains("cancel-in-progress: ${{ github.event.action == 'synchronize' }}"));
         assert!(!yaml.contains("EXTRA_INSTRUCTIONS"));
     }
 
@@ -322,8 +326,8 @@ mod tests {
         let yaml = render_pr_agent_workflow(&o);
         assert!(yaml.contains("types: [opened, reopened, ready_for_review]\n"));
         assert!(!yaml.contains("pull_request.draft"));
-        assert!(yaml.contains("github_action_config.auto_improve: \"true\""));
-        assert!(yaml.contains("github_action_config.auto_describe: \"true\""));
+        assert!(yaml.contains(&format!("github_action_config.auto_improve: {}", OPEN_ONLY)));
+        assert!(yaml.contains(&format!("github_action_config.auto_describe: {}", OPEN_ONLY)));
     }
 
     #[test]

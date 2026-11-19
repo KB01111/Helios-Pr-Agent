@@ -420,7 +420,7 @@ function RepoRow({
 
   const errs: string[] = [];
   if (st && st.error) errs.push(String(st.error));
-  for (const k of ["workflow", "secrets"]) if (st && st[k] && st[k].error) errs.push(`${k}: ${st[k].error}`);
+  for (const k of ["webhook", "workflow", "secrets"]) if (st && st[k] && st[k].error) errs.push(`${k}: ${st[k].error}`);
   const why = "Admin access is required to add workflows and secrets.";
 
   let primary: { label: string; run: () => unknown; variant: "default" | "outline" } | null = null;
@@ -534,6 +534,8 @@ function RepoRow({
 }
 
 function DisableDialog({ repos, onClose }: { repos: string[]; onClose: () => void }) {
+  const cloudBase = useApp((s) => s.cloudBase);
+  const hookUrl = `${webhookBase(cloudBase)}/webhooks/github`;
   const [removeWebhook, setRemoveWebhook] = React.useState(true);
   const [removeSecrets, setRemoveSecrets] = React.useState(false);
   const open = repos.length > 0;
@@ -559,7 +561,7 @@ function DisableDialog({ repos, onClose }: { repos: string[]; onClose: () => voi
           <Label className="font-normal">
             <Checkbox checked={removeWebhook} onCheckedChange={(v) => setRemoveWebhook(v === true)} />
             <span>
-              Also remove the backend webhook (<code>…/webhooks/github</code>) if present
+              Also remove the webhook for this backend (<code className="break-all">{hookUrl}</code>) if present
             </span>
           </Label>
           <Label className="font-normal">
@@ -578,7 +580,7 @@ function DisableDialog({ repos, onClose }: { repos: string[]; onClose: () => voi
             onClick={async () => {
               const list = repos.slice();
               onClose();
-              await disableRepos(list, { removeWebhook, removeSecrets });
+              await disableRepos(list, { removeWebhook, removeSecrets, webhookUrl: hookUrl });
             }}
           >
             <PowerOff /> Turn off

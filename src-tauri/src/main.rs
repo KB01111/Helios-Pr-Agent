@@ -814,7 +814,7 @@ fn github_device_start_blocking(client_id: String) -> Result<serde_json::Value, 
     let res: serde_json::Value = gh_client()?
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
-        .json(&serde_json::json!({ "client_id": client_id, "scope": "repo" }))
+        .json(&serde_json::json!({ "client_id": client_id, "scope": "repo workflow" }))
         .send()
         .map_err(|e| e.to_string())?
         .json()
@@ -1732,43 +1732,37 @@ fn gh_setup_webhook(
 }
 
 /// No key supplied: succeed only if the repo already has the secrets the workflow needs.
+/// Each secret is looked up by name, so repos with many secrets are not a problem.
 fn gh_keep_secrets(
     client: &reqwest::blocking::Client,
     token: &str,
     repo_api: &str,
     provider: &str,
 ) -> (&'static str, Option<String>) {
-    let url = format!("{}/actions/secrets?per_page=100", repo_api);
-    let names: Vec<String> = match gh_request_json(client, token, reqwest::Method::GET, &url, &[], None) {
-        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("secrets").and_then(|s| s.as_array()).cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(str::to_string))
-            .collect(),
-        Ok((status, body)) => {
-            return ("failed", Some(format!("actions secrets: {}", gh_error_text(status, &body))))
-        }
-        Err(e) => return ("failed", Some(format!("actions secrets: {}", e))),
-    };
     let needed: &[&str] = if provider == "openrabbit" {
         &["OPENROUTER_API_KEY", "LLM_API_KEY"]
     } else {
         &["OPENROUTER_API_KEY"]
     };
-    let missing: Vec<&str> = needed
-        .iter()
-        .copied()
-        .filter(|n| !names.iter().any(|have| have == n))
-        .collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for name in needed {
+        let url = format!("{}/actions/secrets/{}", repo_api, name);
+        match gh_request_json(client, token, reqwest::Method::GET, &url, &[], None) {
+            Ok((200, _)) => {}
+            Ok((404, _)) => missing.push(name),
+            Ok((status, body)) => {
+                return ("failed", Some(format!("actions secret {}: {}", name, gh_error_text(status, &body))))
+            }
+            Err(e) => return ("failed", Some(format!("actions secret {}: {}", name, e))),
+        }
+    }
     if missing.is_empty() {
         ("kept", None)
     } else {
         (
             "failed",
             Some(format!(
-                "no OpenRouter key was given and the repo has no {} secret yet",
+                "no OpenRouter key was given and the repo has no {} secret",
                 missing.join(" / ")
             )),
         )
@@ -2083,11 +2077,6 @@ fn github_setup_repo_blocking(
     let repo_api = format!("https://api.github.com/repos/{}", repo);
     let webhook_url = format!("{}/webhooks/github", backend);
 
-    let (webhook_status, webhook_error) = if plan.webhook {
-        gh_setup_webhook(&client, token, &repo_api, &webhook_url, webhook_secret)
-    } else {
-        ("skipped", None)
-    };
     let (secrets_status, secrets_error) = if plan.actions && openrouter_key.is_empty() {
         gh_keep_secrets(&client, token, &repo_api, provider)
     } else if plan.actions {
@@ -2095,9 +2084,17 @@ fn github_setup_repo_blocking(
     } else {
         ("skipped", None)
     };
+    // No key was given and the repo's own secret is gone: stop before changing anything,
+    // as setup always did for a blank key.
+    let abort = plan.actions && openrouter_key.is_empty() && secrets_status == "failed";
+    let (webhook_status, webhook_error) = if plan.webhook && !abort {
+        gh_setup_webhook(&client, token, &repo_api, &webhook_url, webhook_secret)
+    } else {
+        ("skipped", None)
+    };
 
     let (default_branch, workflow_status, workflow_error): (String, &'static str, Option<String>) =
-        if !plan.actions {
+        if !plan.actions || abort {
             (String::new(), "skipped", None)
         } else { match gh_request_json(&client, token, reqwest::Method::GET, &repo_api, &[], None) {
             Ok((200, body)) => {
@@ -2217,6 +2214,7 @@ async fn github_disable_repo(
     repo: String,
     remove_webhook: Option<bool>,
     remove_secrets: Option<bool>,
+    webhook_url: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         github_disable_repo_blocking(
@@ -2224,6 +2222,7 @@ async fn github_disable_repo(
             repo,
             remove_webhook.unwrap_or(true),
             remove_secrets.unwrap_or(false),
+            webhook_url,
         )
     })
     .await
@@ -2235,6 +2234,7 @@ fn github_disable_repo_blocking(
     repo: String,
     remove_webhook: bool,
     remove_secrets: bool,
+    webhook_url: Option<String>,
 ) -> Result<String, String> {
     let token = token.trim();
     if token.is_empty() {
@@ -2281,9 +2281,16 @@ fn github_disable_repo_blocking(
         }
     };
 
-    let webhook_status = if !remove_webhook {
+    // Only the hook registered for this backend is removed: other services may
+    // use the same path on a different host. Without a URL nothing is touched.
+    let hook_target = webhook_url
+        .as_deref()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty());
+    let webhook_status = if !remove_webhook || hook_target.is_none() {
         "skipped"
     } else {
+        let target = hook_target.unwrap_or_default();
         let hooks_url = format!("{}/hooks?per_page=100", repo_api);
         match gh_request_json(&client, token, reqwest::Method::GET, &hooks_url, &[], None) {
             Ok((200, body)) => {
@@ -2293,7 +2300,7 @@ fn github_disable_repo_blocking(
                     .unwrap_or_default()
                     .iter()
                     .filter(|h| {
-                        hook_url(h).is_some_and(|u| u.trim_end_matches('/').ends_with("/webhooks/github"))
+                        hook_url(h).is_some_and(|u| u.trim_end_matches('/') == target)
                     })
                     .filter_map(|h| h.get("id").and_then(|id| id.as_u64()))
                     .collect();

@@ -71,15 +71,20 @@ export function sameOptions(a: Partial<WorkflowOptions> | null | undefined, b: W
   return (Object.keys(y) as (keyof WorkflowOptions)[]).every((k) => JSON.stringify(x[k]) === JSON.stringify(y[k]));
 }
 
-/** Client-side check mirroring the Rust validation, for instant feedback. */
-export function optionsProblem(o: WorkflowOptions): string {
+/** Client-side check mirroring the Rust validation, so an enabled button means the settings pass. */
+export function optionsProblem(raw: WorkflowOptions): string {
+  // Rust trims and drops blanks before checking, so check the normalized values.
+  const o = normalizeOptions(raw);
   if (!(o.auto_review || o.auto_describe || o.auto_improve)) return "Turn on at least one of review, describe or improve.";
-  const bad = [o.model, ...o.fallback_models].find((m) => !/^[A-Za-z0-9/._:-]{1,200}$/.test(m.trim()));
+  const bad = [o.model, ...o.fallback_models].find((m) => !/^[A-Za-z0-9/._:-]{1,200}$/.test(m));
   if (bad !== undefined) return `Model id "${bad}" has unsupported characters.`;
   if (o.fallback_models.length > 5) return "Use at most 5 fallback models.";
-  if (!(o.max_tokens >= 1000 && o.max_tokens <= 2000000)) return "Max tokens must be between 1,000 and 2,000,000.";
+  if (!(raw.max_tokens >= 1000 && raw.max_tokens <= 2000000)) return "Max tokens must be between 1,000 and 2,000,000.";
+  if (!["none", "low", "medium", "high"].includes(o.reasoning_effort)) return "Reasoning effort must be none, low, medium or high.";
   if (o.extra_instructions.includes("${{")) return "Instructions must not contain '${{' (GitHub would evaluate it).";
-  if (o.extra_instructions.length > 2000) return "Instructions are limited to 2,000 characters.";
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/.test(o.extra_instructions)) return "Instructions contain control characters.";
+  if ([...o.extra_instructions].length > 2000) return "Instructions are limited to 2,000 characters.";
   return "";
 }
 
@@ -120,6 +125,10 @@ export function repoState(st: any): RepoState {
   if (st.error) return "error";
   const wf = st.workflow || {};
   const secrets = st.secrets || {};
+  // Do not report Off / Missing key when the lookup that decides it failed.
+  if (wf.error) return "error";
+  if (wf.configured && secrets.error) return "error";
+  if (!wf.configured && st.webhook && st.webhook.error) return "error";
   if (wf.configured && wf.provider === "openrabbit") return secrets.configured ? "openrabbit" : "needs-key";
   if (wf.configured) {
     if (!secrets.openrouter_api_key) return "needs-key";

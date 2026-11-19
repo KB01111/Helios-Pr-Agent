@@ -350,8 +350,10 @@ export async function loadStatus(name: string, force: boolean): Promise<void> {
 
 export async function loadStatusMany(names: string[], force: boolean) {
   const queue = names.slice();
+  // Stop taking repos from the queue once the GitHub session changed (sign-out, other account).
+  const sg = sessionGen;
   const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
-    while (queue.length) await loadStatus(queue.shift() as string, force);
+    while (queue.length && sg === sessionGen) await loadStatus(queue.shift() as string, force);
   });
   await Promise.all(workers);
 }
@@ -473,19 +475,6 @@ export async function configure(opts: ConfigureOptions) {
     return;
   }
   const orKey = opts.orKey.trim();
-  if (useActions && !orKey) {
-    // Without a key, setup keeps each repo's existing OPENROUTER_API_KEY secret.
-    // Only allow that when every target repo is known to have one.
-    const st = gh().status;
-    const lacking = repos.filter((r) => !(st[r] && st[r].secrets && st[r].secrets.openrouter_api_key));
-    if (lacking.length) {
-      toastErr(
-        "OpenRouter key needed",
-        `Enter your OpenRouter API key first — ${lacking.length} repo(s) do not have the OPENROUTER_API_KEY secret yet.`,
-      );
-      return;
-    }
-  }
   const workflowOptions = opts.workflowOptions ?? useAutoReview.getState().options;
   if (useActions && provider === "pr-agent") {
     const problem = optionsProblem(workflowOptions);
@@ -509,6 +498,31 @@ export async function configure(opts: ConfigureOptions) {
     if (!cancelled()) ghOut(line);
   };
   try {
+    if (useActions && !orKey) {
+      // Without a key, setup keeps each repo's existing OPENROUTER_API_KEY secret.
+      // Re-read the live status first: the cached one may predate the secret.
+      const lacking = () =>
+        repos.filter((r) => !(gh().status[r] && gh().status[r].secrets && gh().status[r].secrets.openrouter_api_key));
+      if (lacking().length) {
+        out("[config] no OpenRouter key entered — checking which repos already have the secret…");
+        await loadStatusMany(lacking(), true);
+        if (cancelled()) return;
+      }
+      const missing = lacking();
+      if (missing.length) {
+        const unknown = missing.filter((r) => {
+          const st = gh().status[r];
+          return !st || st.error || (st.secrets && st.secrets.error);
+        });
+        toastErr(
+          "OpenRouter key needed",
+          unknown.length
+            ? `Could not read the Actions secrets of ${unknown.length} repo(s) (${unknown[0]}…). Check the activity log, retry, or enter the key.`
+            : `Enter your OpenRouter API key first — ${missing.length} repo(s) do not have the OPENROUTER_API_KEY secret yet.`,
+        );
+        return;
+      }
+    }
     let secret = opts.secret.trim();
     if (useWebhook && !secret) {
       // The backend verifies every webhook against ONE global secret. Generating a new
@@ -643,6 +657,8 @@ export function webhookBase(cloudBase: string): string {
 export interface DisableOptions {
   removeWebhook: boolean;
   removeSecrets: boolean;
+  /** Exact webhook URL registered for this backend; only that hook is removed. */
+  webhookUrl?: string;
 }
 
 /** Remove the review workflow (and optionally webhook/secrets) from each repo. */
@@ -657,6 +673,9 @@ export async function disableRepos(repos: string[], opts: DisableOptions): Promi
   const sg = sessionGen;
   const stale = () => sg !== sessionGen || token() !== t;
   useGh.setState({ batchRunning: true });
+  // Release the lock by batch generation, not by token: editing the token mid-batch
+  // stops the loop but must not leave batchRunning stuck.
+  const myBatch = ++batchGen;
   let ok = 0;
   let bad = 0;
   try {
@@ -671,6 +690,7 @@ export async function disableRepos(repos: string[], opts: DisableOptions): Promi
             repo,
             removeWebhook: opts.removeWebhook,
             removeSecrets: opts.removeSecrets,
+            webhookUrl: opts.webhookUrl,
           }),
         );
         if (stale()) break;
@@ -684,7 +704,7 @@ export async function disableRepos(repos: string[], opts: DisableOptions): Promi
         bad++;
         ghOut(`[${repo}] error: ${errText(e, 300)}`);
       } finally {
-        if (!stale()) useGh.setState({ configuring: gh().configuring.filter((n) => n !== repo) });
+        if (myBatch === batchGen) useGh.setState({ configuring: gh().configuring.filter((n) => n !== repo) });
       }
       await loadStatus(repo, true);
     }
@@ -695,7 +715,7 @@ export async function disableRepos(repos: string[], opts: DisableOptions): Promi
     }
     return bad === 0 && ok === repos.length;
   } finally {
-    if (!stale()) useGh.setState({ batchRunning: false, configuring: [] });
+    if (myBatch === batchGen) useGh.setState({ batchRunning: false, configuring: [] });
   }
 }
 

@@ -72,9 +72,14 @@ private repos, the GitHub token needs `repo` scope.
 ## Auto review: deploy PR Agent to your repos
 
 The **Auto review** page (the app's start page) is the quickest way to get every pull
-request reviewed. Reviews run in GitHub Actions, so nothing needs hosting.
+request reviewed. Reviews run in GitHub Actions, so nothing needs hosting. Pull requests
+from forks are the exception: GitHub withholds repository secrets from them, so the
+workflow logs a warning and skips those runs.
 
-1. **Connect GitHub** — device flow or a PAT with `repo` scope (session only).
+1. **Connect GitHub** — device flow, or a PAT with the `repo` **and** `workflow` scopes
+   (session only). `workflow` is required to create or update files in
+   `.github/workflows`. Sign-ins made before this scope was added only have `repo`: use
+   **Sign in again** (or paste a new PAT) once, otherwise Enable fails at the workflow step.
 2. **OpenRouter key** — paste a free key ([openrouter.ai/settings/keys](https://openrouter.ai/settings/keys)).
    It is stored encrypted as each repo's `OPENROUTER_API_KEY` Actions secret. Updating a repo
    that already has the secret works without the key.
@@ -93,8 +98,8 @@ settings in one go. Per repo you can also:
 - **Run on a pull request** — pick an open PR and post `/review`, `/describe` or `/improve`;
   the workflow replies on the PR.
 - **View runs** — opens the workflow's Actions page.
-- **Turn off** — deletes the workflow file with a commit (optionally also the
-  `…/webhooks/github` webhook and the repo secrets).
+- **Turn off** — deletes the workflow file with a commit (optionally also the webhook
+  registered for the backend URL shown in the dialog, and the repo secrets).
 
 The generated workflow writes its settings as JSON on its first line
 (`# pr-agent-control: {...}`), which is how the app reads them back. Compared with the old
@@ -102,8 +107,10 @@ fixed template it also:
 
 - re-reviews on `synchronize` (PR-Agent ignores that action unless it is listed in
   `github_action_config.pr_actions`), editing one persistent review comment instead of
-  adding a new one per push; describe/improve still run only when the PR opens;
-- cancels the previous run for the same PR when a new commit arrives;
+  adding a new one per push; describe/improve run only when the PR opens or is marked
+  ready for review, not on pushes or reopens;
+- cancels the previous run for the same PR when a new commit arrives. Only pushes cancel
+  each other, so a quick push cannot drop a description that is still being written;
 - skips draft PRs until they are ready for review (optional);
 - only answers `/commands` on pull requests (not plain issues) from owners, members and
   collaborators, and skips cleanly with a warning when the secret is missing (e.g. fork PRs);
