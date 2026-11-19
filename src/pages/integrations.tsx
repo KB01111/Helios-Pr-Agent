@@ -671,7 +671,12 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
   return (
     <Section
       title="GitHub — 1-click repo setup"
-      description="Sign in with a GitHub OAuth App (Device Flow), tick repositories, and the app wires up webhooks, repo secrets and workflow files for each."
+      description={
+        <>
+          Advanced setup with webhook/backend modes and the OpenRabbit reviewer. For the simple path — PR Agent in GitHub
+          Actions with your review settings — use the <b>Auto review</b> page.
+        </>
+      }
       action={<GithubStateBadge />}
     >
       <GithubConnect />

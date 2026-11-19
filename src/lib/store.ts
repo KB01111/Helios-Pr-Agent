@@ -62,6 +62,7 @@ function loadSecrets(): Record<SecretName, string> {
 }
 
 export type TabId =
+  | "autoreview"
   | "review"
   | "agents"
   | "runs"
@@ -72,6 +73,7 @@ export type TabId =
   | "settings";
 
 export const TAB_IDS: TabId[] = [
+  "autoreview",
   "review",
   "agents",
   "runs",
@@ -188,7 +190,7 @@ interface AppState {
 const initialTheme = (): "dark" | "light" => (lsGet("pragent.theme") === "light" ? "light" : "dark");
 const initialTab = (): TabId => {
   const t = lsGet("pragent.tab") as TabId;
-  return TAB_IDS.includes(t) ? t : "review";
+  return TAB_IDS.includes(t) ? t : "autoreview";
 };
 
 export const useApp = create<AppState>((set, get) => ({
