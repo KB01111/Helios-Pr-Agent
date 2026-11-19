@@ -631,10 +631,13 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
   const [posted, setPosted] = React.useState<{ repo: string; number: number; url: string } | null>(null);
 
   // Bumped whenever the dialog opens, switches repo or closes, so a command that
-  // finishes after that cannot show its link in a later session.
+  // finishes after that cannot show its link in a later session. A layout effect runs
+  // synchronously with the commit, before any later completion can be handled.
   const session = React.useRef(0);
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
     session.current += 1;
+  }, [repo]);
+  React.useEffect(() => {
     if (!repo) return;
     let live = true;
     setPulls(null);
