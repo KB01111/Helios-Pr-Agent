@@ -235,23 +235,8 @@ fn unknown_llm_provider(provider: &str) -> String {
 
 /// Value of `api_base` inside the `[openai]` section only.
 fn openai_api_base(src: &str) -> Option<String> {
-    let mut in_openai = false;
-    for line in src.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_openai = t == "[openai]";
-            continue;
-        }
-        if !in_openai {
-            continue;
-        }
-        if let Some((k, v)) = t.split_once('=') {
-            if k.trim() == "api_base" {
-                return Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
-            }
-        }
-    }
-    None
+    let doc = src.parse::<toml_edit::Document>().ok()?;
+    doc.get("openai")?.get("api_base")?.as_str().map(str::to_owned)
 }
 
 /// Legacy configs have no `[openai]` section and fall back to OpenRouter.
@@ -261,6 +246,32 @@ fn detect_llm_provider(src: &str) -> &'static str {
         Some(base) if base.contains("opencode.ai/inference/go") => "opencode_go",
         _ => "openrouter",
     }
+}
+
+fn default_llm_model(provider: &str) -> &'static str {
+    match provider {
+        "commandcode" => "openai/deepseek/deepseek-v4-flash",
+        "opencode_go" => "openai/kimi-k3",
+        _ => "openrouter/thinkingmachines/inkling-2-small:free",
+    }
+}
+
+fn validate_run_provider(raw: &str, provider: &str) -> Result<(), String> {
+    let saved_provider = detect_llm_provider(raw);
+    let doc = raw.parse::<toml_edit::Document>().map_err(|e| e.to_string())?;
+    let model = doc
+        .get("config")
+        .and_then(|c| c.get("model"))
+        .and_then(|m| m.as_str());
+    if saved_provider != provider
+        || (provider != "openrouter"
+            && model.is_none_or(|m| {
+                m.starts_with("openrouter/") || m == "thinkingmachines/inkling-2-small:free"
+            }))
+    {
+        return Err("Save config with the selected provider and a matching model before running a local review.".into());
+    }
+    Ok(())
 }
 
 /// Env vars PR-Agent needs for the selected provider's key.
@@ -319,7 +330,7 @@ fn get_config_blocking() -> Result<serde_json::Value, String> {
         "path": path.to_string_lossy(),
         "raw": raw,
         "llm_provider": detect_llm_provider(&raw),
-        "model": get_val(&raw, "model").unwrap_or_else(|| "openrouter/thinkingmachines/inkling-2-small:free".into()),
+        "model": get_val(&raw, "model").unwrap_or_else(|| default_llm_model(detect_llm_provider(&raw)).into()),
         "fallback_models": fallbacks,
         "max_model_tokens": get_val(&raw, "max_model_tokens")
             .or_else(|| get_val(&raw, "custom_model_max_tokens"))
@@ -366,7 +377,7 @@ fn render_config_toml(cfg: &serde_json::Value) -> Result<String, String> {
             llm_api_base(&provider)?
         ),
     };
-    let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or("openrouter/thinkingmachines/inkling-2-small:free"));
+    let model = toml_escape(cfg.get("model").and_then(|v| v.as_str()).unwrap_or_else(|| default_llm_model(&provider)));
     let fallbacks = cfg.get("fallback_models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let fb: Vec<String> = fallbacks.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", toml_escape(s)))).collect();
     let max_tokens_raw = cfg
@@ -571,6 +582,8 @@ fn run_local_review_blocking(
     let cmd_args = command_args(&command, question);
     let url = pr_url.trim();
     let config_path = config_path_for_write()?;
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+    validate_run_provider(&raw, &provider)?;
     let python_label = pr_agent_python().display().to_string();
 
     let build = |program: &str, module: Option<&str>| {
@@ -2491,6 +2504,9 @@ mod llm_provider_tests {
         let other_section = "[openrouter]\napi_base = \"https://api.commandcode.ai/provider/v1\"\n";
         assert_eq!(detect_llm_provider(other_section), "openrouter");
 
+        let commented = "[openai] # provider endpoint\napi_base = 'https://api.commandcode.ai/provider/v1' # endpoint\n";
+        assert_eq!(detect_llm_provider(commented), "commandcode");
+
         let legacy = "[config]\nmodel = \"openrouter/free\"\n[openrouter]\n";
         assert_eq!(detect_llm_provider(legacy), "openrouter");
     }
@@ -2526,6 +2542,32 @@ mod llm_provider_tests {
         let toml = render_config_toml(&serde_json::json!({ "model": "openrouter/free" })).unwrap();
         assert!(toml.contains("[openrouter]"));
         assert!(render_config_toml(&serde_json::json!({ "llm_provider": "nope" })).is_err());
+    }
+
+    #[test]
+    fn provider_defaults_and_local_run_consistency() {
+        for provider in ["openrouter", "commandcode", "opencode_go"] {
+            let raw = render_config_toml(&serde_json::json!({"llm_provider": provider})).unwrap();
+            let doc = raw.parse::<toml_edit::Document>().unwrap();
+            assert_eq!(doc["config"]["model"].as_str(), Some(default_llm_model(provider)));
+            assert!(validate_run_provider(&raw, provider).is_ok());
+            for other in ["openrouter", "commandcode", "opencode_go"] {
+                if other != provider {
+                    assert!(validate_run_provider(&raw, other).is_err());
+                }
+            }
+        }
+        let stale = render_config_toml(&serde_json::json!({
+            "llm_provider": "commandcode", "model": "openrouter/free"
+        })).unwrap();
+        assert!(validate_run_provider(&stale, "commandcode").is_err());
+        let missing = "[openai] # provider\napi_base = 'https://opencode.ai/inference/go/openai/v1'\n";
+        assert!(validate_run_provider(missing, "opencode_go").is_err());
+        let explicit = render_config_toml(&serde_json::json!({
+            "llm_provider": "opencode_go", "model": "openai/custom"
+        })).unwrap();
+        assert_eq!(get_val(&explicit, "model").as_deref(), Some("openai/custom"));
+        assert!(validate_run_provider(&explicit, "opencode_go").is_ok());
     }
 
     #[test]

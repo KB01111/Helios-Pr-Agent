@@ -187,7 +187,8 @@ class ReviewOnlyProvider:
         llm_key, llm_key_env = llm_key_for(llm_provider)
         configured_model = os.environ.get("LLM_MODEL", "").strip()
         if not configured_model or (
-            llm_provider != "openrouter" and configured_model.startswith("openrouter/")
+            llm_provider != "openrouter"
+            and (configured_model == DEFAULT_LLM_MODEL or configured_model.startswith("openrouter/"))
         ):
             configured_model = LLM_PROVIDERS[llm_provider]["default_model"]
         llm_model = configured_model

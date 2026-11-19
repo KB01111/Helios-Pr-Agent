@@ -21,6 +21,7 @@ DIFF = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py
 def _clean_llm_env(monkeypatch):
     for name in KEY_ENVS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(main, "BACKEND_API_TOKEN", "")
     monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
 
 
@@ -221,3 +222,20 @@ def test_missing_key_error_names_env_var_not_value(monkeypatch):
     result = _review()
     assert result["status"] == "failed"  # nosec B101
     assert any("OPENCODE_GO_API_KEY missing" in line for line in result["logs"])  # nosec B101
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "commandcode", "opencode_go"])
+@pytest.mark.parametrize("model", [pr.DEFAULT_LLM_MODEL, "openrouter/custom", "openai/custom"])
+def test_review_saved_model_fallback(monkeypatch, provider, model):
+    calls = []
+    _install_fake_httpx(monkeypatch, calls)
+    monkeypatch.setenv("LLM_PROVIDER", provider)
+    monkeypatch.setenv(pr.LLM_PROVIDERS[provider]["key_envs"][0], FAKE_KEY)
+    monkeypatch.setenv("LLM_MODEL", model)
+    _review()
+    expected = model
+    if provider != "openrouter":
+        if model == pr.DEFAULT_LLM_MODEL or model.startswith("openrouter/"):
+            expected = pr.LLM_PROVIDERS[provider]["default_model"]
+        expected = expected.removeprefix("openai/")
+    assert _llm_post(calls)["json"]["model"] == expected  # nosec B101
