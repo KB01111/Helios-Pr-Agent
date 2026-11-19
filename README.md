@@ -107,8 +107,10 @@ fixed template it also:
 
 - re-reviews on `synchronize` (PR-Agent ignores that action unless it is listed in
   `github_action_config.pr_actions`), editing one persistent review comment instead of
-  adding a new one per push; describe/improve run only when the PR opens or is marked
-  ready for review, not on pushes or reopens;
+  adding a new one per push; describe/improve run once, on the first eligible event: when
+  the PR opens, or (with "Skip draft PRs") when a draft is marked ready for review. They do
+  not run on pushes or reopens. Converting a PR to draft and back can run them again when
+  drafts are skipped;
 - queues runs per PR instead of cancelling them: one run at a time, and while one runs only
   the newest waiting run is kept. A description being written is never dropped, and an older
   review can never overwrite the review of a newer commit;

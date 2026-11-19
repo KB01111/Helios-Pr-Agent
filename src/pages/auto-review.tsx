@@ -311,12 +311,11 @@ function BehaviourCard() {
       <Field
         label="Review instructions (optional)"
         htmlFor="ar-instructions"
-        hint={`House rules or focus areas, e.g. "Flag missing tests. Ignore formatting." · ${options.extra_instructions.length}/2000`}
+        hint={`House rules or focus areas, e.g. "Flag missing tests. Ignore formatting." · ${[...options.extra_instructions].length}/2000`}
       >
         <Textarea
           id="ar-instructions"
           value={options.extra_instructions}
-          maxLength={2000}
           rows={3}
           placeholder="Focus on security and error handling. Don't comment on naming style."
           onChange={(e) => setOptions({ extra_instructions: e.target.value })}
@@ -616,7 +615,11 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
   const [picked, setPicked] = React.useState<number | null>(null);
   const [posted, setPosted] = React.useState<{ repo: string; number: number; url: string } | null>(null);
 
+  // Bumped whenever the dialog opens, switches repo or closes, so a command that
+  // finishes after that cannot show its link in a later session.
+  const session = React.useRef(0);
   React.useEffect(() => {
+    session.current += 1;
     if (!repo) return;
     let live = true;
     setPulls(null);
@@ -638,11 +641,14 @@ function TryDialog({ repo, onClose }: { repo: string | null; onClose: () => void
   const run = (cmd: PrCommand) => async () => {
     if (!repo || picked == null) return;
     const number = picked;
+    const mine = session.current;
     try {
       const url = await prCommand(repo, number, cmd);
+      toastOk("Command posted", `${cmd} on ${repo}#${number} — the Action starts in a few seconds.`);
+      // Ignore a completion from a dialog session that was closed or reopened meanwhile.
+      if (mine !== session.current) return;
       // Remember which PR the link belongs to; it is shown only for that selection.
       setPosted({ repo, number, url });
-      toastOk("Command posted", `${cmd} on ${repo}#${number} — the Action starts in a few seconds.`);
     } catch (e) {
       toastErr("Command failed", errText(e, 220));
     }

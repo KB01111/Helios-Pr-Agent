@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the rendered template changes in a way existing repos should pick up.
-pub const TEMPLATE_VERSION: u32 = 4;
+pub const TEMPLATE_VERSION: u32 = 5;
 /// First-line marker of a workflow this app manages.
 pub const MANAGED_MARKER: &str = "# pr-agent-control: ";
 /// Pinned so a compromised upstream branch cannot receive repository secrets.
@@ -143,14 +143,18 @@ pub fn render_pr_agent_workflow(opts: &WorkflowOptions) -> String {
     } else {
         ""
     };
-    // Describe/improve run once, when the PR opens or is marked ready (so a draft that
-    // was skipped on open still gets them). Pushes and reopens only re-run the review,
-    // otherwise they would rewrite the description and re-post suggestions.
+    // Describe/improve run once, on the first event where the PR is eligible. Pushes and
+    // reopens only re-run the review, otherwise they would rewrite the description and
+    // re-post suggestions. With drafts skipped the first eligible event can be
+    // ready_for_review (the draft's opened run was skipped); with drafts allowed it is
+    // always opened, so ready_for_review must not run them a second time.
     let on_open_only = |enabled: bool| -> String {
-        if enabled {
+        if !enabled {
+            yaml_bool(false).to_string()
+        } else if opts.skip_drafts {
             "${{ github.event.action == 'opened' || github.event.action == 'ready_for_review' }}".to_string()
         } else {
-            yaml_bool(false).to_string()
+            "${{ github.event.action == 'opened' }}".to_string()
         }
     };
     let instructions = if opts.extra_instructions.is_empty() {
@@ -278,6 +282,7 @@ mod tests {
 
     const OPEN_ONLY: &str =
         "${{ github.event.action == 'opened' || github.event.action == 'ready_for_review' }}";
+    const OPENED_ONLY: &str = "${{ github.event.action == 'opened' }}";
 
     fn opts() -> WorkflowOptions {
         WorkflowOptions::default().normalized().unwrap()
@@ -326,8 +331,10 @@ mod tests {
         let yaml = render_pr_agent_workflow(&o);
         assert!(yaml.contains("types: [opened, reopened, ready_for_review]\n"));
         assert!(!yaml.contains("pull_request.draft"));
-        assert!(yaml.contains(&format!("github_action_config.auto_improve: {}", OPEN_ONLY)));
-        assert!(yaml.contains(&format!("github_action_config.auto_describe: {}", OPEN_ONLY)));
+        // Drafts are allowed here, so the first eligible event is always `opened`:
+        // ready_for_review must not run describe/improve a second time.
+        assert!(yaml.contains(&format!("github_action_config.auto_improve: {}", OPENED_ONLY)));
+        assert!(yaml.contains(&format!("github_action_config.auto_describe: {}", OPENED_ONLY)));
     }
 
     #[test]
