@@ -67,11 +67,12 @@ except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo r
     from backend import runtime_settings as runtime_settings  # type: ignore[no-redef]
 
 try:
-    from sandboxes.providers_review import LLM_PROVIDERS, llm_key_for, resolve_llm_provider
+    from sandboxes.providers_review import LLM_PROVIDERS, llm_key_for, normalize_openrouter_model, resolve_llm_provider
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
     from backend.sandboxes.providers_review import (  # type: ignore[no-redef]
         LLM_PROVIDERS,
         llm_key_for,
+        normalize_openrouter_model,
         resolve_llm_provider,
     )
 
@@ -168,6 +169,8 @@ def _get_llm_model() -> str:
     # OpenRouter model id to Command Code / OpenCode Go.
     if not configured or (provider != "openrouter" and configured.startswith("openrouter/")):
         return LLM_PROVIDERS[provider]["default_model"]
+    if provider == "openrouter":
+        return normalize_openrouter_model(configured)
     return configured
 
 
@@ -183,7 +186,7 @@ QUOTA_LIMIT = 18_000
 DEBOUNCE_TTL_S = 45
 
 # Only these PR actions may trigger runs. Anything else is acked+skipped.
-VALID_PR_ACTIONS = {"opened", "reopened", "synchronize", "labeled"}
+VALID_PR_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review", "labeled"}
 
 # GitHub repository names are `owner/name`; validate before using them in
 # downstream API URLs or sandbox shell commands.
@@ -326,6 +329,8 @@ def _verify_signature(raw: bytes, signature: str | None) -> bool:
 
 
 def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | None) -> bool:
+    if agent.get("enabled") is False:
+        return False
     targets = agent.get("target_repos") or []
     if targets and repo not in targets and "*" not in targets:
         return False
@@ -336,9 +341,119 @@ def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | N
         if not label:
             return False
         return trigger == "on_label" and (agent.get("trigger_label") or "") == label
-    if action in ("opened", "reopened", "synchronize"):
+    if action in ("opened", "reopened", "synchronize", "ready_for_review"):
         return trigger == "on_commit"
     return False
+
+
+_AGENT_KEY_PATTERN = "agent:*"
+_COMMENT_ASSOC_ALLOWED = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+_REVIEW_CMD_RE = re.compile(r"^\s*/review(?:\s|$)", re.IGNORECASE)
+
+
+def _comment_trigger_target(
+    payload: dict[str, Any], res: dict[str, Any]
+) -> tuple[str, int, dict[str, Any], dict[str, Any]] | None:
+    if not (res.get("recorded") and res.get("action") == "created") or res.get("duplicate"):
+        return None
+    comment = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+    assoc = str(comment.get("author_association") or "").upper()
+    if assoc not in _COMMENT_ASSOC_ALLOWED:
+        return None
+    body_text = str(comment.get("body") or "")
+    if not res.get("mentions_agent") and not _REVIEW_CMD_RE.match(body_text):
+        return None
+    repository = payload.get("repository") if isinstance(payload.get("repository"), dict) else {}
+    repo = str(repository.get("full_name") or "")
+    issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+    try:
+        pr_number = int(issue.get("number") or 0)
+    except (TypeError, ValueError):
+        pr_number = 0
+    if not repo or pr_number <= 0 or not _REPO_RE.fullmatch(repo):
+        return None
+    owner, name = repo.split("/", 1)
+    if owner in (".", "..") or name in (".", ".."):
+        return None
+    return repo, pr_number, issue, comment
+
+
+def _match_comment_agents(agent_configs: list[Any], repo: str) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for cfg in agent_configs:
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False or cfg.get("chat_enabled", True) is False:
+            continue
+        targets = cfg.get("target_repos") or []
+        if not targets or repo in targets or "*" in targets:
+            matched.append({**cfg, "runtime_mode": "review_only"})
+    return matched
+
+
+async def _fetch_pr_head_meta(repo: str, pr_number: int, fallback_title: str) -> tuple[str, str, str]:
+    sha = ""
+    head_ref = ""
+    title = fallback_title
+    try:
+        import httpx
+
+        gh_tok, _ = await github_app.token_for_repo(repo)
+        if gh_tok:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                pr_resp = await client.get(
+                    f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+                    headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {gh_tok}"},
+                )
+            if pr_resp.status_code == 200:
+                pr_data = pr_resp.json() or {}
+                head = pr_data.get("head") if isinstance(pr_data.get("head"), dict) else {}
+                sha = str(head.get("sha") or "")
+                head_ref = str(head.get("ref") or "")
+                title = str(pr_data.get("title") or title)
+    except Exception as exc:
+        log.warning("comment trigger PR lookup failed for %s#%d: %s", repo, pr_number, type(exc).__name__)
+    return sha, head_ref, title
+
+
+async def _handle_issue_comment_trigger(
+    payload: dict[str, Any], res: dict[str, Any], delivery: str, tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Trigger a review_only run when an authorized user @mentions the agent or posts /review."""
+    target = _comment_trigger_target(payload, res)
+    if target is None:
+        return res
+    repo, pr_number, issue, comment = target
+    run_ids: list[str] = []
+    try:
+        agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
+        agent_configs = await store.arget_json_many(agent_keys)
+        matched = _match_comment_agents(agent_configs, repo)
+        if not matched:
+            return res
+        sha, head_ref, title = await _fetch_pr_head_meta(repo, pr_number, str(issue.get("title") or ""))
+        comment_id = comment.get("id") or delivery or uuid.uuid4().hex[:8]
+        action = f"comment:{comment_id}"
+        pr_ctx = PRContext(
+            repo=repo,
+            pr_number=pr_number,
+            sha=sha,
+            action=action,
+            label=None,
+            title=title,
+            head_ref=head_ref,
+        )
+        await _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks)
+        return {**res, "runs": run_ids}
+    except Exception:
+        for rid in run_ids:
+            try:
+                await asyncio.to_thread(_fail_run, rid, "comment processing aborted before dispatch")
+            except Exception as exc:
+                log.warning("could not fail run=%s during cleanup: %s", rid, exc)
+        try:
+            await asyncio.to_thread(events.release_delivery, delivery)
+        except Exception as exc:
+            log.warning("could not release delivery=%s after comment trigger failure: %s", delivery, exc)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -600,11 +715,18 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     if event and event != "pull_request":
         # Reviews, threads, comments, CI results, pushes, App installs: recorded
         # by the event router (activity log, readiness marker, installations).
-        return JSONResponse(await events.route(event, payload, delivery), status_code=202)
+        res = await events.route(event, payload, delivery)
+        if event == "issue_comment":
+            res = await _handle_issue_comment_trigger(payload, res, delivery, tasks)
+        return JSONResponse(res, status_code=202)
 
     pr = payload.get("pull_request")
     raw_action = payload.get("action", "")
     action = raw_action if isinstance(raw_action, str) else ""
+    repository_obj = payload.get("repository")
+    repo_raw = (repository_obj.get("full_name") if isinstance(repository_obj, dict) else "") or ""
+    if isinstance(repo_raw, str) and _REPO_RE.fullmatch(repo_raw):
+        await asyncio.to_thread(events.note_installation, payload, repo_raw)
     activity: dict[str, Any] = {}
     if isinstance(pr, dict) and pr:
         # Every PR action (closed, ready_for_review, ...) feeds the activity log,
@@ -617,6 +739,12 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     sender = payload.get("sender")
     if isinstance(sender, dict) and sender.get("type") == "Bot":
         return JSONResponse({"skipped": "bot"}, status_code=202)
+
+    if isinstance(pr, dict) and pr.get("draft") is True and action in ("opened", "reopened", "synchronize"):
+        draft_body: dict[str, Any] = {"skipped": "draft"}
+        if activity.get("recorded"):
+            draft_body["recorded"] = activity["recorded"]
+        return JSONResponse(draft_body, status_code=202)
 
     if not isinstance(pr, dict) or not pr or action not in VALID_PR_ACTIONS:
         body: dict[str, Any] = {"skipped": action or "no-pull_request"}
@@ -652,7 +780,7 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
 
     # Load agent configs first: don't consume the debounce window for events
     # that match no agent (and scope it to the action/label).
-    agent_keys = await store.arkeys("agent:*")
+    agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
     agent_configs = await store.arget_json_many(agent_keys)
     agents = [cfg for cfg in agent_configs if isinstance(cfg, dict)]
     matched = [a for a in agents if _agent_matches(a, repo, action, label)]
@@ -815,7 +943,7 @@ def create_agent(agent: AgentConfig, request: Request) -> dict[str, Any]:
 @app.get("/agents")
 def list_agents(request: Request) -> list[dict[str, Any]]:
     _require_auth(request)
-    keys = store.rkeys("agent:*")
+    keys = store.rkeys(_AGENT_KEY_PATTERN)
     configs = store.rget_json_many(keys)
     out = [_agent_v2(cfg) for cfg in configs if isinstance(cfg, dict)]
     out.sort(key=lambda a: str(a.get("id")))

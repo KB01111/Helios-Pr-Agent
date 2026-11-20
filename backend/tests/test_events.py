@@ -207,3 +207,30 @@ def test_github_config_test_fails_when_a_configured_app_is_rejected(monkeypatch)
     assert asyncio.run(main._test_github())["ok"] is False  # nosec B101
     monkeypatch.setattr(main, "_test_github_app", app_ok)
     assert asyncio.run(main._test_github())["ok"] is True  # nosec B101
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_comment_partial_runs_fail_before_delivery_release(monkeypatch, cleanup_fails):
+    import asyncio
+    from fastapi import BackgroundTasks
+
+    monkeypatch.setattr(main, "_comment_trigger_target", lambda *_: (REPO, 7, {}, {}))
+    async def keys(*_): return ["agent"]
+    async def configs(*_): return [{"id": "agent"}]
+    async def meta(*_): return (SHA, "feat", "title")
+    async def create(*args):
+        args[-2].extend(["first", "second"])
+        raise RuntimeError("partial creation")
+    calls = []
+    def fail(run_id, _):
+        calls.append(run_id)
+        if cleanup_fails: raise RuntimeError("cleanup unavailable")
+    monkeypatch.setattr(main.store, "arkeys", keys)
+    monkeypatch.setattr(main.store, "arget_json_many", configs)
+    monkeypatch.setattr(main, "_fetch_pr_head_meta", meta)
+    monkeypatch.setattr(main, "_create_runs", create)
+    monkeypatch.setattr(main, "_fail_run", fail)
+    monkeypatch.setattr(events, "release_delivery", lambda delivery: calls.append(delivery))
+    with pytest.raises(RuntimeError, match="partial creation"):
+        asyncio.run(main._handle_issue_comment_trigger({}, {}, "delivery", BackgroundTasks()))
+    assert calls == ["first", "second", "delivery"]

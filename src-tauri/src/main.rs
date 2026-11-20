@@ -10,6 +10,7 @@ mod autoreview;
 mod daemon;
 mod decider;
 mod github_app;
+mod oauth;
 
 use autoreview::WorkflowOptions;
 
@@ -183,6 +184,7 @@ fn ensure_pr_agent_venv() -> Result<PathBuf, String> {
 }
 
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+pub(crate) static APP_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn config_path_for_write() -> Result<PathBuf, String> {
     let path = CONFIG_PATH.get().ok_or("app configuration is not initialized")?;
@@ -1294,6 +1296,51 @@ fn dotenv_render_value(value: &str) -> Result<String, String> {
     Ok(format!("\"{}\"", escaped))
 }
 
+// Locate complete assignments without treating lines inside quoted multiline
+// values as independent keys. python-dotenv also accepts `export KEY = value`.
+fn dotenv_key_lines(content: &str, key: &str) -> Vec<bool> {
+    let mut quote = None;
+    let mut matching = false;
+    content.lines().map(|line| {
+        let continuation = quote.is_some();
+        let mut value = line;
+        if !continuation {
+            matching = false;
+            let trimmed = line.trim_start();
+            let assignment = trimmed.strip_prefix("export")
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .unwrap_or(trimmed).trim_start();
+            if let Some((lhs, rhs)) = assignment.split_once('=') {
+                let lhs = lhs.trim();
+                let lhs = if let Some(quoted) = lhs.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+                    quoted
+                } else {
+                    if lhs.is_empty() || lhs.chars().any(|c| c.is_whitespace() || c == '#' || c == '\'') {
+                        return false;
+                    }
+                    lhs
+                };
+                matching = lhs == key;
+                value = rhs.trim_start();
+                if value.starts_with('\'') || value.starts_with('"') {
+                    quote = value.chars().next();
+                    value = &value[1..];
+                }
+            }
+        }
+        let remove = matching;
+        if let Some(q) = quote {
+            let mut escaped = false;
+            for c in value.chars() {
+                if escaped { escaped = false; continue; }
+                if c == '\\' { escaped = true; continue; }
+                if c == q { quote = None; break; }
+            }
+        }
+        remove
+    }).collect()
+}
+
 static ENV_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write one integration secret into backend/.env (creates the file if needed).
@@ -1312,15 +1359,37 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
         return Err("refusing to write unknown env key".into());
     }
     let v = value.trim();
-    if v.is_empty() {
-        return Err(format!("{} is empty — nothing written", k));
-    }
     if v.contains('\n') || v.contains('\r') {
         return Err("value must be a single line".into());
     }
     // Serialize the whole read-modify-write so concurrent saves don't drop keys.
     let _guard = ENV_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = backend_env_for_write();
+    if v.is_empty() {
+        if !path.is_file() {
+            return Ok(path.to_string_lossy().to_string());
+        }
+        let original = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let matches = dotenv_key_lines(&original, &k);
+        let lines: Vec<String> = original
+            .lines()
+            .zip(matches)
+            .filter(|(_, matched)| !matched)
+            .map(|(line, _)| line)
+            .map(|s| s.to_string())
+            .collect();
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        return Ok(path.to_string_lossy().to_string());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -1333,13 +1402,14 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
     } else {
         vec!["# Local only — NEVER commit (gitignored). Managed by PR Agent Control Integrations.".to_string()]
     };
-    let prefix = format!("{}=", k);
+    let matches = dotenv_key_lines(&lines.join("\n"), &k);
+    let mut matches = matches.into_iter();
     let replacement = format!("{}={}", k, dotenv_render_value(v)?);
     // Replace the first occurrence and drop later duplicates so the value that
     // python-dotenv resolves is unambiguous.
     let mut replaced = false;
     lines.retain_mut(|line| {
-        if !(line.starts_with(&prefix) || line.trim_start().starts_with(&prefix)) {
+        if !matches.next().unwrap_or(false) {
             return true;
         }
         if replaced {
@@ -1547,6 +1617,16 @@ fn github_repo_status_blocking(token: String, repo: String) -> Result<String, St
             }) {
                 webhook = serde_json::json!({"configured": true, "id": id, "url": url});
             }
+        }
+        Ok((403, _)) => {
+            // GitHub App user OAuth tokens and fine-grained PATs without
+            // administration:read cannot list hooks; keep webhook status non-fatal.
+            webhook = serde_json::json!({
+                "configured": false,
+                "id": null,
+                "url": "",
+                "unavailable": true,
+            });
         }
         Ok((status, hooks_body)) => {
             webhook = serde_json::json!({
@@ -2700,22 +2780,22 @@ fn backend_approve_run_blocking(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(daemon::DaemonState::default())
+        .manage(oauth::OAuthState::default())
         .setup(|app| {
+            let config_dir = app.path().app_config_dir()?;
+            let _ = APP_CONFIG_DIR.set(config_dir.clone());
             // Installed apps use a writable per-user copy of the embedded default.
             let path = if cfg!(debug_assertions) {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.pr_agent.toml")
             } else {
-                app.path().app_config_dir()?.join(".pr_agent.toml")
+                config_dir.join(".pr_agent.toml")
             };
             local_runtime::prepare_config(&path).map_err(std::io::Error::other)?;
             CONFIG_PATH
                 .set(path)
                 .map_err(|_| std::io::Error::other("configuration already initialized"))?;
-            Ok(())
-        })
-        .plugin(tauri_plugin_opener::init())
-        .manage(daemon::DaemonState::default())
-        .setup(|app| {
             // Non-fatal: without a tray the window simply closes normally.
             if let Err(e) = daemon::setup_tray(app) {
                 eprintln!("tray unavailable, daemon will stop when the window closes: {}", e);
@@ -2756,7 +2836,19 @@ pub fn run() {
             github_disable_repo,
             github_list_pulls,
             github_pr_command,
-            github_app::github_app_create
+            github_app::github_app_create,
+            oauth::oauth_cancel,
+            oauth::oauth_status,
+            oauth::oauth_save_client,
+            oauth::oauth_clear_client,
+            oauth::openrouter_oauth_connect,
+            oauth::github_oauth_connect,
+            oauth::github_import_cli,
+            oauth::vercel_fetch_teams,
+            oauth::vercel_import_cli,
+            oauth::vercel_oauth_connect,
+            oauth::commandcode_import_cli,
+            oauth::opencode_import_cli
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2828,7 +2920,7 @@ mod setup_mode_tests {
     fn workflow_template_uses_current_token_setting() {
         let yaml = autoreview::default_pr_agent_workflow();
         assert!(yaml.contains("CONFIG__MAX_MODEL_TOKENS"));
-        assert!(!yaml.contains("CUSTOM_MODEL_MAX_TOKENS"));
+        assert!(yaml.contains("CONFIG__CUSTOM_MODEL_MAX_TOKENS"));
     }
 
     #[test]
@@ -2979,5 +3071,16 @@ mod llm_provider_tests {
         )
         .unwrap_err();
         assert!(err.contains("commandcode, opencode_go"));
+    }
+}
+
+#[cfg(test)]
+mod dotenv_assignment_tests {
+    use super::dotenv_key_lines;
+    #[test]
+    fn assignments_allow_spaces_and_preserve_multiline_values() {
+        let content = "'OTHER'='first\nVERCEL_TOKEN = embedded\nlast'\n export VERCEL_TOKEN = old\nVERCEL_TOKEN=duplicate\n# comment = 'ignored\nVERCEL_TOKEN = final";
+        assert_eq!(dotenv_key_lines(content, "VERCEL_TOKEN"), vec![false, false, false, true, true, false, true]);
+        assert_eq!(dotenv_key_lines("VERCEL_TOKEN = \"first\nsecond\"\nOTHER=value", "VERCEL_TOKEN"), vec![true, true, false]);
     }
 }

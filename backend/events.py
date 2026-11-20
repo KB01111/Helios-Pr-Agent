@@ -181,6 +181,12 @@ def _claim_delivery(delivery: str) -> bool:
     return store.rset(key, "1", ex=dm.DELIVERY_TTL_S, nx=True)
 
 
+def release_delivery(delivery: str) -> None:
+    key = dm.delivery_key(delivery)
+    if key is not None:
+        store.rdelete(key)
+
+
 async def route(event: str, payload: dict[str, Any], delivery: str = "") -> dict[str, Any]:
     action = payload.get("action") if isinstance(payload.get("action"), str) else ""
     repo = _str(payload, "repository", "full_name")

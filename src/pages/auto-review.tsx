@@ -6,6 +6,8 @@ import {
   FlaskConical,
   GitPullRequest,
   KeyRound,
+  Loader2,
+  Plug,
   PowerOff,
   RefreshCw,
   RotateCcw,
@@ -38,6 +40,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import {
   actionsUrl,
   isActive,
+  isPrAgentDeployed,
   optionsProblem,
   repoState,
   sameOptions,
@@ -59,6 +62,7 @@ import {
   type PrCommand,
   type PullSummary,
 } from "@/lib/github";
+import { cancelOAuth, connectOpenRouterOAuth, useOAuth } from "@/lib/oauth";
 import { DEFAULT_MODEL, KNOWN_MODELS, useApp } from "@/lib/store";
 import { errText, openUrl, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
@@ -157,12 +161,21 @@ function SetupCard() {
   const orKey = useApp((s) => s.secrets.openrouter);
   const setSecret = useApp((s) => s.setSecret);
   const login = useGh((s) => s.login);
+  const statusMap = useGh((s) => s.status);
+  const activeFlow = useOAuth((s) => s.activeFlow);
+  const flowMessage = useOAuth((s) => s.flowMessage);
   const [showSignIn, setShowSignIn] = React.useState(false);
+  const [manualOr, setManualOr] = React.useState(false);
+
+  const activeRepoCount = React.useMemo(
+    () => Object.values(statusMap).filter((st) => isPrAgentDeployed(repoState(st))).length,
+    [statusMap],
+  );
 
   return (
     <Section
       title="Deploy PR Agent to your repositories"
-      description="Three steps: connect GitHub, add a free OpenRouter key, then switch auto review on for any repo below. Reviews run in GitHub Actions — no server to host."
+      description="Three 1-click steps: connect GitHub, connect OpenRouter, then switch auto review on for any repo below. Reviews run in GitHub Actions — no server to host."
       action={<GithubStateBadge />}
     >
       <div className="grid gap-4">
@@ -187,31 +200,71 @@ function SetupCard() {
         <div className="flex gap-3">
           <StepMark n={2} done={!!orKey} />
           <div className="grid min-w-0 flex-1 gap-2">
-            <span className="text-sm font-medium">OpenRouter API key</span>
-            <div className="flex flex-wrap gap-2">
-              <div className="min-w-56 flex-1">
-                <SecretInput
-                  aria-label="OpenRouter API key"
-                  value={orKey}
-                  placeholder="sk-or-…"
-                  onChange={(e) => setSecret("openrouter", e.target.value)}
-                />
-              </div>
-              <Button variant="outline" onClick={() => openUrl("https://openrouter.ai/settings/keys")}>
-                <ExternalLink /> Get a free key
-              </Button>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">OpenRouter API key</span>
+              {orKey ? <Badge variant="success">Connected</Badge> : null}
             </div>
+            <ButtonRow>
+              <AsyncButton
+                size="sm"
+                onClick={() => connectOpenRouterOAuth()}
+                disabled={activeFlow !== null}
+              >
+                <Plug /> {orKey ? "Reconnect OpenRouter" : "Connect with OpenRouter"}
+              </AsyncButton>
+              {activeFlow === "openrouter" ? (
+                <Button type="button" variant="ghost" size="sm" onClick={cancelOAuth}>
+                  <X /> Cancel
+                </Button>
+              ) : null}
+              <Button
+                type="button"
+                variant="link"
+                size="xs"
+                className="h-auto px-0"
+                onClick={() => setManualOr((v) => !v)}
+              >
+                {manualOr ? "Hide key input" : orKey ? "Edit key" : "Paste key manually"}
+              </Button>
+            </ButtonRow>
+            {activeFlow === "openrouter" ? (
+              <div
+                className="bg-muted/30 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs"
+                aria-live="polite"
+              >
+                <Loader2 className="text-primary size-4 shrink-0 animate-spin" />
+                <span className="min-w-0 flex-1">{flowMessage}</span>
+              </div>
+            ) : null}
+            {manualOr ? (
+              <div className="flex flex-wrap gap-2">
+                <div className="min-w-56 flex-1">
+                  <SecretInput
+                    aria-label="OpenRouter API key"
+                    value={orKey}
+                    placeholder="sk-or-…"
+                    onChange={(e) => setSecret("openrouter", e.target.value)}
+                  />
+                </div>
+                <Button variant="outline" onClick={() => openUrl("https://openrouter.ai/settings/keys")}>
+                  <ExternalLink /> Get a free key
+                </Button>
+              </div>
+            ) : null}
             <Hint className="text-xs">
-              Stored encrypted as the repo's <code>OPENROUTER_API_KEY</code> Actions secret. Kept in this session only —
-              not needed to update repos that already have the secret.
+              Stored encrypted as each repo&apos;s <code>OPENROUTER_API_KEY</code> Actions secret. Kept in this session
+              only — not needed to update repos that already have the secret.
             </Hint>
           </div>
         </div>
         <Separator />
         <div className="flex gap-3">
-          <StepMark n={3} done={false} />
+          <StepMark n={3} done={activeRepoCount > 0} />
           <div className="grid gap-1">
-            <span className="text-sm font-medium">Pick repositories below and click Enable</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">Pick repositories below and click Enable</span>
+              {activeRepoCount > 0 ? <Badge variant="success">{activeRepoCount} active</Badge> : null}
+            </div>
             <Hint className="text-xs">
               The app commits <code>.github/workflows/pr-agent.yml</code> to the default branch and sets the secret. New
               pull requests are reviewed automatically; comment <code>/review</code>, <code>/describe</code>,{" "}
@@ -421,6 +474,7 @@ const STATE_TONE: Record<RepoState, "success" | "warning" | "danger" | "outline"
   "needs-key": "danger",
   openrabbit: "success",
   backend: "outline",
+  "hook-unavailable": "outline",
   off: "outline",
 };
 
@@ -463,7 +517,7 @@ function RepoRow({
 
   let primary: { label: string; run: () => unknown; variant: "default" | "outline" } | null = null;
   if (repo.admin) {
-    if (state === "off" || state === "unknown" || state === "backend") primary = { label: "Enable", run: () => enableWithSwitch([name]), variant: "default" };
+    if (state === "off" || state === "unknown" || state === "backend" || state === "hook-unavailable") primary = { label: "Enable", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "outdated" || state === "custom" || differs) primary = { label: "Update", run: () => enableRepos([name]), variant: "default" };
     else if (state === "needs-key") primary = { label: "Add key", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "openrabbit") primary = { label: "Switch to PR Agent", run: () => enableWithSwitch([name]), variant: "outline" };
@@ -471,7 +525,7 @@ function RepoRow({
   }
   const active = isActive(state) || state === "needs-key";
   // /review etc. are answered only by the PR Agent workflow with its secret in place.
-  const runsPrAgent = state === "on" || state === "outdated" || state === "custom";
+  const runsPrAgent = isPrAgentDeployed(state);
 
   return (
     <div
@@ -753,6 +807,7 @@ function ReposCard({ active }: { active: boolean }) {
   const log = useGh((s) => s.log);
   const options = useAutoReview((s) => s.options);
   const clearNonce = useApp((s) => s.clearNonce);
+  const ghInstallUrl = useOAuth((s) => s.status.github.install_url);
 
   const [query, setQuery] = React.useState("");
   const [filter, setFilter] = React.useState<Filter>("all");
@@ -786,7 +841,7 @@ function ReposCard({ active }: { active: boolean }) {
     if (q && !v.repo.full_name.toLowerCase().includes(q)) return false;
     if (filter === "active") return isActive(v.state);
     if (filter === "attention") return needsAttention(v.state, v.differs);
-    if (filter === "off") return v.state === "off";
+    if (filter === "off") return v.state === "off" || v.state === "hook-unavailable";
     return true;
   });
   // The button's count and its action use the same candidates: the repos shown, not yet checked.
@@ -868,7 +923,16 @@ function ReposCard({ active }: { active: boolean }) {
             {loadingRepos && !repos.length ? (
               <Hint>Loading repositories…</Hint>
             ) : !repos.length ? (
-              <Hint>No repositories loaded — click Refresh list.</Hint>
+              <div className="grid gap-2 py-2">
+                <Hint>No repositories loaded — click Refresh list.</Hint>
+                {ghInstallUrl ? (
+                  <div>
+                    <Button type="button" variant="outline" size="sm" onClick={() => openUrl(ghInstallUrl)}>
+                      <ExternalLink /> Grant repository access on GitHub
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
             ) : !visible.length ? (
               <Hint>No repositories match.</Hint>
             ) : (

@@ -39,6 +39,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { checkBackend, fetchQuota, loadConfig, refreshAgents, syncRuns } from "@/lib/actions";
 import { useGh, loadRepos } from "@/lib/github";
+import { refreshOAuthStatus } from "@/lib/oauth";
 import { forgetSecrets } from "@/lib/session";
 import { useApp, type TabId } from "@/lib/store";
 import { AgentsPage } from "@/pages/agents";
@@ -225,7 +226,11 @@ function AppSidebar() {
 
 function Topbar() {
   const tab = useApp((s) => s.tab);
+  const setTab = useApp((s) => s.setTab);
   const backend = useApp((s) => s.backend);
+  const githubConnected = useApp((s) => !!s.secrets.github);
+  const openrouterConnected = useApp((s) => !!s.secrets.openrouter);
+  const ghLogin = useGh((s) => s.login);
   const def = TABS.find((t) => t.id === tab) as TabDef;
   const [busy, setBusy] = React.useState(false);
 
@@ -233,7 +238,7 @@ function Topbar() {
     setBusy(true);
     try {
       await checkBackend(false);
-      await Promise.all([loadConfig(), refreshAgents(), syncRuns(), fetchQuota()]);
+      await Promise.all([loadConfig(), refreshAgents(), syncRuns(), fetchQuota(), refreshOAuthStatus()]);
     } finally {
       setBusy(false);
     }
@@ -252,9 +257,40 @@ function Topbar() {
         <h1 className="truncate text-base leading-tight font-semibold">{def.title}</h1>
         <p className="text-muted-foreground truncate text-xs">{def.sub}</p>
       </div>
-      <Badge variant={backend.ok === true ? "success" : backend.ok === false ? "danger" : "outline"}>
-        backend: {backend.label}
-      </Badge>
+      <div className="hidden items-center gap-1.5 md:flex">
+        <button
+          type="button"
+          onClick={() => setTab("integrations")}
+          className="focus-visible:ring-ring inline-flex cursor-pointer rounded-full focus-visible:ring-2 focus-visible:outline-none"
+        >
+          <Badge variant={githubConnected ? "success" : "outline"} className="hover:opacity-90">
+            {githubConnected ? (ghLogin ? `@${ghLogin}` : "GitHub ✓") : "Connect GitHub"}
+          </Badge>
+        </button>
+        {openrouterConnected ? (
+          <button
+            type="button"
+            onClick={() => setTab("integrations")}
+            className="focus-visible:ring-ring inline-flex cursor-pointer rounded-full focus-visible:ring-2 focus-visible:outline-none"
+          >
+            <Badge variant="success" className="hover:opacity-90">
+              OpenRouter ✓
+            </Badge>
+          </button>
+        ) : null}
+        <button
+          type="button"
+          onClick={() => setTab("settings")}
+          className="focus-visible:ring-ring inline-flex cursor-pointer rounded-full focus-visible:ring-2 focus-visible:outline-none"
+        >
+          <Badge
+            variant={backend.ok === true ? "success" : backend.ok === false ? "danger" : "outline"}
+            className="hover:opacity-90"
+          >
+            backend: {backend.label}
+          </Badge>
+        </button>
+      </div>
       <Button variant="outline" size="sm" onClick={reloadAll} disabled={busy}>
         <RefreshCw className={busy ? "animate-spin" : ""} />
         Reload
@@ -282,6 +318,7 @@ export function App() {
     void refreshAgents();
     void syncRuns();
     void fetchQuota();
+    void refreshOAuthStatus();
     if (useApp.getState().secrets.github) void loadRepos();
   }, []);
 

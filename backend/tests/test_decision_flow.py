@@ -400,3 +400,64 @@ def test_deleting_an_evaluation_also_removes_its_recent_index_entry(env):
     assert store.rkeys("evalrecent:*") == [] and store.eval_list(5) == []
     _c, again = store.eval_register("o/r", 61, SHA, {"state": "dispatched"})
     assert [r["id"] for r in store.eval_list(5)] == [again["id"]]  # re-registered: exactly one entry
+
+
+def test_draft_prs_are_skipped_until_ready_for_review(env):
+    draft_payload = {
+        "action": "opened",
+        "pull_request": {"number": 88, "title": "WIP", "draft": True, "head": {"sha": SHA, "ref": "feat"}},
+        "repository": {"full_name": "o/r"},
+        "sender": {"type": "User"},
+    }
+    res = env["client"].post("/webhooks/github", json=draft_payload).json()
+    assert res["skipped"] == "draft" and env["dispatched"] == []  # nosec B101
+    ready_payload = {**draft_payload, "action": "ready_for_review"}
+    ready_payload["pull_request"] = {**draft_payload["pull_request"], "draft": False}
+    ready = env["client"].post("/webhooks/github", json=ready_payload).json()
+    assert len(ready["runs"]) == 1 and len(env["dispatched"]) == 1  # nosec B101
+
+
+def test_authorized_comment_review_command_dispatches_review_only(env, monkeypatch):
+    dispatched = env["dispatched"]
+    fake_tok = "".join(("ghp_", "test"))
+    monkeypatch.setenv("GITHUB_TOKEN", fake_tok)
+
+    class _Resp:
+        def __init__(self, status, data):
+            self.status_code, self._data = status, data
+
+        def json(self):
+            return self._data
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            return _Resp(200, {"title": "PR title", "head": {"sha": SHA, "ref": "feat"}})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "o/r"},
+        "sender": {"type": "User"},
+        "issue": {"number": 7, "title": "PR title", "pull_request": {}},
+        "comment": {"id": 501, "body": "/review", "author_association": "OWNER", "user": {"login": "kb"}},
+    }
+    resp = env["client"].post("/webhooks/github", json=payload, headers={"X-GitHub-Event": "issue_comment", "X-GitHub-Delivery": "c-1"}).json()
+    assert len(resp["runs"]) == 1  # nosec B101
+    assert dispatched[0][0]["runtime_mode"] == "review_only"  # nosec B101
+
+    # Non-collaborators cannot trigger reviews via /review.
+    unauth = {**payload, "comment": {"id": 502, "body": "/review", "author_association": "NONE", "user": {"login": "stranger"}}}
+    resp2 = env["client"].post("/webhooks/github", json=unauth, headers={"X-GitHub-Event": "issue_comment", "X-GitHub-Delivery": "c-2"}).json()
+    assert "runs" not in resp2  # nosec B101
+    assert len(dispatched) == 1  # nosec B101

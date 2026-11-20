@@ -41,9 +41,15 @@ export async function apiGet<T = any>(path: string, baseOverride?: string): Prom
   return r.json() as Promise<T>;
 }
 
-export async function apiMut<T = any>(method: string, path: string, body?: unknown): Promise<T> {
-  const base = backendUrl();
-  const token = apiToken();
+export async function apiMut<T = any>(
+  method: string,
+  path: string,
+  body?: unknown,
+  baseOverride?: string,
+  tokenOverride?: string,
+): Promise<T> {
+  const base = (baseOverride || backendUrl()).replace(/\/+$/, "");
+  const token = tokenOverride !== undefined ? tokenOverride : apiToken();
   let raw: unknown;
   try {
     raw = await tauriInvoke("backend_mutate", {

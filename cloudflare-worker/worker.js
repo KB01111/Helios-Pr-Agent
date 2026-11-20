@@ -190,7 +190,7 @@ export function skipReason(event, payload) {
 }
 
 export async function handleWebhook(request, env, _ctx) {
-  if (!env.GITHUB_WEBHOOK_SECRET || !backendBase(env)) {
+  if ((!env.GITHUB_WEBHOOK_SECRET && !env.GITHUB_APP_WEBHOOK_SECRET) || !backendBase(env)) {
     return json({ error: "worker not configured" }, 500);
   }
   const declared = Number(request.headers.get("content-length") || 0);

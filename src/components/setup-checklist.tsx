@@ -2,10 +2,20 @@ import * as React from "react";
 import { RefreshCw } from "lucide-react";
 import { AsyncButton, Hint, Section, StatusDot } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
-import { apiGet, apiMut } from "@/lib/api";
-import { fetchAppHealth, type AppHealth } from "@/lib/cloud";
+import { Progress } from "@/components/ui/progress";
+import { apiGet, apiMut, backendUrl } from "@/lib/api";
+import { fetchAppHealth, saveCloudSettings, type AppHealth } from "@/lib/cloud";
+import {
+  connectGitHubOAuth,
+  connectOpenRouterOAuth,
+  ensureDefaultBackendAgent,
+  importCommandCodeCli,
+  importOpenCodeCli,
+  resolvePublicWebhookBase,
+  useOAuth,
+} from "@/lib/oauth";
 import { useApp, type TabId } from "@/lib/store";
-import { errText } from "@/lib/tauri";
+import { errText, openUrl } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 
 type StepState = "ok" | "warn" | "err" | "idle";
@@ -31,8 +41,13 @@ export function SetupChecklist({ active }: { active: boolean }) {
   const setTab = useApp((s) => s.setTab);
   const cloudBase = useApp((s) => s.cloudBase);
   const backend = useApp((s) => s.backendUrl);
+  const sessionOrKey = useApp((s) => s.secrets.openrouter);
+  const revision = useOAuth((s) => s.revision);
+  const oauthStatus = useOAuth((s) => s.status);
+  const lastOrCloudErr = useOAuth((s) => s.lastOpenRouterCloudError);
   const [status, setStatus] = React.useState<any>(undefined); // undefined = loading, null = unreachable
   const [health, setHealth] = React.useState<AppHealth | null | undefined>(undefined);
+  const [healthBackend, setHealthBackend] = React.useState<string | null>(null);
   const [agents, setAgents] = React.useState<number | null>(null);
   const [err, setErr] = React.useState("");
 
@@ -41,7 +56,8 @@ export function SetupChecklist({ active }: { active: boolean }) {
     // Only the newest check may write state: a slow answer from a previous
     // backend must not overwrite the current one.
     const mine = ++seq.current;
-    const current = () => mine === seq.current;
+    const targetBackend = backendUrl();
+    const current = () => mine === seq.current && backendUrl() === targetBackend;
     setErr("");
     let st: any;
     try {
@@ -59,6 +75,7 @@ export function SetupChecklist({ active }: { active: boolean }) {
     const h = await fetchAppHealth();
     if (!current()) return;
     setHealth(h);
+    setHealthBackend(targetBackend);
     let count: number | null = null;
     try {
       const list = await apiGet("/agents");
@@ -69,12 +86,12 @@ export function SetupChecklist({ active }: { active: boolean }) {
     if (current()) setAgents(count);
   }, []);
 
-  // Re-check whenever the tab is shown or the backend URL changes.
+  // Re-check whenever the tab is shown, the backend URL changes, or an OAuth connection finishes.
   React.useEffect(() => {
     if (active) void refresh();
-  }, [active, refresh, backend]);
+  }, [active, refresh, backend, revision]);
 
-  const base = cloudBase.trim().replace(/\/+$/, "");
+  const base = resolvePublicWebhookBase(cloudBase, backend);
   const wantedHook = base ? `${base}/webhooks/github` : "";
   const go = (tab: TabId) => () => setTab(tab);
 
@@ -112,15 +129,72 @@ export function SetupChecklist({ active }: { active: boolean }) {
         ? `${status.redis.mode} via ${status.redis.source}`
         : "In-memory only: agents, runs and cloud settings are lost on restart. Connect Redis Cloud on FastAPI Cloud (sets REDIS_URL).",
     });
+    let llmAction: Step["action"];
+    let llmDetail = llmReady
+      ? `${llm} · ${status.model}`
+      : `${llm} has no API key on the backend. Connect with 1 click or add it under Integrations below.`;
+    if (!llmReady) {
+      if (llm === "openrouter" && sessionOrKey) {
+        llmDetail = `OpenRouter key is in this session, but could not be saved to the backend${
+          lastOrCloudErr ? ` (${lastOrCloudErr})` : ""
+        }. Ensure BACKEND_API_TOKEN is set on the backend and in Settings, then click Save session key to backend.`;
+        llmAction = {
+          label: "Save session key to backend",
+          run: async () => {
+            try {
+              await saveCloudSettings({ OPENROUTER_API_KEY: sessionOrKey });
+              useOAuth.setState({ lastOpenRouterCloudError: "" });
+              toastOk("Saved to cloud backend", "OPENROUTER_API_KEY");
+              await refresh();
+            } catch (e) {
+              toastErr("Backend save failed", errText(e, 240));
+            }
+          },
+        };
+      } else if (llm === "openrouter") {
+        llmAction = {
+          label: "Connect OpenRouter",
+          run: () => connectOpenRouterOAuth(),
+        };
+      } else if (llm === "commandcode" && oauthStatus.cli.commandcode_cli) {
+        llmAction = {
+          label: "Import CLI key",
+          run: () => importCommandCodeCli(),
+        };
+      } else if (llm === "opencode_go" && oauthStatus.cli.opencode_cli) {
+        llmAction = {
+          label: "Import CLI key",
+          run: () => importOpenCodeCli(),
+        };
+      }
+    }
     steps.push({
       id: "llm",
       title: "Review model",
       state: llmReady ? "ok" : "warn",
-      detail: llmReady
-        ? `${llm} · ${status.model}`
-        : `${llm} has no API key on the backend. Add it under Connections below — it is saved to the cloud.`,
+      detail: llmDetail,
+      action: llmAction,
     });
     const slugOk = !!(health && health.configured && health.ok);
+    const installUrl =
+      (health?.html_url ? `${health.html_url.replace(/\/+$/, "")}/installations/new` : "") ||
+      oauthStatus.github.install_url ||
+      "";
+    let appAction: Step["action"];
+    if (healthBackend === backend && health && !health.configured) {
+      appAction = {
+        label: "Connect GitHub App",
+        run: () => {
+          if (healthBackend !== backendUrl()) return;
+          return connectGitHubOAuth({ forceNewApp: true });
+        },
+      };
+    } else if (health && health.configured && !health.ok && installUrl) {
+      appAction = {
+        label: "Install on repos",
+        run: () => openUrl(installUrl),
+      };
+    }
     steps.push({
       id: "app",
       title: "GitHub App (bot identity, Check Runs, all PR events)",
@@ -128,10 +202,11 @@ export function SetupChecklist({ active }: { active: boolean }) {
       detail: !health
         ? "Could not check the App."
         : !health.configured
-          ? "Not created yet — use “Create GitHub App” below (one click, then Install)."
+          ? "Not created yet — click Connect GitHub App (opens browser once, then installs automatically)."
           : health.ok
             ? `${health.slug} · installed on ${health.installations?.map((i) => i.account).join(", ")}`
             : health.problems.join(" · "),
+      action: appAction,
     });
     const hookOk = !!(health?.configured && wantedHook && health.webhook_url === wantedHook);
     if (health?.configured) {
@@ -140,7 +215,7 @@ export function SetupChecklist({ active }: { active: boolean }) {
         title: "App webhook points at your backend",
         state: hookOk ? "ok" : "warn",
         detail: !base
-          ? "Set the Cloud app base URL (webhook URL card below)."
+          ? "Set a public HTTPS Cloud app base URL in the webhook URL card below."
           : hookOk
             ? wantedHook
             : `App delivers to ${health.webhook_url || "nowhere"}; expected ${wantedHook}.`,
@@ -167,16 +242,30 @@ export function SetupChecklist({ active }: { active: boolean }) {
       state: agents ? "ok" : "warn",
       detail: agents
         ? `${agents} backend agent(s). Auto review manages GitHub Actions repos.`
-        : "No backend agent yet. Enable repos on the Auto review page (Actions, no hosting) or configure them below.",
-      action: { label: "Open Auto review", run: go("autoreview") },
+        : "No backend agent yet. Create a default review agent or enable GitHub Actions on the Auto review page.",
+      action: !agents
+        ? {
+            label: "Create default agent",
+            run: async () => {
+              try {
+                const r = await ensureDefaultBackendAgent();
+                if (r.created) toastOk("Default agent created", "pr-agent-control (review_only)");
+                await refresh();
+              } catch (e) {
+                toastErr("Agent creation failed", errText(e, 200));
+              }
+            },
+          }
+        : { label: "Open Auto review", run: go("autoreview") },
     });
   }
 
   const done = steps.filter((s) => s.state === "ok").length;
+  const pct = steps.length ? Math.round((done / steps.length) * 100) : 0;
   return (
     <Section
       title="Setup status"
-      description="Everything the cloud backend needs to review your pull requests, with the fix for whatever is missing."
+      description="Everything the cloud backend needs to review your pull requests, with 1-click fixes for whatever is missing."
       action={
         <Badge variant={steps.length && done === steps.length ? "success" : "outline"}>
           {status === undefined ? "checking…" : `${done}/${steps.length} ready`}
@@ -188,7 +277,11 @@ export function SetupChecklist({ active }: { active: boolean }) {
         </AsyncButton>
       }
     >
-      {status === undefined ? <Hint>Checking the backend…</Hint> : null}
+      {status === undefined ? (
+        <Hint>Checking the backend…</Hint>
+      ) : (
+        <Progress value={pct} aria-label="Setup readiness" />
+      )}
       <ul className="grid gap-2.5">
         {steps.map((s) => (
           <li key={s.id} className="flex flex-wrap items-start gap-x-3 gap-y-1">
