@@ -18,6 +18,7 @@ State: /workspace/home/.reviewed.json
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 HOME = os.path.expanduser("~")
@@ -35,7 +36,20 @@ for env_file in ("/workspace/home/.box-env", os.path.join(HOME, ".box-env")):
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 REPOS = [r.strip() for r in os.environ.get("REPOS", "").replace(",", " ").split() if r.strip()]
-MODEL = os.environ.get("MODEL", "thinkingmachines/inkling-2-small:free")
+
+
+def normalize_openrouter_model(model):
+    m = (model or "").strip()
+    if m.startswith("openrouter/"):
+        rest = m[len("openrouter/"):]
+        if "/" in rest:
+            return rest
+    return m or "thinkingmachines/inkling-2-small:free"
+
+
+MODEL = normalize_openrouter_model(os.environ.get("MODEL", "thinkingmachines/inkling-2-small:free"))
+FALLBACK_MODEL = "openrouter/free"
+RETRY_CODES = {404, 429, 500, 502, 503, 504}
 MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "24000"))
 STATE_PATH = os.environ.get("STATE_PATH", "/workspace/home/.reviewed.json")
 BACKEND_URL = os.environ.get("BACKEND_URL", "").strip().rstrip("/")
@@ -59,17 +73,11 @@ def gh(path, method="GET", payload=None, diff=False):
         return json.loads(body) if not diff else body
 
 
-def review_with_openrouter(title, diff):
-    prompt = (
-        "You are a senior code reviewer. Review this GitHub PR diff and reply in markdown:\n"
-        "1) Summary (2-3 sentences) 2) Top risks/bugs with file references "
-        "3) Missing tests 4) Verdict: LGTM / Needs changes.\n"
-        "Be concrete, skip nitpicks.\n\nPR title: " + title + "\n\nDiff (truncated):\n" + diff[:MAX_DIFF_CHARS]
-    )
+def _call_openrouter(model_id, prompt):
     req = urllib.request.Request(
         "https://openrouter.ai/api/v1/chat/completions",
         data=json.dumps({
-            "model": MODEL,
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
         }).encode(),
         method="POST",
@@ -80,7 +88,24 @@ def review_with_openrouter(title, diff):
     )
     with urllib.request.urlopen(req, timeout=300) as r:
         body = json.loads(r.read().decode())
-    return body["choices"][0]["message"]["content"]
+    return (body.get("choices") or [{}])[0].get("message", {}).get("content", "")
+
+
+def review_with_openrouter(title, diff):
+    prompt = (
+        "You are a senior code reviewer. Review this GitHub PR diff and reply in markdown:\n"
+        "1) Summary (2-3 sentences) 2) Top risks/bugs with file references "
+        "3) Missing tests 4) Verdict: LGTM / Needs changes.\n"
+        "Be concrete, skip nitpicks.\n\nPR title: " + title + "\n\nDiff (truncated):\n" + diff[:MAX_DIFF_CHARS]
+    )
+    try:
+        content = _call_openrouter(MODEL, prompt)
+        if content or MODEL == FALLBACK_MODEL:
+            return content
+    except urllib.error.HTTPError as e:
+        if e.code not in RETRY_CODES or MODEL == FALLBACK_MODEL:
+            raise
+    return _call_openrouter(FALLBACK_MODEL, prompt)
 
 
 def save_state(done):

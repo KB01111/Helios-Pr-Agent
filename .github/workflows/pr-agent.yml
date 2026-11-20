@@ -2,7 +2,7 @@ name: PR Agent (Inkling-2-small:free)
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize]
   issue_comment:
     types: [created, edited]
 
@@ -11,10 +11,20 @@ permissions:
   issues: write
   pull-requests: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 jobs:
   pr_agent_job:
-    if: ${{ github.event.sender.type != 'Bot' }}
+    if: >-
+      ${{ github.event.sender.type != 'Bot' &&
+          (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+          (github.event_name != 'issue_comment' ||
+           (github.event.issue.pull_request &&
+            contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check for OpenRouter key
         id: key-check
@@ -39,4 +49,15 @@ jobs:
           CONFIG__MODEL: "openrouter/thinkingmachines/inkling-2-small:free"
           CONFIG__FALLBACK_MODELS: '["openrouter/free"]'
           CONFIG__MAX_MODEL_TOKENS: "200000"
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "200000"
           CONFIG__REASONING_EFFORT: "low"
+          OPENROUTER__REASONING_EFFORT: "low"
+          CONFIG__AI_TIMEOUT: "300"
+          CONFIG__PROPAGATE_TOOL_ERRORS: "true"
+          GITHUB_ACTION_CONFIG__FAIL_ON_COMMAND_ERRORS: "true"
+          PR_REVIEWER__PERSISTENT_COMMENT: "true"
+          PR_REVIEWER__INLINE_CODE_COMMENTS: "true"
+          github_action_config.pr_actions: '["opened","reopened","ready_for_review","synchronize"]'
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: ${{ github.event.action == 'opened' || github.event.action == 'ready_for_review' }}
+          github_action_config.auto_improve: "false"

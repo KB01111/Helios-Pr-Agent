@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { fetchQuota } from "@/lib/actions";
+import { cloudModelId } from "@/lib/cloud";
 import { DEFAULT_MODEL, selectedModel, selectedProvider, useApp, type QuotaSlot } from "@/lib/store";
 import { errText, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
@@ -62,9 +63,9 @@ export function QuotaPage({ active }: { active: boolean }) {
       if (!secrets.openrouter) return fail("Enter OPENROUTER_API_KEY first.");
       if (!repoList) return fail("Enter at least one repo.");
     }
-    let model = DEFAULT_MODEL;
+    let model = cloudModelId("openrouter", DEFAULT_MODEL);
     try {
-      model = selectedModel();
+      model = cloudModelId("openrouter", selectedModel());
     } catch {
       /* keep default */
     }

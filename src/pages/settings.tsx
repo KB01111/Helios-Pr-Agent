@@ -1,10 +1,12 @@
 import * as React from "react";
-import { Eraser, Wifi } from "lucide-react";
+import { Eraser, Plug, Wifi, X } from "lucide-react";
 import { AsyncButton, ButtonRow, Console, Field, FieldGrid, Hint, Page, SecretInput, Section } from "@/components/common";
 import { GithubConnect, GithubStateBadge } from "@/components/github-connect";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { checkBackend } from "@/lib/actions";
+import { cancelOAuth, connectOpenRouterOAuth, useOAuth } from "@/lib/oauth";
 import { forgetSecrets } from "@/lib/session";
 import { useApp } from "@/lib/store";
 
@@ -17,6 +19,7 @@ export function SettingsPage({ active }: { active: boolean }) {
   const commandcode = useApp((s) => s.secrets.commandcode);
   const opencodeGo = useApp((s) => s.secrets.opencodeGo);
   const setSecret = useApp((s) => s.setSecret);
+  const activeFlow = useOAuth((s) => s.activeFlow);
 
   const [urlDraft, setUrlDraft] = React.useState(backendUrl);
   const [out, setOut] = React.useState("Not tested.");
@@ -85,7 +88,7 @@ export function SettingsPage({ active }: { active: boolean }) {
 
       <Section
         title="GitHub — OAuth connect"
-        description="No backend needed: the browser opens GitHub, you enter the code, done. The token stays in memory/session."
+        description="One-click browser OAuth creates/installs your personal App or signs in; or import from GitHub CLI. The token stays in memory/session only."
         action={<GithubStateBadge />}
       >
         <GithubConnect showTokenField />
@@ -101,12 +104,28 @@ export function SettingsPage({ active }: { active: boolean }) {
         }
       >
         <Field label="OPENROUTER_API_KEY" htmlFor="sett-or" hint="Session only — shared with the Review and Quota tabs.">
-          <SecretInput
-            id="sett-or"
-            value={openrouter}
-            placeholder="sk-or-…"
-            onChange={(e) => setSecret("openrouter", e.target.value)}
-          />
+          <div className="flex flex-wrap gap-2">
+            <div className="min-w-56 flex-1">
+              <SecretInput
+                id="sett-or"
+                value={openrouter}
+                placeholder="sk-or-…"
+                onChange={(e) => setSecret("openrouter", e.target.value)}
+              />
+            </div>
+            <AsyncButton
+              variant="outline"
+              onClick={connectOpenRouterOAuth}
+              disabled={activeFlow === "openrouter"}
+            >
+              <Plug /> {openrouter ? "Reconnect OpenRouter" : "Connect with OpenRouter"}
+            </AsyncButton>
+            {activeFlow === "openrouter" ? (
+              <Button type="button" variant="ghost" size="sm" onClick={cancelOAuth}>
+                <X /> Cancel
+              </Button>
+            ) : null}
+          </div>
         </Field>
         <Field label="COMMANDCODE_API_KEY" htmlFor="sett-cc" hint="Session only — shared with the Review tab.">
           <SecretInput

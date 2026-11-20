@@ -10,6 +10,7 @@ mod autoreview;
 mod daemon;
 mod decider;
 mod github_app;
+mod oauth;
 
 use autoreview::WorkflowOptions;
 
@@ -183,6 +184,7 @@ fn ensure_pr_agent_venv() -> Result<PathBuf, String> {
 }
 
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+pub(crate) static APP_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn config_path_for_write() -> Result<PathBuf, String> {
     let path = CONFIG_PATH.get().ok_or("app configuration is not initialized")?;
@@ -1548,6 +1550,16 @@ fn github_repo_status_blocking(token: String, repo: String) -> Result<String, St
                 webhook = serde_json::json!({"configured": true, "id": id, "url": url});
             }
         }
+        Ok((403, _)) => {
+            // GitHub App user OAuth tokens and fine-grained PATs without
+            // administration:read cannot list hooks; keep webhook status non-fatal.
+            webhook = serde_json::json!({
+                "configured": false,
+                "id": null,
+                "url": "",
+                "unavailable": true,
+            });
+        }
         Ok((status, hooks_body)) => {
             webhook = serde_json::json!({
                 "configured": false,
@@ -2701,11 +2713,13 @@ fn backend_approve_run_blocking(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            let config_dir = app.path().app_config_dir()?;
+            let _ = APP_CONFIG_DIR.set(config_dir.clone());
             // Installed apps use a writable per-user copy of the embedded default.
             let path = if cfg!(debug_assertions) {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.pr_agent.toml")
             } else {
-                app.path().app_config_dir()?.join(".pr_agent.toml")
+                config_dir.join(".pr_agent.toml")
             };
             local_runtime::prepare_config(&path).map_err(std::io::Error::other)?;
             CONFIG_PATH
@@ -2715,6 +2729,7 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .manage(daemon::DaemonState::default())
+        .manage(oauth::OAuthState::default())
         .setup(|app| {
             // Non-fatal: without a tray the window simply closes normally.
             if let Err(e) = daemon::setup_tray(app) {
@@ -2756,7 +2771,19 @@ pub fn run() {
             github_disable_repo,
             github_list_pulls,
             github_pr_command,
-            github_app::github_app_create
+            github_app::github_app_create,
+            oauth::oauth_cancel,
+            oauth::oauth_status,
+            oauth::oauth_save_client,
+            oauth::oauth_clear_client,
+            oauth::openrouter_oauth_connect,
+            oauth::github_oauth_connect,
+            oauth::github_import_cli,
+            oauth::vercel_fetch_teams,
+            oauth::vercel_import_cli,
+            oauth::vercel_oauth_connect,
+            oauth::commandcode_import_cli,
+            oauth::opencode_import_cli
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2828,7 +2855,7 @@ mod setup_mode_tests {
     fn workflow_template_uses_current_token_setting() {
         let yaml = autoreview::default_pr_agent_workflow();
         assert!(yaml.contains("CONFIG__MAX_MODEL_TOKENS"));
-        assert!(!yaml.contains("CUSTOM_MODEL_MAX_TOKENS"));
+        assert!(yaml.contains("CONFIG__CUSTOM_MODEL_MAX_TOKENS"));
     }
 
     #[test]

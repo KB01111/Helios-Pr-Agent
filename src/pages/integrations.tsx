@@ -1,7 +1,35 @@
 import * as React from "react";
-import { Check, ClipboardCopy, KeyRound, Plug, RefreshCw, RotateCcw, Search, Settings2, Shuffle, X } from "lucide-react";
-import { AsyncButton, ButtonRow, Console, Field, FieldGrid, Hint, Page, SecretInput, Section, StatusDot } from "@/components/common";
+import {
+  Check,
+  ClipboardCopy,
+  ExternalLink,
+  GitBranch,
+  KeyRound,
+  Loader2,
+  Plug,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings2,
+  Shuffle,
+  Terminal,
+  Trash2,
+  X,
+} from "lucide-react";
+import {
+  AsyncButton,
+  ButtonRow,
+  Console,
+  Field,
+  FieldGrid,
+  Hint,
+  Page,
+  SecretInput,
+  Section,
+  StatusDot,
+} from "@/components/common";
 import { GithubConnect, GithubStateBadge } from "@/components/github-connect";
+import { SetupChecklist } from "@/components/setup-checklist";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -10,6 +38,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { apiGet, apiMut, backendUrl } from "@/lib/api";
+import { CLOUD_KEYS, cloudModelId, fetchAppHealth, saveCloudSettings, type AppHealth } from "@/lib/cloud";
 import {
   checkStatus,
   configure,
@@ -21,8 +50,21 @@ import {
   type ReviewMode,
   type WorkflowProvider,
 } from "@/lib/github";
-import { SetupChecklist } from "@/components/setup-checklist";
-import { CLOUD_KEYS, cloudModelId, fetchAppHealth, saveCloudSettings, type AppHealth } from "@/lib/cloud";
+import {
+  cancelOAuth,
+  clearOAuthClient,
+  connectGitHubOAuth,
+  connectOpenRouterOAuth,
+  connectVercelOAuth,
+  fetchVercelTeams,
+  importCommandCodeCli,
+  importGitHubCli,
+  importOpenCodeCli,
+  importVercelCli,
+  resolvePublicWebhookBase,
+  saveOAuthClient,
+  useOAuth,
+} from "@/lib/oauth";
 import { defaultModelFor, LLM_PROVIDERS, modelsForProvider, toProviderId, useApp, type LlmProviderId } from "@/lib/store";
 import { errText, openUrl, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
@@ -39,19 +81,22 @@ function ConnectionHead({
   name,
   hint,
   dot,
+  badge,
   onTest,
 }: {
   name: string;
   hint: string;
   dot: Dot;
+  badge?: React.ReactNode;
   onTest?: () => Promise<void>;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
       <span className="flex items-center gap-2 text-sm font-semibold">
         <StatusDot state={dot} />
         {name}
       </span>
+      {badge}
       <span className="text-muted-foreground min-w-0 flex-1 text-xs">{hint}</span>
       {onTest ? (
         <AsyncButton variant="ghost" size="sm" onClick={onTest}>
@@ -67,6 +112,8 @@ const EMPTY_DRAFTS = {
   ghSecret: "",
   vercelToken: "",
   vercelTeam: "",
+  vercelClientId: "",
+  vercelClientSecret: "",
   boxKey: "",
   redisConn: "",
   redisUrl: "",
@@ -81,13 +128,28 @@ const EMPTY_DRAFTS = {
 type Drafts = typeof EMPTY_DRAFTS;
 
 function ConnectionsCard({
+  active,
   drafts,
   setDrafts,
 }: {
+  active: boolean;
   drafts: Drafts;
   setDrafts: React.Dispatch<React.SetStateAction<Drafts>>;
 }) {
   const setSecret = useApp((s) => s.setSecret);
+  const backend = useApp((s) => s.backendUrl);
+  const cloudBase = useApp((s) => s.cloudBase);
+  const sessionGh = useApp((s) => !!s.secrets.github);
+  const sessionOr = useApp((s) => !!s.secrets.openrouter);
+  const ghLogin = useGh((s) => s.login);
+
+  const activeFlow = useOAuth((s) => s.activeFlow);
+  const flowMessage = useOAuth((s) => s.flowMessage);
+  const oauthStatus = useOAuth((s) => s.status);
+  const revision = useOAuth((s) => s.revision);
+  const vercelUser = useOAuth((s) => s.vercelUser);
+  const vercelTeams = useOAuth((s) => s.vercelTeams);
+
   const [dots, setDots] = React.useState<Record<ProviderKey, Dot>>({
     github: "warn",
     vercel: "warn",
@@ -101,24 +163,45 @@ function ConnectionsCard({
     text: "not checked",
     tone: "outline",
   });
+  const [redisSummary, setRedisSummary] = React.useState("Not checked yet.");
   const [out, setOut] = React.useState("Integrations not checked.");
+  const [health, setHealth] = React.useState<AppHealth | null | undefined>(undefined);
+  const [appName, setAppName] = React.useState("PR Agent Control");
+  const [org, setOrg] = React.useState("");
+
   const llmDirty = React.useRef(false); // unsaved provider/model edits
+  const seq = React.useRef(0);
   const patch = (p: Partial<Drafts>) => {
     if ("llmProvider" in p || "llmModel" in p || "llmModelCustom" in p) llmDirty.current = true;
     setDrafts((d) => ({ ...d, ...p }));
   };
 
+  const checkApp = React.useCallback(async () => {
+    const h = await fetchAppHealth();
+    setHealth(h);
+  }, []);
+
   const refresh = React.useCallback(async () => {
+    const mine = ++seq.current;
     setOut("Checking status…");
     let data: any = null;
     try {
       data = await apiGet("/config/status");
     } catch (e) {
+      if (mine !== seq.current) return;
+      setHealth(null);
+      setRedisSummary("Backend unreachable.");
       setOut(`Status failed (is backend up at ${backendUrl()}?): ${errText(e, 300)}`);
       setBadge({ text: "unreachable", tone: "danger" });
       toastErr("Integrations", "Backend unreachable: " + errText(e, 160));
       return;
     }
+    if (mine !== seq.current) return;
+
+    const h = await fetchAppHealth();
+    if (mine !== seq.current) return;
+    setHealth(h);
+
     const github = (data && data.github) || {};
     const vercel = (data && data.vercel) || {};
     const redis = (data && data.redis) || {};
@@ -147,6 +230,12 @@ function ConnectionsCard({
     const all = [ok.githubFull, ok.vercel, ok.box, ok.redis, ok.openrouter, ok.commandcode, ok.opencodeGo];
     const n = all.filter(Boolean).length;
     setBadge({ text: `${n}/7 connected`, tone: n === 7 ? "success" : "outline" });
+    setRedisSummary(
+      ok.redis
+        ? `${redis.mode || "redis"} via ${redis.source || "env"}`
+        : "In-memory only — FastAPI Cloud injects REDIS_URL automatically.",
+    );
+
     const llm = (data && data.llm_provider) || "openrouter";
     if (data && data.llm_provider && !llmDirty.current) {
       // Show what the backend really runs: its provider and (if listed) its model.
@@ -164,8 +253,16 @@ function ConnectionsCard({
     setOut(
       [
         `github: ${github.token_set ? "token set" : github.app_configured ? "no PAT" : "token MISSING"} · ${
-          github.webhook_secret_set ? "webhook secret set" : github.app_webhook_secret_set ? "no repo webhook secret" : "webhook secret MISSING"
-        }${github.app_configured ? ` · App ${github.app_slug || "configured"}${github.app_webhook_secret_set ? "" : " (App webhook secret MISSING)"}` : ""}`,
+          github.webhook_secret_set
+            ? "webhook secret set"
+            : github.app_webhook_secret_set
+              ? "no repo webhook secret"
+              : "webhook secret MISSING"
+        }${
+          github.app_configured
+            ? ` · App ${github.app_slug || "configured"}${github.app_webhook_secret_set ? "" : " (App webhook secret MISSING)"}`
+            : ""
+        }`,
         `vercel: ${ok.vercel ? "configured" + (vercel.team_set ? " (team scoped)" : "") : "not configured"}`,
         `upstash_box: ${ok.box ? "configured" : "not configured"}`,
         `redis: ${
@@ -180,7 +277,9 @@ function ConnectionsCard({
         `cloud settings: ${
           data && data.settings
             ? `${data.settings.cloud_keys.length} saved from the app · ${
-                data.settings.encryption ? "secrets encrypted" : "NO encryption secret — set BACKEND_API_TOKEN to store keys"
+                data.settings.encryption
+                  ? "secrets encrypted"
+                  : "NO encryption secret — set BACKEND_API_TOKEN to store keys"
               } · ${data.settings.persistent ? "persistent (Redis)" : "NOT persistent (in-memory store: lost on restart)"}`
             : "unavailable (older backend — redeploy it to enable)"
         }${data && data.settings && data.settings.errors.length ? `\n  ⚠ ${data.settings.errors.join("\n  ⚠ ")}` : ""}`,
@@ -190,8 +289,8 @@ function ConnectionsCard({
   }, [setDrafts]);
 
   React.useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    if (active) void refresh();
+  }, [active, refresh, backend, revision]);
 
   const test = (provider: ProviderKey) => async () => {
     setOut(`Testing ${provider}…`);
@@ -215,8 +314,6 @@ function ConnectionsCard({
    *     immediately, no redeploy;
    *  2. the local `backend/.env` via the Tauri backend, for a backend run from this
    *     checkout. Never `localStorage`.
-   * `drop` keys are removed from the cloud (e.g. a blank model = provider default).
-   * Returns true when every value landed somewhere.
    */
   const persist = async (todo: readonly (readonly [string, string])[], drop: string[], label: string): Promise<boolean> => {
     setOut(`Saving ${label}…`);
@@ -234,7 +331,7 @@ function ConnectionsCard({
         cloudErr = errText(e, 300);
       }
     }
-    const localOnly = todo.filter(([key]) => !CLOUD_KEYS.has(key)); // e.g. REDIS_URL: must exist before the backend starts
+    const localOnly = todo.filter(([key]) => !CLOUD_KEYS.has(key));
     const localPaths = new Set<string>();
     let localErr = "";
     for (const [key, val] of todo) {
@@ -249,7 +346,9 @@ function ConnectionsCard({
     const everySaved = (!cloudWanted || cloudOk || (!!localPaths.size && !localErr)) && (!localOnly.length || !localErr);
     const lines: string[] = [];
     if (cloudWanted) {
-      lines.push(cloudOk ? `✓ cloud backend (${backendUrl()}): saved, live now — no redeploy needed` : `✗ cloud backend: ${cloudErr}`);
+      lines.push(
+        cloudOk ? `✓ cloud backend (${backendUrl()}): saved, live now — no redeploy needed` : `✗ cloud backend: ${cloudErr}`,
+      );
     }
     if (todo.length) {
       lines.push(
@@ -267,7 +366,6 @@ function ConnectionsCard({
     return everySaved;
   };
 
-  // Save token inputs: cloud backend first, local backend/.env as well (never localStorage).
   const save =
     (pairs: [string, keyof Drafts][], label: string, keep: (keyof Drafts)[] = []) =>
     async () => {
@@ -280,8 +378,6 @@ function ConnectionsCard({
         label,
       );
       if (!saved) return;
-      // Mirror session-usable secrets into memory + sessionStorage (same convention as
-      // Settings) — unless the user cleared session secrets while the save was pending.
       if (useApp.getState().clearNonce === nonce) {
         for (const [key, val] of todo) {
           if (key === "GITHUB_TOKEN") setSecret("github", val);
@@ -292,7 +388,6 @@ function ConnectionsCard({
         }
         if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
       }
-      // Clear only what was submitted: text typed while the save was pending stays.
       setDrafts((d) => {
         const next = { ...d };
         for (const [, val, field] of todo) if (!keep.includes(field) && d[field].trim() === val) next[field] = "";
@@ -301,12 +396,9 @@ function ConnectionsCard({
       void refresh();
     };
 
-  // Backend LLM provider + model: one save, applied to the cloud immediately.
   const saveLlm = async () => {
     const pid = toProviderId(drafts.llmProvider);
     const chosen = drafts.llmModel === "custom" ? drafts.llmModelCustom.trim() : drafts.llmModel;
-    // A blank model means "the provider's default": store it explicitly so a deploy-time
-    // LLM_MODEL env var cannot silently stay in force.
     const model = cloudModelId(pid, chosen || defaultModelFor(pid));
     const saved = await persist(
       [
@@ -322,15 +414,72 @@ function ConnectionsCard({
     }
   };
 
+  const base = resolvePublicWebhookBase(cloudBase, backend);
+  const wantedHook = base ? `${base}/webhooks/github` : "";
+  const installUrl =
+    (health?.html_url ? `${health.html_url.replace(/\/+$/, "")}/installations/new` : "") ||
+    oauthStatus.github.install_url ||
+    "";
+  const hookMismatch = !!(health?.configured && wantedHook && health.webhook_url && health.webhook_url !== wantedHook);
+
+  const fixWebhook = async () => {
+    try {
+      await apiMut("POST", "/github-app/webhook", { base_url: base });
+      toastOk("Webhook updated", wantedHook);
+    } catch (e) {
+      toastErr("Webhook update failed", errText(e, 300));
+    }
+    await checkApp();
+  };
+
+  const ghBadgeText = health?.configured
+    ? health.ok
+      ? "healthy"
+      : `${health.problems.length} issue(s)`
+    : ghLogin
+      ? `@${ghLogin}`
+      : sessionGh
+        ? "session token"
+        : "not connected";
+  const ghBadgeVariant: "success" | "warning" | "outline" =
+    health?.configured && health.ok
+      ? "success"
+      : health?.configured && !health.ok
+        ? "warning"
+        : sessionGh
+          ? "success"
+          : "outline";
+
+  const orBadgeText = dots.openrouter === "ok" ? "connected" : sessionOr ? "session only" : "not connected";
+  const orBadgeVariant: "success" | "warning" | "outline" =
+    dots.openrouter === "ok" ? "success" : sessionOr ? "warning" : "outline";
+
+  const vercelSaveTeam = async (teamId: string) => {
+    patch({ vercelTeam: teamId });
+    if (!teamId) return;
+    await persist([["VERCEL_TEAM_ID", teamId]], [], "Vercel team");
+    void refresh();
+  };
+
+  const saveVercelOAuthApp = async () => {
+    const cid = drafts.vercelClientId.trim();
+    if (!cid) return toastErr("Vercel OAuth", "Enter a Vercel OAuth Client ID first.");
+    try {
+      await saveOAuthClient("vercel", cid, drafts.vercelClientSecret.trim() || undefined);
+      patch({ vercelClientSecret: "" });
+      toastOk("Vercel OAuth saved", "You can now use 1-click Connect with Vercel.");
+    } catch (e) {
+      toastErr("Vercel OAuth", errText(e, 200));
+    }
+  };
+
   return (
     <Section
-      title="Connections — 1-click setup"
+      title="Connections — 1-click OAuth & cloud settings"
       description={
         <>
-          Saved to your <b>cloud backend</b> (encrypted in its store, live immediately — no redeploy) and, for a backend
-          run from this checkout, to <code>backend/.env</code> (git-ignored). Never to <code>localStorage</code>. Inputs
-          clear on save. The backend needs <code>BACKEND_API_TOKEN</code> set to accept secrets. <code>REDIS_URL</code> must
-          stay a deploy-time environment variable.
+          Connect services in one click — secrets stay inside Rust, your encrypted <b>cloud backend</b> store, and local{" "}
+          <code>backend/.env</code> (never <code>localStorage</code>).
         </>
       }
       action={<Badge variant={badge.tone}>{badge.text}</Badge>}
@@ -340,241 +489,249 @@ function ConnectionsCard({
         </AsyncButton>
       }
     >
-      {/* GitHub */}
-      <div className="grid gap-3">
-        <ConnectionHead name="GitHub" hint="webhook secret + token (repo scope)" dot={dots.github} onTest={test("github")} />
-        <FieldGrid>
-          <Field label="PAT" htmlFor="int-gh-token">
-            <SecretInput
-              id="int-gh-token"
-              value={drafts.ghToken}
-              placeholder="ghp_…"
-              onChange={(e) => patch({ ghToken: e.target.value })}
-            />
-          </Field>
-          <Field label="Webhook secret" htmlFor="int-gh-secret" hint="Repo Settings → Webhooks → Secret">
-            <SecretInput
-              id="int-gh-secret"
-              value={drafts.ghSecret}
-              placeholder="whsec_…"
-              onChange={(e) => patch({ ghSecret: e.target.value })}
-            />
-          </Field>
-        </FieldGrid>
-        <ButtonRow>
-          <AsyncButton
-            size="sm"
-            onClick={save(
-              [
-                ["GITHUB_TOKEN", "ghToken"],
-                ["GITHUB_WEBHOOK_SECRET", "ghSecret"],
-              ],
-              "GitHub",
-            )}
-          >
-            <Plug /> Connect GitHub
-          </AsyncButton>
-        </ButtonRow>
-      </div>
-      <Separator />
-
-      {/* Vercel */}
-      <div className="grid gap-3">
-        <ConnectionHead name="Vercel Sandbox" hint="token (+ optional team id) for ephemeral runs" dot={dots.vercel} onTest={test("vercel")} />
-        <FieldGrid>
-          <Field label="Vercel token" htmlFor="int-vercel-token">
-            <SecretInput
-              id="int-vercel-token"
-              value={drafts.vercelToken}
-              placeholder="vercel_…"
-              onChange={(e) => patch({ vercelToken: e.target.value })}
-            />
-          </Field>
-          <Field label="Team ID (optional)" htmlFor="int-vercel-team">
-            <Input
-              id="int-vercel-team"
-              value={drafts.vercelTeam}
-              placeholder="team_…"
-              onChange={(e) => patch({ vercelTeam: e.target.value })}
-              autoComplete="off"
-            />
-          </Field>
-        </FieldGrid>
-        <ButtonRow>
-          <AsyncButton
-            size="sm"
-            onClick={save(
-              [
-                ["VERCEL_TOKEN", "vercelToken"],
-                ["VERCEL_TEAM_ID", "vercelTeam"],
-              ],
-              "Vercel",
-              ["vercelTeam"],
-            )}
-          >
-            <Plug /> Connect Vercel
-          </AsyncButton>
-        </ButtonRow>
-      </div>
-      <Separator />
-
-      {/* Upstash Box */}
-      <div className="grid gap-3">
-        <ConnectionHead name="Upstash Box" hint="Box API key for warm-box runs" dot={dots.upstash_box} onTest={test("upstash_box")} />
-        <Field label="Box API key" htmlFor="int-box-key">
-          <SecretInput
-            id="int-box-key"
-            value={drafts.boxKey}
-            placeholder="box_…"
-            onChange={(e) => patch({ boxKey: e.target.value })}
+      {/* 1. Core Integrations (2-col) */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        {/* GitHub OAuth + App */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead
+            name="GitHub (OAuth + App)"
+            hint="Bot identity, Check Runs & repo access"
+            dot={health?.ok ? "ok" : dots.github}
+            badge={<Badge variant={ghBadgeVariant}>{ghBadgeText}</Badge>}
+            onTest={test("github")}
           />
-        </Field>
-        <ButtonRow>
-          <AsyncButton size="sm" onClick={save([["UPSTASH_BOX_API_KEY", "boxKey"]], "Upstash Box")}>
-            <Plug /> Connect Box
-          </AsyncButton>
-        </ButtonRow>
-      </div>
-      <Separator />
 
-      {/* Redis */}
-      <div className="grid gap-3">
-        <ConnectionHead
-          name="Redis (shared state)"
-          hint="agents, runs, quota · FastAPI Cloud injects REDIS_URL"
-          dot={dots.redis}
-          onTest={test("redis")}
-        />
-        <Field
-          label="REDIS_URL (local/self-hosted)"
-          htmlFor="int-redis-conn-url"
-          hint="FastAPI Cloud injects REDIS_URL automatically — use this field only for a local/self-hosted backend. Test verifies the deployed backend."
-        >
-          <SecretInput
-            id="int-redis-conn-url"
-            value={drafts.redisConn}
-            placeholder="rediss://default:…@host:port"
-            onChange={(e) => patch({ redisConn: e.target.value })}
-          />
-        </Field>
-        <ButtonRow>
-          <AsyncButton size="sm" onClick={save([["REDIS_URL", "redisConn"]], "Redis URL")}>
-            <Plug /> Connect Redis URL
-          </AsyncButton>
-        </ButtonRow>
-        <details className="group">
-          <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
-            Upstash REST (legacy/optional) — REST URL + token instead of REDIS_URL
-          </summary>
-          <div className="mt-3 grid gap-3">
-            <FieldGrid>
-              <Field label="REST URL" htmlFor="int-redis-url">
-                <Input
-                  id="int-redis-url"
-                  value={drafts.redisUrl}
-                  placeholder="https://….upstash.io"
-                  onChange={(e) => patch({ redisUrl: e.target.value })}
-                  autoComplete="off"
-                />
-              </Field>
-              <Field label="REST token" htmlFor="int-redis-token">
-                <SecretInput
-                  id="int-redis-token"
-                  value={drafts.redisToken}
-                  onChange={(e) => patch({ redisToken: e.target.value })}
-                />
-              </Field>
-            </FieldGrid>
-            <ButtonRow>
+          <ButtonRow>
+            <AsyncButton
+              size="sm"
+              onClick={() => connectGitHubOAuth()}
+              disabled={activeFlow === "github" || activeFlow === "github-cli"}
+            >
+              <GitBranch /> {sessionGh ? "Reconnect GitHub" : "Connect with GitHub"}
+            </AsyncButton>
+            {oauthStatus.cli.gh_available ? (
               <AsyncButton
+                variant="outline"
                 size="sm"
-                onClick={save(
-                  [
-                    ["UPSTASH_REDIS_REST_URL", "redisUrl"],
-                    ["UPSTASH_REDIS_REST_TOKEN", "redisToken"],
-                  ],
-                  "Redis",
-                  ["redisUrl"],
-                )}
+                onClick={() => importGitHubCli(true)}
+                disabled={activeFlow === "github" || activeFlow === "github-cli"}
               >
-                <Plug /> Connect Redis
+                <Terminal />{" "}
+                {oauthStatus.cli.gh_login ? `Use GitHub CLI (@${oauthStatus.cli.gh_login})` : "Use GitHub CLI"}
               </AsyncButton>
-            </ButtonRow>
-          </div>
-        </details>
-      </div>
-      <Separator />
+            ) : null}
+          </ButtonRow>
 
-      {/* OpenRouter */}
-      <div className="grid gap-3">
-        <ConnectionHead name="OpenRouter" hint="LLM key for reviews" dot={dots.openrouter} onTest={test("openrouter")} />
-        <Field label="API key" htmlFor="int-or-key">
-          <SecretInput
-            id="int-or-key"
-            value={drafts.orKey}
-            placeholder="sk-or-…"
-            onChange={(e) => patch({ orKey: e.target.value })}
+          {activeFlow === "github" ? (
+            <div
+              className="bg-muted/30 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs"
+              aria-live="polite"
+            >
+              <Loader2 className="text-primary size-4 shrink-0 animate-spin" />
+              <span className="min-w-0 flex-1">{flowMessage}</span>
+              <Button type="button" variant="ghost" size="sm" onClick={cancelOAuth}>
+                <X /> Cancel
+              </Button>
+            </div>
+          ) : null}
+
+          {health?.configured ? (
+            <div className="bg-muted/20 grid gap-2 rounded-md border p-3 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-medium">
+                  {health.ok ? "✓ " : "⚠ "}
+                  {health.slug ? `App ${health.slug}` : "GitHub App configured"}
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {installUrl ? (
+                    <Button type="button" variant="outline" size="xs" onClick={() => openUrl(installUrl)}>
+                      <ExternalLink /> Install / manage repos
+                    </Button>
+                  ) : null}
+                  <AsyncButton variant="ghost" size="xs" onClick={checkApp}>
+                    <RefreshCw /> Check App
+                  </AsyncButton>
+                  {hookMismatch ? (
+                    <AsyncButton variant="outline" size="xs" onClick={fixWebhook}>
+                      Fix webhook URL
+                    </AsyncButton>
+                  ) : null}
+                </div>
+              </div>
+              {health.installations?.length ? (
+                <p className="text-muted-foreground">
+                  Installed on{" "}
+                  {health.installations.map((i) => `${i.account} (${i.repository_selection})`).join(", ")}
+                </p>
+              ) : null}
+              {health.problems.map((p) => (
+                <p key={p} className="text-warning break-words">
+                  • {p}
+                </p>
+              ))}
+              {hookMismatch ? (
+                <p className="text-warning break-words">
+                  • Webhook points to <code>{health.webhook_url}</code>, expected <code>{wantedHook}</code>.
+                </p>
+              ) : null}
+            </div>
+          ) : (
+            <Hint className="text-xs">
+              First click opens GitHub to create &amp; install your personal GitHub App; future sign-ins use 1-click OAuth.
+            </Hint>
+          )}
+
+          <details className="group">
+            <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+              Advanced: custom App name / org, PAT, or webhook secret
+            </summary>
+            <div className="mt-3 grid gap-3">
+              <FieldGrid>
+                <Field label="App name" htmlFor="int-app-name" hint="Max 34 chars, unique on GitHub.">
+                  <Input
+                    id="int-app-name"
+                    value={appName}
+                    maxLength={34}
+                    onChange={(e) => setAppName(e.target.value)}
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="Organization (optional)" htmlFor="int-app-org">
+                  <Input
+                    id="int-app-org"
+                    value={org}
+                    onChange={(e) => setOrg(e.target.value)}
+                    placeholder="my-org"
+                    autoComplete="off"
+                  />
+                </Field>
+              </FieldGrid>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={() => connectGitHubOAuth({ forceNewApp: true, appName, org })}
+                  disabled={activeFlow === "github" || !appName.trim()}
+                >
+                  <Plug /> Create / replace GitHub App
+                </AsyncButton>
+                {oauthStatus.github.has_oauth ? (
+                  <AsyncButton
+                    variant="ghost"
+                    size="sm"
+                    onClick={async () => {
+                      await clearOAuthClient("github");
+                      toastOk("Cleared saved GitHub OAuth client", "Next Connect will set up a fresh GitHub App.");
+                    }}
+                  >
+                    <Trash2 /> Reset saved OAuth client
+                  </AsyncButton>
+                ) : null}
+              </ButtonRow>
+              <Separator />
+              <FieldGrid>
+                <Field label="Manual PAT" htmlFor="int-gh-token">
+                  <SecretInput
+                    id="int-gh-token"
+                    value={drafts.ghToken}
+                    placeholder="ghp_…"
+                    onChange={(e) => patch({ ghToken: e.target.value })}
+                  />
+                </Field>
+                <Field label="Manual webhook secret" htmlFor="int-gh-secret">
+                  <SecretInput
+                    id="int-gh-secret"
+                    value={drafts.ghSecret}
+                    placeholder="whsec_…"
+                    onChange={(e) => patch({ ghSecret: e.target.value })}
+                  />
+                </Field>
+              </FieldGrid>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={save(
+                    [
+                      ["GITHUB_TOKEN", "ghToken"],
+                      ["GITHUB_WEBHOOK_SECRET", "ghSecret"],
+                    ],
+                    "GitHub",
+                  )}
+                >
+                  <KeyRound /> Save manual credentials
+                </AsyncButton>
+              </ButtonRow>
+            </div>
+          </details>
+        </div>
+
+        {/* OpenRouter OAuth */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead
+            name="OpenRouter (AI Reviews)"
+            hint="Default LLM gateway with free & reasoning models"
+            dot={dots.openrouter}
+            badge={<Badge variant={orBadgeVariant}>{orBadgeText}</Badge>}
+            onTest={test("openrouter")}
           />
-        </Field>
-        <ButtonRow>
-          <AsyncButton size="sm" onClick={save([["OPENROUTER_API_KEY", "orKey"]], "OpenRouter")}>
-            <Plug /> Connect OpenRouter
-          </AsyncButton>
-        </ButtonRow>
-      </div>
-      <Separator />
 
-      {/* Command Code */}
-      <div className="grid gap-3">
-        <ConnectionHead
-          name="Command Code"
-          hint="LLM key for reviews (OpenAI-compatible)"
-          dot={dots.commandcode}
-          onTest={test("commandcode")}
-        />
-        <Field label="API key" htmlFor="int-cc-key">
-          <SecretInput
-            id="int-cc-key"
-            value={drafts.ccKey}
-            placeholder={LLM_PROVIDERS.commandcode.keyPlaceholder}
-            onChange={(e) => patch({ ccKey: e.target.value })}
-          />
-        </Field>
-        <ButtonRow>
-          <AsyncButton size="sm" onClick={save([["COMMANDCODE_API_KEY", "ccKey"]], "Command Code")}>
-            <Plug /> Connect Command Code
-          </AsyncButton>
-        </ButtonRow>
-      </div>
-      <Separator />
+          <ButtonRow>
+            <AsyncButton size="sm" onClick={connectOpenRouterOAuth} disabled={activeFlow === "openrouter"}>
+              <Plug /> {dots.openrouter === "ok" || sessionOr ? "Reconnect OpenRouter" : "Connect with OpenRouter"}
+            </AsyncButton>
+            {activeFlow === "openrouter" ? (
+              <Button type="button" variant="ghost" size="sm" onClick={cancelOAuth}>
+                <X /> Cancel
+              </Button>
+            ) : null}
+          </ButtonRow>
 
-      {/* OpenCode Go */}
-      <div className="grid gap-3">
-        <ConnectionHead
-          name="OpenCode Go"
-          hint="LLM key for reviews (OpenAI-compatible)"
-          dot={dots.opencode_go}
-          onTest={test("opencode_go")}
-        />
-        <Field label="API key" htmlFor="int-oc-key">
-          <SecretInput
-            id="int-oc-key"
-            value={drafts.ocKey}
-            placeholder={LLM_PROVIDERS.opencode_go.keyPlaceholder}
-            onChange={(e) => patch({ ocKey: e.target.value })}
-          />
-        </Field>
-        <ButtonRow>
-          <AsyncButton size="sm" onClick={save([["OPENCODE_GO_API_KEY", "ocKey"]], "OpenCode Go")}>
-            <Plug /> Connect OpenCode Go
-          </AsyncButton>
-        </ButtonRow>
-      </div>
-      <Separator />
+          {activeFlow === "openrouter" ? (
+            <div
+              className="bg-muted/30 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs"
+              aria-live="polite"
+            >
+              <Loader2 className="text-primary size-4 shrink-0 animate-spin" />
+              <span className="min-w-0 flex-1">{flowMessage}</span>
+            </div>
+          ) : (
+            <Hint className="text-xs">
+              One click opens OpenRouter in your browser via PKCE OAuth — no Client ID needed. Your key is saved to
+              session, cloud backend, and <code>backend/.env</code> automatically.
+            </Hint>
+          )}
 
-      {/* Backend LLM provider */}
-      <div className="grid gap-3">
-        <ConnectionHead name="Backend LLM provider & model" hint="which LLM the cloud backend uses for reviews" dot="idle" />
+          <details className="group">
+            <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+              Or paste an API key manually
+            </summary>
+            <div className="mt-3 grid gap-3">
+              <Field label="API key" htmlFor="int-or-key">
+                <SecretInput
+                  id="int-or-key"
+                  value={drafts.orKey}
+                  placeholder="sk-or-…"
+                  onChange={(e) => patch({ orKey: e.target.value })}
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={save([["OPENROUTER_API_KEY", "orKey"]], "OpenRouter")}
+                >
+                  <KeyRound /> Save key
+                </AsyncButton>
+              </ButtonRow>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      {/* 2. Review Model & Alternate LLMs */}
+      <div className="bg-card/50 grid gap-3 rounded-lg border p-4">
+        <ConnectionHead name="Backend LLM provider & model" hint="Which LLM the cloud backend uses for reviews" dot="idle" />
         <FieldGrid>
           <Field
             label="LLM provider"
@@ -601,7 +758,10 @@ function ConnectionsCard({
             </Select>
           </Field>
           <Field label="Model" htmlFor="int-llm-model">
-            <Select value={drafts.llmModel || defaultModelFor(drafts.llmProvider)} onValueChange={(v) => patch({ llmModel: v })}>
+            <Select
+              value={drafts.llmModel || defaultModelFor(drafts.llmProvider)}
+              onValueChange={(v) => patch({ llmModel: v })}
+            >
               <SelectTrigger id="int-llm-model" className="w-full">
                 <SelectValue />
               </SelectTrigger>
@@ -633,7 +793,367 @@ function ConnectionsCard({
         </ButtonRow>
       </div>
 
-      <Console>{out}</Console>
+      <div className="grid gap-4 md:grid-cols-2">
+        {/* Command Code */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead
+            name="Command Code"
+            hint="OpenAI-compatible review provider"
+            dot={dots.commandcode}
+            onTest={test("commandcode")}
+          />
+          <ButtonRow>
+            <AsyncButton
+              variant={oauthStatus.cli.commandcode_cli ? "default" : "outline"}
+              size="sm"
+              onClick={importCommandCodeCli}
+              disabled={activeFlow === "commandcode-cli"}
+            >
+              <Terminal /> Import from CLI
+            </AsyncButton>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => openUrl("https://commandcode.ai")}
+            >
+              <ExternalLink /> Get key
+            </Button>
+          </ButtonRow>
+          <details className="group">
+            <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+              Paste API key manually
+            </summary>
+            <div className="mt-3 grid gap-3">
+              <Field label="API key" htmlFor="int-cc-key">
+                <SecretInput
+                  id="int-cc-key"
+                  value={drafts.ccKey}
+                  placeholder={LLM_PROVIDERS.commandcode.keyPlaceholder}
+                  onChange={(e) => patch({ ccKey: e.target.value })}
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={save([["COMMANDCODE_API_KEY", "ccKey"]], "Command Code")}
+                >
+                  <KeyRound /> Save key
+                </AsyncButton>
+              </ButtonRow>
+            </div>
+          </details>
+        </div>
+
+        {/* OpenCode Go */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead
+            name="OpenCode Go"
+            hint="OpenAI-compatible review provider"
+            dot={dots.opencode_go}
+            onTest={test("opencode_go")}
+          />
+          <ButtonRow>
+            <AsyncButton
+              variant={oauthStatus.cli.opencode_cli ? "default" : "outline"}
+              size="sm"
+              onClick={importOpenCodeCli}
+              disabled={activeFlow === "opencode-cli"}
+            >
+              <Terminal /> Import from CLI
+            </AsyncButton>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => openUrl("https://opencode.ai/go")}
+            >
+              <ExternalLink /> Get key
+            </Button>
+          </ButtonRow>
+          <details className="group">
+            <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+              Paste API key manually
+            </summary>
+            <div className="mt-3 grid gap-3">
+              <Field label="API key" htmlFor="int-oc-key">
+                <SecretInput
+                  id="int-oc-key"
+                  value={drafts.ocKey}
+                  placeholder={LLM_PROVIDERS.opencode_go.keyPlaceholder}
+                  onChange={(e) => patch({ ocKey: e.target.value })}
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={save([["OPENCODE_GO_API_KEY", "ocKey"]], "OpenCode Go")}
+                >
+                  <KeyRound /> Save key
+                </AsyncButton>
+              </ButtonRow>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      {/* 3. Sandboxes & Storage (3-col) */}
+      <div className="grid gap-4 lg:grid-cols-3">
+        {/* Vercel Sandbox */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead name="Vercel Sandbox" hint="Ephemeral PR sandboxes" dot={dots.vercel} onTest={test("vercel")} />
+          <ButtonRow>
+            {oauthStatus.cli.vercel_cli ? (
+              <AsyncButton
+                size="sm"
+                onClick={importVercelCli}
+                disabled={activeFlow === "vercel-cli" || activeFlow === "vercel"}
+              >
+                <Terminal /> Import from Vercel CLI
+              </AsyncButton>
+            ) : null}
+            {oauthStatus.vercel.has_oauth ? (
+              <AsyncButton
+                variant={oauthStatus.cli.vercel_cli ? "outline" : "default"}
+                size="sm"
+                onClick={connectVercelOAuth}
+                disabled={activeFlow === "vercel" || activeFlow === "vercel-cli"}
+              >
+                <Plug /> Connect with Vercel
+              </AsyncButton>
+            ) : null}
+          </ButtonRow>
+          {activeFlow === "vercel" ? (
+            <div className="bg-muted/30 flex items-center gap-2 rounded-md border px-3 py-2 text-xs">
+              <Loader2 className="text-primary size-4 shrink-0 animate-spin" />
+              <span className="min-w-0 flex-1">{flowMessage}</span>
+              <Button type="button" variant="ghost" size="xs" onClick={cancelOAuth}>
+                Cancel
+              </Button>
+            </div>
+          ) : null}
+          {!oauthStatus.cli.vercel_cli && !oauthStatus.vercel.has_oauth ? (
+            <Hint className="text-xs">
+              Run <code>vercel login</code> locally for 1-click CLI import, or paste a token below.
+            </Hint>
+          ) : null}
+          {vercelTeams.length > 0 ? (
+            <Field
+              label={vercelUser ? `Vercel team (@${vercelUser})` : "Vercel team"}
+              htmlFor="int-vercel-team-select"
+            >
+              <Select value={drafts.vercelTeam} onValueChange={vercelSaveTeam}>
+                <SelectTrigger id="int-vercel-team-select" className="w-full">
+                  <SelectValue placeholder="Choose team…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {vercelTeams.map((t) => (
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.name} ({t.slug || t.id})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+          ) : null}
+          <details className="group">
+            <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+              Manual token or OAuth app
+            </summary>
+            <div className="mt-3 grid gap-3">
+              <Field label="Vercel token" htmlFor="int-vercel-token">
+                <div className="flex gap-2">
+                  <div className="flex-1">
+                    <SecretInput
+                      id="int-vercel-token"
+                      value={drafts.vercelToken}
+                      placeholder="vercel_…"
+                      onChange={(e) => patch({ vercelToken: e.target.value })}
+                    />
+                  </div>
+                  <AsyncButton
+                    variant="outline"
+                    size="sm"
+                    onClick={async () => {
+                      try {
+                        const teams = await fetchVercelTeams(drafts.vercelToken);
+                        toastOk("Vercel teams loaded", `${teams.length} team(s) found.`);
+                      } catch (e) {
+                        toastErr("Vercel teams failed", errText(e, 200));
+                      }
+                    }}
+                  >
+                    Load teams
+                  </AsyncButton>
+                </div>
+              </Field>
+              <Field label="Team ID (optional)" htmlFor="int-vercel-team">
+                <Input
+                  id="int-vercel-team"
+                  value={drafts.vercelTeam}
+                  placeholder="team_…"
+                  onChange={(e) => patch({ vercelTeam: e.target.value })}
+                  autoComplete="off"
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={save(
+                    [
+                      ["VERCEL_TOKEN", "vercelToken"],
+                      ["VERCEL_TEAM_ID", "vercelTeam"],
+                    ],
+                    "Vercel",
+                    ["vercelTeam"],
+                  )}
+                >
+                  <KeyRound /> Save token &amp; team
+                </AsyncButton>
+              </ButtonRow>
+              <Separator />
+              <Field
+                label="Vercel OAuth Client ID"
+                htmlFor="int-vercel-cid"
+                hint="Callback URL: http://127.0.0.1:17495/vercel/callback"
+              >
+                <Input
+                  id="int-vercel-cid"
+                  value={drafts.vercelClientId}
+                  placeholder={oauthStatus.vercel.client_id || "oac_…"}
+                  onChange={(e) => patch({ vercelClientId: e.target.value })}
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label="Client Secret (optional)" htmlFor="int-vercel-csec">
+                <SecretInput
+                  id="int-vercel-csec"
+                  value={drafts.vercelClientSecret}
+                  placeholder="optional for PKCE"
+                  onChange={(e) => patch({ vercelClientSecret: e.target.value })}
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton variant="outline" size="sm" onClick={saveVercelOAuthApp}>
+                  Save OAuth client
+                </AsyncButton>
+                {oauthStatus.vercel.has_oauth ? (
+                  <AsyncButton
+                    variant="ghost"
+                    size="sm"
+                    onClick={async () => {
+                      await clearOAuthClient("vercel");
+                      toastOk("Cleared Vercel OAuth client");
+                    }}
+                  >
+                    Clear
+                  </AsyncButton>
+                ) : null}
+              </ButtonRow>
+            </div>
+          </details>
+        </div>
+
+        {/* Upstash Box */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead name="Upstash Box" hint="Warm-box sandbox runner" dot={dots.upstash_box} onTest={test("upstash_box")} />
+          <Field label="Box API key" htmlFor="int-box-key">
+            <SecretInput
+              id="int-box-key"
+              value={drafts.boxKey}
+              placeholder="box_…"
+              onChange={(e) => patch({ boxKey: e.target.value })}
+            />
+          </Field>
+          <ButtonRow>
+            <AsyncButton size="sm" onClick={save([["UPSTASH_BOX_API_KEY", "boxKey"]], "Upstash Box")}>
+              <Plug /> Save Box key
+            </AsyncButton>
+            <Button type="button" variant="ghost" size="sm" onClick={() => openUrl("https://console.upstash.com")}>
+              <ExternalLink /> Open Upstash Console
+            </Button>
+          </ButtonRow>
+        </div>
+
+        {/* Redis */}
+        <div className="bg-card/50 grid content-start gap-3 rounded-lg border p-4">
+          <ConnectionHead
+            name="Redis (shared state)"
+            hint="Agents, runs & quota"
+            dot={dots.redis}
+            onTest={test("redis")}
+          />
+          <Hint className="text-xs">{redisSummary}</Hint>
+          <details className="group">
+            <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+              Self-hosted REDIS_URL or Upstash REST
+            </summary>
+            <div className="mt-3 grid gap-3">
+              <Field
+                label="REDIS_URL (local/self-hosted)"
+                htmlFor="int-redis-conn-url"
+                hint="FastAPI Cloud injects REDIS_URL automatically — only needed for local/self-hosted backends."
+              >
+                <SecretInput
+                  id="int-redis-conn-url"
+                  value={drafts.redisConn}
+                  placeholder="rediss://default:…@host:port"
+                  onChange={(e) => patch({ redisConn: e.target.value })}
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton variant="outline" size="sm" onClick={save([["REDIS_URL", "redisConn"]], "Redis URL")}>
+                  <Plug /> Save Redis URL
+                </AsyncButton>
+              </ButtonRow>
+              <Separator />
+              <Field label="Upstash REST URL" htmlFor="int-redis-url">
+                <Input
+                  id="int-redis-url"
+                  value={drafts.redisUrl}
+                  placeholder="https://….upstash.io"
+                  onChange={(e) => patch({ redisUrl: e.target.value })}
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label="Upstash REST token" htmlFor="int-redis-token">
+                <SecretInput
+                  id="int-redis-token"
+                  value={drafts.redisToken}
+                  onChange={(e) => patch({ redisToken: e.target.value })}
+                />
+              </Field>
+              <ButtonRow>
+                <AsyncButton
+                  variant="outline"
+                  size="sm"
+                  onClick={save(
+                    [
+                      ["UPSTASH_REDIS_REST_URL", "redisUrl"],
+                      ["UPSTASH_REDIS_REST_TOKEN", "redisToken"],
+                    ],
+                    "Redis",
+                    ["redisUrl"],
+                  )}
+                >
+                  <Plug /> Save REST credentials
+                </AsyncButton>
+              </ButtonRow>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      {/* 4. Collapsible Diagnostics */}
+      <details className="group">
+        <summary className="text-muted-foreground hover:text-foreground cursor-pointer text-xs select-none">
+          Connection diagnostics
+        </summary>
+        <Console className="mt-2">{out}</Console>
+      </details>
     </Section>
   );
 }
@@ -642,7 +1162,7 @@ function ConnectionsCard({
 /* GitHub 1-click repo setup                                           */
 /* ------------------------------------------------------------------ */
 
-function StepPill({ label, state, title }: { label: string; state: "ok" | "warn" | "" ; title?: string }) {
+function StepPill({ label, state, title }: { label: string; state: "ok" | "warn" | ""; title?: string }) {
   const mark = state === "ok" ? "✓" : state === "warn" ? "✕" : "—";
   return (
     <Badge
@@ -668,14 +1188,11 @@ function RepoRow({ name }: { name: string }) {
   const workflow = (st && st.workflow) || {};
   const secrets = (st && st.secrets) || {};
   const generic = (st && st.error) || "";
-  // A repo reviewed only by the GitHub Action needs no webhook, and a
-  // backend-only repo needs no workflow/secrets: show those steps as n/a.
   const mode = st && st.mode;
   let secTitle = secrets.error || generic;
   if (!secTitle && st && !secrets.configured) {
     const missing: string[] = [];
     if (!secrets.openrouter_api_key) missing.push("OPENROUTER_API_KEY");
-    // LLM_API_KEY is only required by the OpenRabbit workflow.
     if (workflow.provider === "openrabbit" && !secrets.llm_api_key) missing.push("LLM_API_KEY");
     if (missing.length) secTitle = "missing repo secret(s): " + missing.join(", ");
   }
@@ -755,6 +1272,7 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
   const cloudBase = useApp((s) => s.cloudBase);
   const clearNonce = useApp((s) => s.clearNonce);
 
+  const login = useGh((s) => s.login);
   const repos = useGh((s) => s.repos);
   const loadingRepos = useGh((s) => s.loadingRepos);
   const selected = useGh((s) => s.selected);
@@ -762,6 +1280,7 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
   const batchRunning = useGh((s) => s.batchRunning);
   const log = useGh((s) => s.log);
 
+  const [switchOpen, setSwitchOpen] = React.useState(false);
   const [filter, setFilter] = React.useState("");
   const [mode, setMode] = React.useState<ReviewMode>("actions");
   const [secret, setSecretText] = React.useState("");
@@ -782,8 +1301,7 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
   }, [log]);
 
   const orKey = orKeyDraft.trim() || sessionOrKey || "";
-  const base = webhookBase(cloudBase);
-  void backend;
+  const base = resolvePublicWebhookBase(cloudBase, backend) || webhookBase(cloudBase);
   let isLocal = false;
   try {
     isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/i.test(new URL(base).hostname);
@@ -820,7 +1338,33 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
       }
       action={<GithubStateBadge />}
     >
-      <GithubConnect />
+      {connected ? (
+        <div className="grid gap-3">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-muted-foreground">
+              {login ? (
+                <>
+                  Connected as <b>@{login}</b>
+                </>
+              ) : (
+                "Connected (session token)"
+              )}
+            </span>
+            <Button
+              type="button"
+              variant="link"
+              size="xs"
+              className="h-auto px-0"
+              onClick={() => setSwitchOpen((v) => !v)}
+            >
+              {switchOpen ? "Hide sign-in" : "Switch account"}
+            </Button>
+          </div>
+          {switchOpen ? <GithubConnect /> : null}
+        </div>
+      ) : (
+        <GithubConnect />
+      )}
 
       {connected ? (
         <div className="grid gap-4">
@@ -833,8 +1377,8 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
             <span className="text-muted-foreground ml-auto text-xs">{selected.length} selected</span>
           </div>
           <Hint>
-            Tick repositories to configure. Webhooks, secrets and workflow files require <b>admin</b> access. Statuses load on
-            demand — tick a repo or use “Check status” (never auto-checks every repo).
+            Tick repositories to configure. Webhooks, secrets and workflow files require <b>admin</b> access. Statuses
+            load on demand — tick a repo or use “Check status”.
           </Hint>
           <div className="flex flex-wrap gap-2">
             <div className="relative min-w-48 flex-1">
@@ -930,8 +1474,8 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
                   : "")}
           </Hint>
           <Hint>
-            The base URL comes from “Cloud app base URL” in the webhook URL card below; it falls back to the Settings backend
-            URL.
+            The base URL comes from “Cloud app base URL” in the webhook URL card below; it falls back to an HTTPS
+            Settings backend URL.
           </Hint>
           <div className="grid gap-2.5">
             <Label className="font-normal">
@@ -944,9 +1488,8 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
             </Label>
           </div>
           <Hint>
-            Saving to <code>.env</code> requires a backend restart to take effect. The token otherwise stays in
-            memory/sessionStorage only. OpenRouter key: uses the key saved in the OpenRouter row above, then the session key{" "}
-            <b>{orKey ? "(key ready)" : "(no OpenRouter key yet)"}</b>.
+            Saving to <code>.env</code> requires a backend restart to take effect. OpenRouter key: uses the key from
+            OpenRouter above or the current session key <b>{orKey ? "(key ready)" : "(no OpenRouter key yet)"}</b>.
           </Hint>
           <FieldGrid>
             <Field label="Backend agent name" htmlFor="gh-agent-name">
@@ -980,8 +1523,7 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
         </div>
       ) : (
         <Hint className="flex items-center gap-2">
-          <KeyRound className="size-4" /> Sign in to list your repositories.
-          <X className="hidden" />
+          <KeyRound className="size-4" /> Sign in above to list your repositories.
         </Hint>
       )}
     </Section>
@@ -995,11 +1537,12 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
 function WebhookCard() {
   const cloudBase = useApp((s) => s.cloudBase);
   const setCloudBase = useApp((s) => s.setCloudBase);
-  const base = cloudBase.trim().replace(/\/+$/, "");
+  const backend = useApp((s) => s.backendUrl);
+  const base = resolvePublicWebhookBase(cloudBase, backend);
   const url = base ? base + "/webhooks/github" : "https://<cloud-app>/webhooks/github";
 
   const copy = async () => {
-    if (!base) return toastErr("Webhook URL", "Enter your cloud app base URL first.");
+    if (!base) return toastErr("Webhook URL", "Enter a public HTTPS base URL first.");
     try {
       await navigator.clipboard.writeText(url);
       toastOk("Copied", url);
@@ -1013,8 +1556,8 @@ function WebhookCard() {
       title="GitHub webhook URL"
       description={
         <>
-          Repo Settings → Webhooks → Add webhook: paste the Payload URL below, Content type <code>application/json</code>,
-          Secret = the webhook secret saved above, events = pull requests only.
+          Repo Settings → Webhooks → Add webhook: paste the Payload URL below, Content type{" "}
+          <code>application/json</code>, Secret = the webhook secret saved above, events = pull requests &amp; comments.
         </>
       }
       action={<Badge variant="outline">copy-paste</Badge>}
@@ -1024,204 +1567,22 @@ function WebhookCard() {
         </Button>
       }
     >
-      <Field label="Cloud app base URL" htmlFor="int-cloud-base" hint="e.g. https://your-app.vercel.app">
+      <Field
+        label="Cloud app base URL"
+        htmlFor="int-cloud-base"
+        hint="Optional override — defaults to your HTTPS Settings Backend URL when set."
+      >
         <Input
           id="int-cloud-base"
           value={cloudBase}
           onChange={(e) => setCloudBase(e.target.value)}
-          placeholder="https://your-app…"
+          placeholder={base || "https://your-app.vercel.app"}
           autoComplete="off"
         />
       </Field>
       <Hint>
         Payload URL: <code className="break-all">{url}</code>
       </Hint>
-    </Section>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* GitHub App (bot identity, Check Runs, all PR events)                */
-/* ------------------------------------------------------------------ */
-
-type CreatedApp = {
-  app_id: number;
-  slug: string;
-  html_url: string;
-  install_url: string;
-  webhook_active: boolean;
-  env_path: string | null;
-  local_error: string | null;
-  cloud_saved: boolean;
-  cloud_error: string | null;
-};
-
-function GithubAppCard() {
-  const cloudBase = useApp((s) => s.cloudBase);
-  const apiToken = useApp((s) => s.secrets.api);
-  const [appName, setAppName] = React.useState("PR Agent Control");
-  const [org, setOrg] = React.useState("");
-  const [created, setCreated] = React.useState<CreatedApp | null>(null);
-  // undefined = first check still running, null = backend cannot answer
-  const [health, setHealth] = React.useState<AppHealth | null | undefined>(undefined);
-  const base = cloudBase.trim().replace(/\/+$/, "");
-  const wantedHook = base ? `${base}/webhooks/github` : "";
-
-  const backend = useApp((s) => s.backendUrl);
-  const checkSeq = React.useRef(0);
-  const check = React.useCallback(async () => {
-    // Newest check wins, so a slow answer from a previous backend cannot restore its state.
-    const mine = ++checkSeq.current;
-    const h = await fetchAppHealth();
-    if (mine === checkSeq.current) setHealth(h);
-  }, []);
-  React.useEffect(() => {
-    setHealth(undefined); // the old backend's App says nothing about the new one
-    void check();
-  }, [check, backend]);
-
-  const create = async () => {
-    // Re-check right before: an App may already exist (or the first check may still have been running).
-    const existing = await fetchAppHealth();
-    setHealth(existing);
-    if (existing?.configured) {
-      toastErr("GitHub App", "An App is already set up on this backend; use Check App.");
-      return;
-    }
-    try {
-      const res = await tauriInvoke<CreatedApp>("github_app_create", {
-        backendUrl: base,
-        appName: appName.trim(),
-        org: org.trim() || null,
-        // Credentials go from the Rust side straight to the cloud backend (never via the webview).
-        settingsUrl: backendUrl(),
-        apiToken: apiToken || null,
-      });
-      setCreated(res);
-      if (res.cloud_saved) toastOk("GitHub App created", `${res.slug} · credentials saved to the cloud backend`);
-      else toastErr("GitHub App created, cloud backend not updated", res.cloud_error || "backend URL / API token missing");
-      void check();
-    } catch (e) {
-      toastErr("GitHub App", errText(e, 300));
-    }
-  };
-
-  const fixWebhook = async () => {
-    try {
-      await apiMut("POST", "/github-app/webhook", { base_url: base });
-      toastOk("Webhook updated", wantedHook);
-    } catch (e) {
-      toastErr("Webhook update failed", errText(e, 300));
-    }
-    await check();
-  };
-
-  const installUrl = created?.install_url || (health?.html_url ? `${health.html_url.replace(/\/+$/, "")}/installations/new` : "");
-  const hookMismatch = !!(health?.configured && wantedHook && health.webhook_url && health.webhook_url !== wantedHook);
-
-  return (
-    <Section
-      title="GitHub App (recommended)"
-      description={
-        <>
-          Gives the agent its own bot identity, lets it post the merge-readiness Check Run, and delivers every PR
-          event (reviews, resolved threads, CI results) to the backend. GitHub opens in your browser to confirm. The
-          private key and webhook secret go straight to your cloud backend (and the local <code>backend/.env</code>), never
-          through this window.
-        </>
-      }
-      action={
-        <Badge variant={health?.configured ? (health.ok ? "success" : "warning") : "outline"}>
-          {health?.configured ? (health.ok ? "healthy" : `${health.problems.length} issue(s)`) : created ? "created" : "not set up"}
-        </Badge>
-      }
-      footer={
-        <ButtonRow>
-          <AsyncButton onClick={create} disabled={!appName.trim() || !base || health === undefined || !!health?.configured}>
-            <Plug /> {health?.configured ? "App already set up" : "Create GitHub App"}
-          </AsyncButton>
-          {installUrl ? (
-            <Button type="button" variant="outline" size="sm" onClick={() => openUrl(installUrl)}>
-              Install on repositories
-            </Button>
-          ) : null}
-          <AsyncButton variant="outline" size="sm" onClick={check}>
-            <RefreshCw /> Check App
-          </AsyncButton>
-          {hookMismatch ? (
-            <AsyncButton variant="outline" size="sm" onClick={fixWebhook}>
-              Fix webhook URL
-            </AsyncButton>
-          ) : null}
-        </ButtonRow>
-      }
-    >
-      <FieldGrid>
-        <Field label="App name" htmlFor="int-app-name" hint="Must be unique on GitHub (max 34 characters)">
-          <Input id="int-app-name" value={appName} maxLength={34} onChange={(e) => setAppName(e.target.value)} />
-        </Field>
-        <Field label="Organization (optional)" htmlFor="int-app-org" hint="Leave empty to create it on your account">
-          <Input id="int-app-org" value={org} onChange={(e) => setOrg(e.target.value)} placeholder="my-org" />
-        </Field>
-      </FieldGrid>
-      <Hint>
-        Webhook:{" "}
-        {base ? (
-          <code className="break-all">{base}/webhooks/github</code>
-        ) : (
-          <>none yet. Set the cloud app base URL below first, or the App is created with its webhook off.</>
-        )}
-      </Hint>
-      {!base ? (
-        <Hint className="text-warning">
-          Set the <b>Cloud app base URL</b> (webhook URL card below) first: the App can only deliver events to a public https
-          backend.
-        </Hint>
-      ) : null}
-      {created ? (
-        <Hint>
-          Created <b>{created.slug}</b> (id {created.app_id}).{" "}
-          {created.cloud_saved ? (
-            <>
-              Credentials are saved on the cloud backend (private key and webhook secret are encrypted there; no redeploy
-              needed).
-            </>
-          ) : (
-            <span className="text-destructive">
-              The cloud backend did not accept the credentials ({created.cloud_error || "no backend URL"}). Fix that (is{" "}
-              <code>BACKEND_API_TOKEN</code> set on it and in Settings?) and recreate the App, or copy the values from{" "}
-              <code className="break-all">{created.env_path || "backend/.env"}</code>.
-            </span>
-          )}{" "}
-          {created.env_path ? "A copy is in the local backend/.env. " : ""}
-          Next: <b>Install on repositories</b>, and set the same <code>GITHUB_APP_WEBHOOK_SECRET</code> on the Cloudflare
-          worker if you use it.
-          {created.webhook_active ? null : " Its webhook is off until you set a URL in the App settings on GitHub."}
-        </Hint>
-      ) : null}
-      {health && health.configured ? (
-        <div className="grid gap-1.5">
-          <p className="text-[13px] font-medium">
-            {health.ok ? "✓ " : "⚠ "}
-            {health.slug ? `App ${health.slug}` : "App"}
-            {health.installations?.length
-              ? ` · installed on ${health.installations.map((i) => `${i.account} (${i.repository_selection})`).join(", ")}`
-              : ""}
-          </p>
-          {health.problems.map((p) => (
-            <p key={p} className="text-warning text-xs break-words">
-              • {p}
-            </p>
-          ))}
-          {hookMismatch ? (
-            <p className="text-warning text-xs break-words">
-              • the App delivers to <code>{health.webhook_url}</code>, not <code>{wantedHook}</code>. Use “Fix webhook URL”.
-            </p>
-          ) : null}
-        </div>
-      ) : health === null ? (
-        <Hint>Backend unreachable — App status unknown.</Hint>
-      ) : null}
     </Section>
   );
 }
@@ -1243,8 +1604,7 @@ export function IntegrationsPage({ active }: { active: boolean }) {
   return (
     <Page active={active}>
       <SetupChecklist active={active} />
-      <ConnectionsCard drafts={drafts} setDrafts={setDrafts} />
-      <GithubAppCard />
+      <ConnectionsCard active={active} drafts={drafts} setDrafts={setDrafts} />
       <RepoSetupCard orKeyDraft={drafts.orKey} />
       <WebhookCard />
     </Page>

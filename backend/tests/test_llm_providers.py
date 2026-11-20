@@ -239,3 +239,116 @@ def test_review_saved_model_fallback(monkeypatch, provider, model):
             expected = pr.LLM_PROVIDERS[provider]["default_model"]
         expected = expected.removeprefix("openai/")
     assert _llm_post(calls)["json"]["model"] == expected  # nosec B101
+
+
+def test_openrouter_vendor_prefix_is_stripped_while_routers_stay():
+    assert pr.normalize_openrouter_model("openrouter/thinkingmachines/inkling-2-small:free") == "thinkingmachines/inkling-2-small:free"  # nosec B101
+    assert pr.normalize_openrouter_model("openrouter/free") == "openrouter/free"  # nosec B101
+    assert pr.normalize_openrouter_model("openrouter/auto") == "openrouter/auto"  # nosec B101
+    assert pr.normalize_openrouter_model("openai/gpt-4o") == "openai/gpt-4o"  # nosec B101
+
+
+def test_review_normalizes_openrouter_model_uses_default_prompt_and_formats_heading(monkeypatch):
+    calls = []
+    _install_fake_httpx(monkeypatch, calls)
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/thinkingmachines/inkling-2-small:free")
+    agent = {
+        "id": "agent-a",
+        "name": "Agent A",
+        "system_prompt": "",
+        "profile": "assertive",
+        "path_instructions": [
+            {"path": "src/**/*.py", "instructions": "Always validate inputs."},
+            {"path": "docs/**", "instructions": "Ignore me."},
+        ],
+    }
+    ctx = {"repo": "owner/repo", "pr_number": 7, "sha": "abc", "action": "opened", "title": "T"}
+    result = asyncio.run(pr.ReviewOnlyProvider().run(agent, ctx))
+    assert result["status"] == "completed"  # nosec B101
+    post = _llm_post(calls)
+    assert post["json"]["model"] == "thinkingmachines/inkling-2-small:free"  # nosec B101
+    assert post["json"]["messages"][0]["content"] == pr.DEFAULT_SYSTEM_PROMPT  # nosec B101
+    user_msg = post["json"]["messages"][1]["content"]
+    assert "assertive" in user_msg  # nosec B101
+    assert "Always validate inputs." in user_msg  # nosec B101
+    assert "Ignore me." not in user_msg  # nosec B101
+    comment_post = next(c for c in calls if c["method"] == "POST" and c["url"].endswith("/comments"))
+    assert "\n## 🤖 Agent A (review_only, 0 CPU-sec)\n" in comment_post["json"]["body"]  # nosec B101
+
+
+def test_review_openrouter_retries_with_free_router_on_429(monkeypatch):
+    calls = []
+
+    class _FallbackClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            calls.append(("GET", url, headers or {}))
+            if url.endswith("/comments"):
+                return _Resp(200, data=[])
+            return _Resp(200, text=DIFF, data={"head": {"sha": "abc"}})
+
+        async def post(self, url, headers=None, json=None):
+            calls.append(("POST", url, json))
+            if url.endswith("/chat/completions"):
+                if json["model"] != pr.OPENROUTER_FALLBACK_MODEL:
+                    return _Resp(429, text='{"error":{"message":"rate limited"}}', data={"error": {"message": "rate limited"}})
+                return _Resp(200, data={"choices": [{"message": {"content": "Looks good"}}]})
+            return _Resp(201, data={})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FallbackClient)
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/thinkingmachines/inkling-2-small:free")
+    result = _review()
+    assert result["status"] == "completed"  # nosec B101
+    llm_posts = [c[2]["model"] for c in calls if c[0] == "POST" and c[1].endswith("/chat/completions")]
+    assert llm_posts == ["thinkingmachines/inkling-2-small:free", "openrouter/free"]  # nosec B101
+
+
+def test_review_falls_back_to_pr_files_on_406_large_diff(monkeypatch):
+    calls = []
+
+    class _LargeDiffClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            calls.append(("GET", url, headers or {}))
+            if url.endswith("/pulls/7") and (headers or {}).get("Accept") == "application/vnd.github.diff":
+                return _Resp(406, text="diff too large")
+            if url.endswith("/pulls/7/files"):
+                return _Resp(200, data=[{"filename": "src/main.py", "status": "modified", "patch": "@@ -1 +1 @@\n+x = 1"}])
+            if url.endswith("/comments"):
+                return _Resp(200, data=[])
+            return _Resp(200, data={"head": {"sha": "abc"}})
+
+        async def post(self, url, headers=None, json=None):
+            calls.append(("POST", url, json))
+            if url.endswith("/chat/completions"):
+                return _Resp(200, data={"choices": [{"message": {"content": "Reviewed files"}}]})
+            return _Resp(201, data={})
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _LargeDiffClient)
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
+    result = _review()
+    assert result["status"] == "completed"  # nosec B101
+    assert "src/main.py" in result["diff"]  # nosec B101
+    assert any("falling back to PR files patches" in line for line in result["logs"])  # nosec B101

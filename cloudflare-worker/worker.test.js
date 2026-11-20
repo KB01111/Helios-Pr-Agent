@@ -344,6 +344,8 @@ test("deliveries signed with the GitHub App secret are accepted when configured"
     const env = { ...baseEnv, GITHUB_APP_WEBHOOK_SECRET: "app-secret" };
     assert.equal((await post(body, { signature: appSigned, env })).status, 202);
     assert.equal((await post(body, { env })).status, 202); // repo secret still works
+    const appOnlyEnv = { GITHUB_APP_WEBHOOK_SECRET: "app-secret", BACKEND_URL: baseEnv.BACKEND_URL };
+    assert.equal((await post(body, { signature: appSigned, env: appOnlyEnv })).status, 202);
   } finally {
     f.restore();
   }

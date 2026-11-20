@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the rendered template changes in a way existing repos should pick up.
-pub const TEMPLATE_VERSION: u32 = 5;
+pub const TEMPLATE_VERSION: u32 = 6;
 /// First-line marker of a workflow this app manages.
 pub const MANAGED_MARKER: &str = "# pr-agent-control: ";
 /// Pinned so a compromised upstream branch cannot receive repository secrets.
@@ -221,7 +221,12 @@ jobs:
           CONFIG__MODEL: "{model}"
           CONFIG__FALLBACK_MODELS: '{fallbacks}'
           CONFIG__MAX_MODEL_TOKENS: "{max_tokens}"
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: "{max_tokens}"
           CONFIG__REASONING_EFFORT: "{effort}"
+          OPENROUTER__REASONING_EFFORT: "{effort}"
+          CONFIG__AI_TIMEOUT: "300"
+          CONFIG__PROPAGATE_TOOL_ERRORS: "true"
+          GITHUB_ACTION_CONFIG__FAIL_ON_COMMAND_ERRORS: "true"
           # One review comment per PR, edited in place on every new push.
           PR_REVIEWER__PERSISTENT_COMMENT: "true"
           PR_REVIEWER__INLINE_CODE_COMMENTS: "true"
@@ -302,7 +307,11 @@ mod tests {
     fn default_workflow_has_expected_settings() {
         let yaml = default_pr_agent_workflow();
         assert!(yaml.contains("CONFIG__MAX_MODEL_TOKENS: \"200000\""));
-        assert!(!yaml.contains("CUSTOM_MODEL_MAX_TOKENS"));
+        assert!(yaml.contains("CONFIG__CUSTOM_MODEL_MAX_TOKENS: \"200000\""));
+        assert!(yaml.contains("OPENROUTER__REASONING_EFFORT: \"low\""));
+        assert!(yaml.contains("CONFIG__AI_TIMEOUT: \"300\""));
+        assert!(yaml.contains("CONFIG__PROPAGATE_TOOL_ERRORS: \"true\""));
+        assert!(yaml.contains("GITHUB_ACTION_CONFIG__FAIL_ON_COMMAND_ERRORS: \"true\""));
         assert!(yaml.contains("types: [opened, reopened, ready_for_review, synchronize]"));
         assert!(yaml.contains("!github.event.pull_request.draft"));
         assert!(yaml.contains("PR_REVIEWER__PERSISTENT_COMMENT: \"true\""));

@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, FileDiff, Radio, RefreshCw } from "lucide-react";
+import { Check, ExternalLink, FileDiff, Radio, RefreshCw } from "lucide-react";
 import { AsyncButton, ButtonRow, Console, Hint, Page, Section } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { apiMut } from "@/lib/api";
 import { syncRuns, toggleStream } from "@/lib/actions";
 import { useApp, type Run } from "@/lib/store";
-import { errText } from "@/lib/tauri";
+import { errText, openUrl } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 
 type Tone = "success" | "danger" | "warning" | "outline";
@@ -76,8 +76,9 @@ export function RunsPage({ active }: { active: boolean }) {
             const pr = String(r.pr_number || r.pr || "?");
             const provider = String(r.provider || r.runtime_mode || r.mode || "?");
             const cpu = String(r.cpu_hours ?? r.cpu_seconds ?? "?");
-            const logs = String(r.logs || r.log || r.summary || "").slice(0, 900);
+            const logs = (Array.isArray(r.logs) ? r.logs.join("\n") : String(r.logs || r.log || r.summary || "")).slice(0, 2000);
             const diff = String(r.diff || "");
+            const canOpenPr = repo !== "?" && pr !== "?" && /^[^/\s]+\/[^/\s]+$/.test(repo) && /^\d+$/.test(pr);
             return (
               <div key={id || i} className="bg-card grid gap-3 rounded-lg border p-4">
                 <div className="flex flex-wrap items-center gap-2">
@@ -100,8 +101,18 @@ export function RunsPage({ active }: { active: boolean }) {
                     </Console>
                   </details>
                 ) : null}
-                {diff || (status === "queued" && id) ? (
+                {canOpenPr || diff || (status === "queued" && id) ? (
                   <ButtonRow>
+                    {canOpenPr ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => openUrl(`https://github.com/${repo}/pull/${pr}`)}
+                      >
+                        <ExternalLink /> Open PR
+                      </Button>
+                    ) : null}
                     {diff ? (
                       <Button type="button" variant="ghost" size="sm" onClick={() => setDiffFor(r)}>
                         <FileDiff /> View diff

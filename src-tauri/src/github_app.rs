@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 
 const FLOW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const HOMEPAGE: &str = "https://github.com/KB01111/Helios-Pr-Agent";
+pub const GITHUB_OAUTH_PORTS: &[u16] = &[17492, 17493, 17494];
+
+pub fn github_callback_urls() -> Vec<String> {
+    GITHUB_OAUTH_PORTS
+        .iter()
+        .map(|p| format!("http://127.0.0.1:{}/oauth/callback", p))
+        .collect()
+}
 
 /// Events the agent consumes. `installation*` events are always sent to Apps.
 pub const APP_EVENTS: &[&str] = &[
@@ -109,9 +117,13 @@ pub fn build_manifest(app_name: &str, webhook_base: Option<&str>, redirect_url: 
         "url": HOMEPAGE,
         "hook_attributes": hook,
         "redirect_url": redirect_url,
+        "callback_urls": github_callback_urls(),
+        "request_oauth_on_install": true,
         "public": false,
         "default_permissions": {
-            "contents": "read",
+            "contents": "write",
+            "workflows": "write",
+            "secrets": "write",
             "metadata": "read",
             "pull_requests": "write",
             "issues": "write",
@@ -122,7 +134,7 @@ pub fn build_manifest(app_name: &str, webhook_base: Option<&str>, redirect_url: 
     })
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -130,32 +142,74 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn start_page(action: &str, manifest: &serde_json::Value) -> String {
+pub(crate) fn start_page(action: &str, manifest: &serde_json::Value) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Create GitHub App</title></head>\
-<body style=\"font-family:system-ui;padding:2rem\"><p>Redirecting to GitHub…</p>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Create GitHub App — PR Agent Control</title>\
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,-apple-system,sans-serif;\
+background:#0d1117;color:#f0f6fc}}main{{max-width:440px;padding:28px;border:1px solid #30363d;border-radius:12px;\
+background:#161b22;text-align:center}}button{{background:#2f81f7;color:#fff;border:0;padding:10px 18px;border-radius:8px;\
+font-weight:600;cursor:pointer}}@media(prefers-color-scheme:light){{body{{background:#f6f8fa;color:#1f2328}}\
+main{{background:#fff;border-color:#d0d7de}}}}</style></head>\
+<body><main><h2 style=\"margin:0 0 8px\">PR Agent Control</h2><p style=\"opacity:.8;margin:0 0 18px\">Redirecting to GitHub to approve App creation…</p>\
 <form id=\"f\" method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"manifest\" value=\"{}\">\
 <noscript><button type=\"submit\">Continue to GitHub</button></noscript></form>\
-<script>document.getElementById('f').submit()</script></body></html>",
+<script>document.getElementById('f').submit()</script></main></body></html>",
         html_escape(action),
         html_escape(&manifest.to_string())
     )
 }
 
-fn done_page(ok: bool, msg: &str) -> String {
+pub(crate) fn result_page(ok: bool, title: &str, msg: &str) -> String {
+    let icon = if ok { "&#10003;" } else { "&#10005;" };
+    let color = if ok { "#3fb950" } else { "#f85149" };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>PR Agent Control</title></head>\
-<body style=\"font-family:system-ui;padding:2rem\"><h2>{}</h2><p>{}</p><p>You can close this tab and return to the app.</p></body></html>",
-        if ok { "GitHub App created" } else { "GitHub App was not created" },
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{0} — PR Agent Control</title>\
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,-apple-system,sans-serif;\
+background:#0d1117;color:#f0f6fc}}main{{max-width:460px;padding:32px;border:1px solid #30363d;border-radius:14px;\
+background:#161b22;text-align:center}}.badge{{display:inline-flex;align-items:center;justify-content:center;width:48px;\
+height:48px;border-radius:999px;font-size:24px;font-weight:700;margin-bottom:14px;background:{1}22;color:{1};border:1px solid {1}55}}\
+p{{opacity:.82;line-height:1.5;margin:8px 0 0}}@media(prefers-color-scheme:light){{body{{background:#f6f8fa;color:#1f2328}}\
+main{{background:#fff;border-color:#d0d7de}}}}</style></head>\
+<body><main><div class=\"badge\">{2}</div><h2 style=\"margin:0 0 8px\">{0}</h2><p>{3}</p>\
+<p style=\"font-size:13px;opacity:.65;margin-top:16px\">You can close this tab and return to PR Agent Control.</p></main></body></html>",
+        html_escape(title),
+        color,
+        icon,
         html_escape(msg)
     )
 }
 
-fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+pub(crate) fn done_page(ok: bool, msg: &str) -> String {
+    result_page(
+        ok,
+        if ok { "GitHub App created" } else { "GitHub App was not created" },
+        msg,
+    )
+}
+
+pub(crate) fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let resp = format!(
         "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
-Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{}",
         status,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+pub(crate) fn respond_redirect(stream: &mut TcpStream, location: &str) {
+    let safe_loc = location.replace(['\r', '\n'], "");
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Redirecting…</title></head>\
+<body style=\"font-family:system-ui;padding:2rem\"><p>Redirecting to <a href=\"{0}\">GitHub</a>…</p></body></html>",
+        html_escape(&safe_loc)
+    );
+    let resp = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Type: text/html; charset=utf-8\r\n\
+Content-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{}",
+        safe_loc,
         body.len(),
         body
     );
@@ -209,7 +263,7 @@ pub fn parse_request_line(line: &str) -> Option<(String, Vec<(String, String)>)>
     Some((path.to_string(), params))
 }
 
-fn random_state() -> Result<String, String> {
+pub(crate) fn random_state() -> Result<String, String> {
     sodiumoxide::init().map_err(|_| "failed to initialize libsodium".to_string())?;
     Ok(sodiumoxide::randombytes::randombytes(16)
         .iter()
@@ -217,7 +271,7 @@ fn random_state() -> Result<String, String> {
         .collect())
 }
 
-fn read_request_line(stream: &mut TcpStream) -> String {
+pub(crate) fn read_request_line(stream: &mut TcpStream) -> String {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).unwrap_or(0);
@@ -274,7 +328,7 @@ pub fn pem_to_env(pem: &str) -> String {
     pem.trim().replace("\r\n", "\n").replace('\n', "\\n")
 }
 
-fn convert_code(code: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn convert_code(code: &str) -> Result<serde_json::Value, String> {
     if !code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err("unexpected manifest code format".into());
     }
@@ -308,7 +362,7 @@ pub fn cloud_settings_body(id: i64, slug: &str, pem: &str, webhook_secret: Optio
 
 /// Save the App credentials on the deployed backend (encrypted there). The secrets
 /// go straight from this process to the backend; they never reach the webview.
-fn push_to_cloud(settings_url: &str, api_token: Option<&str>, body: &serde_json::Value) -> Result<(), String> {
+pub(crate) fn push_to_cloud(settings_url: &str, api_token: Option<&str>, body: &serde_json::Value) -> Result<(), String> {
     // The body carries the private key, so refuse remote plaintext HTTP even when
     // no bearer token is sent (https and loopback http are fine).
     crate::require_secure_for_token(settings_url.trim(), true)?;
@@ -365,12 +419,30 @@ fn create_blocking(
     let slug = app.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let pem = app.get("pem").and_then(|v| v.as_str()).ok_or("GitHub response had no private key")?;
     let html_url = app.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let client_id = app.get("client_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let client_secret = app.get("client_secret").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
 
     let webhook_secret = app
         .get("webhook_secret")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+
+    let install_url = if html_url.is_empty() {
+        format!("https://github.com/apps/{}/installations/new", slug)
+    } else {
+        format!("{}/installations/new", html_url.trim_end_matches('/'))
+    };
+    if !client_id.is_empty() && !client_secret.is_empty() {
+        let _ = crate::oauth::save_github_oauth_client(
+            &client_id,
+            &client_secret,
+            true,
+            Some(&slug),
+            Some(&html_url),
+            Some(&install_url),
+        );
+    }
 
     // The App now exists and GitHub will not show the key again, so every sink is
     // best effort: a failing one must not lose the credentials for the others.
@@ -411,11 +483,6 @@ Delete the App at {} and try again.",
         Ok(p) => (Some(p), None),
         Err(e) => (None, Some(e)),
     };
-    let install_url = if html_url.is_empty() {
-        format!("https://github.com/apps/{}/installations/new", slug)
-    } else {
-        format!("{}/installations/new", html_url.trim_end_matches('/'))
-    };
     Ok(serde_json::json!({
         "app_id": id,
         "slug": slug,
@@ -455,6 +522,11 @@ mod tests {
         assert_eq!(m["hook_attributes"]["url"], "https://api.example.com/webhooks/github");
         assert_eq!(m["hook_attributes"]["active"], true);
         assert_eq!(m["default_permissions"]["checks"], "write");
+        assert_eq!(m["default_permissions"]["contents"], "write");
+        assert_eq!(m["default_permissions"]["workflows"], "write");
+        assert_eq!(m["default_permissions"]["secrets"], "write");
+        assert_eq!(m["request_oauth_on_install"], true);
+        assert_eq!(m["callback_urls"].as_array().unwrap().len(), GITHUB_OAUTH_PORTS.len());
         assert_eq!(m["public"], false);
         let events: Vec<&str> = m["default_events"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
         assert!(events.contains(&"pull_request_review_thread") && events.contains(&"check_suite"));
