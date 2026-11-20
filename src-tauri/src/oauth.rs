@@ -1116,7 +1116,7 @@ fn github_oauth_blocking(
                         );
                         continue;
                     }
-                    None if setup_action == Some("install") => {
+                    None if setup_action == Some("install") || param(&params, "code").is_some() => {
                         // GitHub omitted state after installation; redirect to an explicit
                         // OAuth authorization URL correlated with our oauth_state.
                         oauth_used_explicit_redirect = true;
@@ -1346,6 +1346,9 @@ fn finish_vercel_connect(
     api_token: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let (user, teams, teams_error) = vercel_user_and_teams(token)?;
+    if let Some(ref error) = teams_error {
+        return Err(error.clone());
+    }
     let team_id = if teams.len() == 1 {
         teams[0].get("id").and_then(|v| v.as_str()).map(str::to_string)
     } else {
@@ -1478,7 +1481,8 @@ pub async fn vercel_oauth_connect(
             .filter(|s| !s.is_empty())
             .ok_or("Vercel did not return an access_token")?;
         ensure_active(&cancelled)?;
-        finish_vercel_connect(token, settings_url.as_deref(), api_token.as_deref())
+        let _ = (token, settings_url, api_token);
+        Err("Vercel OAuth access tokens expire and cannot be saved without refresh support. Use Import from Vercel CLI or paste a manual token instead.".into())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1518,8 +1522,10 @@ fn validate_opencode_go_key(key: &str) -> Result<(), String> {
     let status = res.status();
     if status.is_success() {
         Ok(())
-    } else {
+    } else if status.as_u16() == 401 || status.as_u16() == 403 {
         Err(format!("OpenCode Go rejected the CLI key (HTTP {})", status))
+    } else {
+        Err(format!("OpenCode Go key validation failed (HTTP {})", status))
     }
 }
 

@@ -1296,6 +1296,51 @@ fn dotenv_render_value(value: &str) -> Result<String, String> {
     Ok(format!("\"{}\"", escaped))
 }
 
+// Locate complete assignments without treating lines inside quoted multiline
+// values as independent keys. python-dotenv also accepts `export KEY = value`.
+fn dotenv_key_lines(content: &str, key: &str) -> Vec<bool> {
+    let mut quote = None;
+    let mut matching = false;
+    content.lines().map(|line| {
+        let continuation = quote.is_some();
+        let mut value = line;
+        if !continuation {
+            matching = false;
+            let trimmed = line.trim_start();
+            let assignment = trimmed.strip_prefix("export")
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .unwrap_or(trimmed).trim_start();
+            if let Some((lhs, rhs)) = assignment.split_once('=') {
+                let lhs = lhs.trim();
+                let lhs = if let Some(quoted) = lhs.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+                    quoted
+                } else {
+                    if lhs.is_empty() || lhs.chars().any(|c| c.is_whitespace() || c == '#' || c == '\'') {
+                        return false;
+                    }
+                    lhs
+                };
+                matching = lhs == key;
+                value = rhs.trim_start();
+                if value.starts_with('\'') || value.starts_with('"') {
+                    quote = value.chars().next();
+                    value = &value[1..];
+                }
+            }
+        }
+        let remove = matching;
+        if let Some(q) = quote {
+            let mut escaped = false;
+            for c in value.chars() {
+                if escaped { escaped = false; continue; }
+                if c == '\\' { escaped = true; continue; }
+                if c == q { quote = None; break; }
+            }
+        }
+        remove
+    }).collect()
+}
+
 static ENV_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write one integration secret into backend/.env (creates the file if needed).
@@ -1324,11 +1369,13 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
         if !path.is_file() {
             return Ok(path.to_string_lossy().to_string());
         }
-        let prefix = format!("{}=", k);
-        let lines: Vec<String> = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())?
+        let original = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let matches = dotenv_key_lines(&original, &k);
+        let lines: Vec<String> = original
             .lines()
-            .filter(|line| !(line.starts_with(&prefix) || line.trim_start().starts_with(&prefix)))
+            .zip(matches)
+            .filter(|(_, matched)| !matched)
+            .map(|(line, _)| line)
             .map(|s| s.to_string())
             .collect();
         let mut content = lines.join("\n");
@@ -1355,13 +1402,14 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
     } else {
         vec!["# Local only — NEVER commit (gitignored). Managed by PR Agent Control Integrations.".to_string()]
     };
-    let prefix = format!("{}=", k);
+    let matches = dotenv_key_lines(&lines.join("\n"), &k);
+    let mut matches = matches.into_iter();
     let replacement = format!("{}={}", k, dotenv_render_value(v)?);
     // Replace the first occurrence and drop later duplicates so the value that
     // python-dotenv resolves is unambiguous.
     let mut replaced = false;
     lines.retain_mut(|line| {
-        if !(line.starts_with(&prefix) || line.trim_start().starts_with(&prefix)) {
+        if !matches.next().unwrap_or(false) {
             return true;
         }
         if replaced {
@@ -3023,5 +3071,16 @@ mod llm_provider_tests {
         )
         .unwrap_err();
         assert!(err.contains("commandcode, opencode_go"));
+    }
+}
+
+#[cfg(test)]
+mod dotenv_assignment_tests {
+    use super::dotenv_key_lines;
+    #[test]
+    fn assignments_allow_spaces_and_preserve_multiline_values() {
+        let content = "'OTHER'='first\nVERCEL_TOKEN = embedded\nlast'\n export VERCEL_TOKEN = old\nVERCEL_TOKEN=duplicate\n# comment = 'ignored\nVERCEL_TOKEN = final";
+        assert_eq!(dotenv_key_lines(content, "VERCEL_TOKEN"), vec![false, false, false, true, true, false, true]);
+        assert_eq!(dotenv_key_lines("VERCEL_TOKEN = \"first\nsecond\"\nOTHER=value", "VERCEL_TOKEN"), vec![true, true, false]);
     }
 }

@@ -61,6 +61,7 @@ import {
   importGitHubCli,
   importOpenCodeCli,
   importVercelCli,
+  invalidateVercelTeams,
   resolvePublicWebhookBase,
   saveOAuthClient,
   useOAuth,
@@ -131,8 +132,10 @@ function ConnectionsCard({
   active,
   drafts,
   setDrafts,
+  draftBackend,
 }: {
   active: boolean;
+  draftBackend: string;
   drafts: Drafts;
   setDrafts: React.Dispatch<React.SetStateAction<Drafts>>;
 }) {
@@ -149,6 +152,12 @@ function ConnectionsCard({
   const revision = useOAuth((s) => s.revision);
   const vercelUser = useOAuth((s) => s.vercelUser);
   const vercelTeams = useOAuth((s) => s.vercelTeams);
+  const apiCredential = useApp((s) => s.secrets.api);
+  const vercelTeamsTarget = useOAuth((s) => s.vercelTeamsTarget);
+  const teamsMatch = draftBackend === backend && vercelTeamsTarget?.backend === backend && vercelTeamsTarget.api === apiCredential &&
+    (vercelTeamsTarget.draftToken === null ? !drafts.vercelToken.trim() : vercelTeamsTarget.draftToken === drafts.vercelToken.trim());
+  const [teamSaving, setTeamSaving] = React.useState(false);
+  const teamSavingRef = React.useRef(false);
   const vercelTeamsFromSavedToken = useOAuth((s) => s.vercelTeamsFromSavedToken);
 
   const [dots, setDots] = React.useState<Record<ProviderKey, Dot>>({
@@ -172,28 +181,30 @@ function ConnectionsCard({
 
   const llmDirty = React.useRef(false); // unsaved provider/model edits
   const seq = React.useRef(0);
+  const appSeq = React.useRef(0);
   const patch = (p: Partial<Drafts>) => {
     if ("llmProvider" in p || "llmModel" in p || "llmModelCustom" in p) llmDirty.current = true;
     setDrafts((d) => ({ ...d, ...p }));
   };
 
   const checkApp = React.useCallback(async () => {
-    const mine = ++seq.current;
+    const mine = ++appSeq.current;
     const targetBackend = backendUrl();
     const h = await fetchAppHealth();
-    if (mine === seq.current && backendUrl() === targetBackend) {
+    if (mine === appSeq.current && backendUrl() === targetBackend) {
       setHealth(h);
     }
   }, []);
 
   const refresh = React.useCallback(async () => {
     const mine = ++seq.current;
+    const targetBackend = backendUrl();
     setOut("Checking status…");
     let data: any = null;
     try {
       data = await apiGet("/config/status");
     } catch (e) {
-      if (mine !== seq.current) return;
+      if (mine !== seq.current || backendUrl() !== targetBackend) return;
       setHealth(null);
       setRedisSummary("Backend unreachable.");
       setOut(`Status failed (is backend up at ${backendUrl()}?): ${errText(e, 300)}`);
@@ -201,10 +212,10 @@ function ConnectionsCard({
       toastErr("Integrations", "Backend unreachable: " + errText(e, 160));
       return;
     }
-    if (mine !== seq.current) return;
+    if (mine !== seq.current || backendUrl() !== targetBackend) return;
 
     const h = await fetchAppHealth();
-    if (mine !== seq.current) return;
+    if (mine !== seq.current || backendUrl() !== targetBackend) return;
     setHealth(h);
 
     const github = (data && data.github) || {};
@@ -320,7 +331,10 @@ function ConnectionsCard({
    *  2. the local `backend/.env` via the Tauri backend, for a backend run from this
    *     checkout. Never `localStorage`.
    */
-  const persist = async (todo: readonly (readonly [string, string])[], drop: string[], label: string): Promise<boolean> => {
+  const persist = async (todo: readonly (readonly [string, string])[], drop: string[], label: string, targets = { local: true, requireCloud: false }): Promise<boolean> => {
+    if (todo.some(([key]) => key === "VERCEL_TOKEN")) {
+      invalidateVercelTeams();
+    }
     setOut(`Saving ${label}…`);
     const cloudValues: Record<string, string | null> = {};
     for (const [key, val] of todo) if (CLOUD_KEYS.has(key)) cloudValues[key] = val;
@@ -339,7 +353,7 @@ function ConnectionsCard({
     const localOnly = todo.filter(([key]) => !CLOUD_KEYS.has(key));
     const localPaths = new Set<string>();
     let localErr = "";
-    for (const [key, val] of todo) {
+    for (const [key, val] of targets.local ? todo : []) {
       try {
         localPaths.add(await tauriInvoke<string>("save_backend_env_var", { key, value: val }));
       } catch (e) {
@@ -348,14 +362,14 @@ function ConnectionsCard({
       }
     }
     const cloudWanted = Object.keys(cloudValues).length > 0;
-    const everySaved = (!cloudWanted || cloudOk || (!!localPaths.size && !localErr)) && (!localOnly.length || !localErr);
+    const everySaved = (!cloudWanted || cloudOk || (!targets.requireCloud && !!localPaths.size && !localErr)) && (!localOnly.length || !localErr);
     const lines: string[] = [];
     if (cloudWanted) {
       lines.push(
         cloudOk ? `✓ cloud backend (${backendUrl()}): saved, live now — no redeploy needed` : `✗ cloud backend: ${cloudErr}`,
       );
     }
-    if (todo.length) {
+    if (todo.length && targets.local) {
       lines.push(
         localPaths.size && !localErr
           ? `✓ local file ${Array.from(localPaths).join(", ")}${cloudOk ? "" : " — restart a locally run backend to apply"}`
@@ -460,20 +474,29 @@ function ConnectionsCard({
     dots.openrouter === "ok" ? "success" : sessionOr ? "warning" : "outline";
 
   const vercelSaveTeam = async (teamId: string) => {
-    if (!teamId) return;
+    if (!teamId || teamSavingRef.current || !teamsMatch ||
+        vercelTeamsTarget?.backend !== backendUrl() ||
+        vercelTeamsTarget.api !== useApp.getState().secrets.api) return;
     if (!vercelTeamsFromSavedToken || drafts.vercelToken.trim()) {
       patch({ vercelTeam: teamId });
       toastOk("Team staged", "Click Save token & team under Manual token to apply this token and team together.");
       return;
     }
+    teamSavingRef.current = true;
+    setTeamSaving(true);
+    const targetBackend = backendUrl();
     const prev = drafts.vercelTeam;
-    patch({ vercelTeam: teamId });
-    const ok = await persist([["VERCEL_TEAM_ID", teamId]], [], "Vercel team");
-    if (!ok) {
-      patch({ vercelTeam: prev });
-      return;
+    try {
+      patch({ vercelTeam: teamId });
+      const ok = await persist([["VERCEL_TEAM_ID", teamId]], [], "Vercel team", {
+        local: !!vercelTeamsTarget.localSaved, requireCloud: true,
+      });
+      if (!ok && backendUrl() === targetBackend) patch({ vercelTeam: prev });
+      if (ok) void refresh();
+    } finally {
+      teamSavingRef.current = false;
+      setTeamSaving(false);
     }
-    void refresh();
   };
 
   const saveVercelOAuthApp = async () => {
@@ -958,12 +981,12 @@ function ConnectionsCard({
               Run <code>vercel login</code> locally for 1-click CLI import, or paste a token below.
             </Hint>
           ) : null}
-          {vercelTeams.length > 0 ? (
+          {teamsMatch && vercelTeams.length > 0 ? (
             <Field
               label={vercelUser ? `Vercel team (@${vercelUser})` : "Vercel team"}
               htmlFor="int-vercel-team-select"
             >
-              <Select value={drafts.vercelTeam} onValueChange={vercelSaveTeam}>
+              <Select disabled={teamSaving || !!activeFlow} value={drafts.vercelTeam} onValueChange={vercelSaveTeam}>
                 <SelectTrigger id="int-vercel-team-select" className="w-full">
                   <SelectValue placeholder="Choose team…" />
                 </SelectTrigger>
@@ -1643,7 +1666,13 @@ function WebhookCard() {
 }
 
 export function IntegrationsPage({ active }: { active: boolean }) {
+  const backend = useApp((s) => s.backendUrl);
+  const [draftBackend, setDraftBackend] = React.useState(backend);
   const [drafts, setDrafts] = React.useState<Drafts>(EMPTY_DRAFTS);
+  React.useEffect(() => {
+    setDrafts(EMPTY_DRAFTS);
+    setDraftBackend(backend);
+  }, [backend]);
   const clearNonce = useApp((s) => s.clearNonce);
   React.useEffect(
     () =>
@@ -1659,7 +1688,7 @@ export function IntegrationsPage({ active }: { active: boolean }) {
   return (
     <Page active={active}>
       <SetupChecklist active={active} />
-      <ConnectionsCard active={active} drafts={drafts} setDrafts={setDrafts} />
+      <ConnectionsCard active={active} drafts={drafts} setDrafts={setDrafts} draftBackend={draftBackend} />
       <RepoSetupCard orKeyDraft={drafts.orKey} />
       <WebhookCard />
     </Page>

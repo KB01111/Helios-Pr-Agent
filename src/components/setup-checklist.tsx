@@ -3,7 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { AsyncButton, Hint, Section, StatusDot } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import { apiGet, apiMut } from "@/lib/api";
+import { apiGet, apiMut, backendUrl } from "@/lib/api";
 import { fetchAppHealth, saveCloudSettings, type AppHealth } from "@/lib/cloud";
 import {
   connectGitHubOAuth,
@@ -47,6 +47,7 @@ export function SetupChecklist({ active }: { active: boolean }) {
   const lastOrCloudErr = useOAuth((s) => s.lastOpenRouterCloudError);
   const [status, setStatus] = React.useState<any>(undefined); // undefined = loading, null = unreachable
   const [health, setHealth] = React.useState<AppHealth | null | undefined>(undefined);
+  const [healthBackend, setHealthBackend] = React.useState<string | null>(null);
   const [agents, setAgents] = React.useState<number | null>(null);
   const [err, setErr] = React.useState("");
 
@@ -55,7 +56,8 @@ export function SetupChecklist({ active }: { active: boolean }) {
     // Only the newest check may write state: a slow answer from a previous
     // backend must not overwrite the current one.
     const mine = ++seq.current;
-    const current = () => mine === seq.current;
+    const targetBackend = backendUrl();
+    const current = () => mine === seq.current && backendUrl() === targetBackend;
     setErr("");
     let st: any;
     try {
@@ -73,6 +75,7 @@ export function SetupChecklist({ active }: { active: boolean }) {
     const h = await fetchAppHealth();
     if (!current()) return;
     setHealth(h);
+    setHealthBackend(targetBackend);
     let count: number | null = null;
     try {
       const list = await apiGet("/agents");
@@ -178,10 +181,13 @@ export function SetupChecklist({ active }: { active: boolean }) {
       oauthStatus.github.install_url ||
       "";
     let appAction: Step["action"];
-    if (health && !health.configured) {
+    if (healthBackend === backend && health && !health.configured) {
       appAction = {
         label: "Connect GitHub App",
-        run: () => connectGitHubOAuth({ forceNewApp: true }),
+        run: () => {
+          if (healthBackend !== backendUrl()) return;
+          return connectGitHubOAuth({ forceNewApp: true });
+        },
       };
     } else if (health && health.configured && !health.ok && installUrl) {
       appAction = {

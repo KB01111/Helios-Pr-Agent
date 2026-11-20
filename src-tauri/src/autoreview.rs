@@ -187,8 +187,9 @@ permissions:
 concurrency:
   # Runs for one PR are queued, one at a time. Nothing is cancelled mid-run, so a PR
   # description being written is never dropped, and a review can never overwrite the
-  # review of a newer commit. While one runs, only the newest waiting run is kept.
-  group: ${{{{ github.workflow }}}}-${{{{ (github.event_name == 'pull_request' && format('pr-{{0}}', github.event.pull_request.number)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && format('pr-{{0}}', github.event.issue.number)) || format('run-{{0}}', github.run_id) }}}}
+  # review of a newer commit. Pending runs are preserved.
+  group: ${{{{ github.workflow }}}}-${{{{ (github.event_name == 'pull_request' && format('pr-{{0}}', github.event.pull_request.number)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ') || startsWith(github.event.comment.body, fromJSON('"/review\n"')) || startsWith(github.event.comment.body, fromJSON('"/review\r"')) || startsWith(github.event.comment.body, fromJSON('"/review\t"'))) && format('pr-{{0}}', github.event.issue.number)) || format('run-{{0}}', github.run_id) }}}}
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -196,8 +197,7 @@ jobs:
     if: >-
       ${{{{ github.event.sender.type != 'Bot' &&{draft_guard}
           (github.event_name != 'issue_comment' ||
-           (github.event.issue.pull_request &&
-            contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}}}
+           (github.event.issue.pull_request && github.event.sender.type != 'Bot' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ') || startsWith(github.event.comment.body, fromJSON('"/review\n"')) || startsWith(github.event.comment.body, fromJSON('"/review\r"')) || startsWith(github.event.comment.body, fromJSON('"/review\t"'))))) }}}}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -322,7 +322,8 @@ mod tests {
         assert!(yaml.contains(&format!("github_action_config.auto_describe: {}", OPEN_ONLY)));
         assert!(yaml.contains("github_action_config.auto_improve: \"false\""));
         // One queue per PR: no run is cancelled mid-flight, so nothing is dropped or reordered.
-        assert!(yaml.contains("group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && format('pr-{0}', github.event.issue.number))"));
+        assert!(yaml.contains(r#"group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ') || startsWith(github.event.comment.body, fromJSON('"/review\n"')) || startsWith(github.event.comment.body, fromJSON('"/review\r"')) || startsWith(github.event.comment.body, fromJSON('"/review\t"'))) && format('pr-{0}', github.event.issue.number))"#));
+        assert!(yaml.contains("queue: max"));
         assert!(yaml.contains("cancel-in-progress: false"));
         assert!(!yaml.contains("EXTRA_INSTRUCTIONS"));
     }

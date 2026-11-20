@@ -422,6 +422,7 @@ async def _handle_issue_comment_trigger(
     if target is None:
         return res
     repo, pr_number, issue, comment = target
+    run_ids: list[str] = []
     try:
         agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
         agent_configs = await store.arget_json_many(agent_keys)
@@ -440,10 +441,14 @@ async def _handle_issue_comment_trigger(
             title=title,
             head_ref=head_ref,
         )
-        run_ids: list[str] = []
         await _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks)
         return {**res, "runs": run_ids}
     except Exception:
+        for rid in run_ids:
+            try:
+                await asyncio.to_thread(_fail_run, rid, "comment processing aborted before dispatch")
+            except Exception as exc:
+                log.warning("could not fail run=%s during cleanup: %s", rid, exc)
         try:
             await asyncio.to_thread(events.release_delivery, delivery)
         except Exception as exc:

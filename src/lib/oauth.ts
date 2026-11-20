@@ -74,6 +74,7 @@ interface OAuthStoreState {
   vercelUser: string;
   vercelTeams: VercelTeam[];
   vercelTeamsFromSavedToken: boolean;
+  vercelTeamsTarget: { backend: string; api: string; draftToken: string | null; localSaved?: boolean } | null;
   lastOpenRouterCloudError: string;
   bump: () => void;
 }
@@ -86,9 +87,29 @@ export const useOAuth = create<OAuthStoreState>((set) => ({
   vercelUser: "",
   vercelTeams: [],
   vercelTeamsFromSavedToken: false,
+  vercelTeamsTarget: null,
   lastOpenRouterCloudError: "",
   bump: () => set((s) => ({ revision: s.revision + 1 })),
 }));
+
+// Team lists belong to the backend connection that loaded them.
+let vercelConnection = 0;
+export function invalidateVercelTeams() {
+  ++vercelConnection;
+  useOAuth.setState({ vercelTeams: [], vercelTeamsFromSavedToken: false, vercelTeamsTarget: null });
+}
+useApp.subscribe((state, previous) => {
+  if (state.backendUrl !== previous.backendUrl || state.secrets.api !== previous.secrets.api) {
+    invalidateVercelTeams();
+  }
+});
+
+function vercelTarget(draftToken: string | null = null) {
+  return { backend: backendUrl(), api: useApp.getState().secrets.api, draftToken, connection: vercelConnection };
+}
+function vercelTargetCurrent(target: ReturnType<typeof vercelTarget>) {
+  return target.backend === backendUrl() && target.api === useApp.getState().secrets.api && target.connection === vercelConnection;
+}
 
 let flowSeq = 0;
 let statusSeq = 0;
@@ -98,6 +119,9 @@ function startFlow(flow: Exclude<ActiveOAuthFlow, null>, flowMessage: string): n
   if (current) {
     toastErr("OAuth in progress", `Finish or cancel the active ${current} connection first.`);
     return null;
+  }
+  if (flow === "vercel" || flow === "vercel-cli") {
+    invalidateVercelTeams();
   }
   const id = ++flowSeq;
   useOAuth.setState({ activeFlow: flow, flowMessage });
@@ -144,6 +168,11 @@ function isLocalOrPrivateHostname(host: string): boolean {
     }
     const v4Mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
     if (v4Mapped && isNonPublicIpv4(v4Mapped[1])) return true;
+    const hexMapped = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMapped) {
+      const hi = parseInt(hexMapped[1], 16), lo = parseInt(hexMapped[2], 16);
+      if (isNonPublicIpv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`)) return true;
+    }
   }
   return false;
 }
@@ -157,7 +186,7 @@ export function validatePublicHttpsUrl(raw: string): string {
     if (parsed.protocol !== "https:") return "";
     if (parsed.username || parsed.password || parsed.search || parsed.hash) return "";
     if (isLocalOrPrivateHostname(parsed.hostname)) return "";
-    return candidate;
+    return parsed.href.replace(/\/+$/, "");
   } catch {
     return "";
   }
@@ -186,11 +215,11 @@ export async function ensureDefaultBackendAgent(): Promise<{ created: boolean; c
   const targetBase = backendUrl();
   const targetToken = useApp.getState().secrets.api;
   const existing = agentList(await apiGet("/agents", targetBase));
+  if (backendUrl() !== targetBase || useApp.getState().secrets.api !== targetToken) {
+    throw new Error("Backend connection changed while checking agents; please retry.");
+  }
   if (existing.length > 0) {
     return { created: false, count: existing.length };
-  }
-  if (backendUrl() !== targetBase) {
-    throw new Error("Backend URL changed while checking agents; please retry.");
   }
   try {
     await apiMut(
@@ -461,12 +490,16 @@ export async function importGitHubCli(saveToBackend = false): Promise<boolean> {
 }
 
 export async function fetchVercelTeams(token: string): Promise<VercelTeam[]> {
+  invalidateVercelTeams();
+  const target = vercelTarget(token.trim());
   const res = await tauriInvoke<{ user?: string; teams?: VercelTeam[] }>("vercel_fetch_teams", { token });
+  if (!vercelTargetCurrent(target)) throw new Error("Backend connection changed; reload teams.");
   const teams = Array.isArray(res.teams) ? res.teams : [];
   useOAuth.setState({
     vercelUser: String(res.user || ""),
     vercelTeams: teams,
     vercelTeamsFromSavedToken: false,
+    vercelTeamsTarget: target,
   });
   return teams;
 }
@@ -478,15 +511,25 @@ async function handleVercelResult(
     teams_error?: string | null;
     team_id?: string | null;
     cloud_saved?: boolean;
+    cloud_error?: string | null;
+    local_error?: string | null;
     env_path?: string | null;
   },
   label: string,
+  target: ReturnType<typeof vercelTarget>,
 ) {
+  if (!vercelTargetCurrent(target)) return false;
+  if (!res.cloud_saved || res.teams_error) {
+    useOAuth.setState({ vercelTeams: [], vercelTeamsFromSavedToken: false, vercelTeamsTarget: null });
+    toastErr(label, [res.cloud_error, res.local_error, res.teams_error, !res.cloud_saved ? "Token was not saved to the selected backend. Use manual connection or retry." : ""].filter(Boolean).join(" · "));
+    return false;
+  }
   const teams = Array.isArray(res.teams) ? res.teams : [];
   useOAuth.setState({
     vercelUser: String(res.user || ""),
     vercelTeams: teams,
     vercelTeamsFromSavedToken: true,
+    vercelTeamsTarget: { ...target, localSaved: !!res.env_path },
   });
   useOAuth.getState().bump();
   const detail = [
@@ -494,15 +537,19 @@ async function handleVercelResult(
     res.team_id ? `team ${res.team_id}` : teams.length > 1 ? `${teams.length} teams found` : "",
     res.teams_error ? `team lookup warning: ${res.teams_error}` : "",
     summarizePersistTarget(res),
+    res.cloud_error || "",
+    res.local_error || "",
   ]
     .filter(Boolean)
     .join(" · ");
   toastOk(label, detail);
+  return true;
 }
 
 export async function importVercelCli(): Promise<boolean> {
   const id = startFlow("vercel-cli", "Importing Vercel CLI login…");
   if (id === null) return false;
+  const target = vercelTarget();
   try {
     const res = await tauriInvoke<{
       user?: string;
@@ -510,14 +557,15 @@ export async function importVercelCli(): Promise<boolean> {
       teams_error?: string | null;
       team_id?: string | null;
       cloud_saved?: boolean;
+      cloud_error?: string | null;
+      local_error?: string | null;
       env_path?: string | null;
     }>("vercel_import_cli", {
-      settingsUrl: backendUrl() || null,
-      apiToken: useApp.getState().secrets.api || null,
+      settingsUrl: target.backend || null,
+      apiToken: target.api || null,
     });
     if (!isFlowCurrent(id)) return false;
-    await handleVercelResult(res, "Vercel CLI imported");
-    return true;
+    return await handleVercelResult(res, "Vercel CLI imported", target);
   } catch (e) {
     if (isFlowCurrent(id)) {
       toastErr("Vercel CLI import failed", errText(e, 240));
@@ -531,6 +579,7 @@ export async function importVercelCli(): Promise<boolean> {
 export async function connectVercelOAuth(): Promise<boolean> {
   const id = startFlow("vercel", "Browser opened — authorize Vercel integration…");
   if (id === null) return false;
+  const target = vercelTarget();
   try {
     const res = await tauriInvoke<{
       user?: string;
@@ -538,14 +587,15 @@ export async function connectVercelOAuth(): Promise<boolean> {
       teams_error?: string | null;
       team_id?: string | null;
       cloud_saved?: boolean;
+      cloud_error?: string | null;
+      local_error?: string | null;
       env_path?: string | null;
     }>("vercel_oauth_connect", {
-      settingsUrl: backendUrl() || null,
-      apiToken: useApp.getState().secrets.api || null,
+      settingsUrl: target.backend || null,
+      apiToken: target.api || null,
     });
     if (!isFlowCurrent(id)) return false;
-    await handleVercelResult(res, "Vercel connected");
-    return true;
+    return await handleVercelResult(res, "Vercel connected", target);
   } catch (e) {
     if (isFlowCurrent(id)) {
       const msg = errText(e, 260);
