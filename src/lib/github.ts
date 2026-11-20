@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { apiGet, apiMut, backendUrl } from "./api";
 import { agentList, refreshAgents } from "./actions";
 import { optionsProblem, useAutoReview, type WorkflowOptions } from "./autoreview";
+import { CLOUD_KEYS, saveCloudSettings } from "./cloud";
 import { lsGet, lsSet, useApp } from "./store";
 import { errText, jsonObj, openUrl, tauriInvoke } from "./tauri";
 import { toastErr, toastOk } from "./toast";
@@ -386,13 +387,41 @@ export async function checkStatus(filter: string) {
 
 /* ---------- configure batch (sequential; failures never abort the batch) ---------- */
 async function saveEnv(key: string, value: string): Promise<boolean> {
+  // Cloud backend first (what a deployed backend actually reads), then the local file.
+  let cloud = false;
+  if (CLOUD_KEYS.has(key)) {
+    try {
+      await saveCloudSettings({ [key]: value });
+      ghOut(`[env] ${key} saved to the cloud backend`);
+      cloud = true;
+    } catch (e) {
+      ghOut(`[env] ${key} cloud save failed: ${errText(e, 220)}`);
+    }
+  }
+  // A deployed backend only sees the cloud copy: a local-file-only save would let
+  // `configure` register webhooks the backend cannot verify. A backend run from
+  // this checkout reads the local file, so there that alone is enough.
+  const cloudRequired = CLOUD_KEYS.has(key) && !localBackend();
+  let local = false;
   try {
     const p = await tauriInvoke("save_backend_env_var", { key, value });
     ghOut(`[env] ${key} saved to ${p}`);
-    return true;
+    local = true;
   } catch (e) {
-    ghOut(`[env] ${key} save failed: ${errText(e, 220)}`);
-    toastErr("Env save failed", `${key}: ${errText(e, 180)}`);
+    ghOut(`[env] ${key} local save failed: ${errText(e, 220)}`);
+  }
+  const ok = cloudRequired ? cloud : cloud || local;
+  if (!ok) {
+    toastErr("Env save failed", `${key}: ${cloudRequired && local ? "not saved to the cloud backend" : "not saved"}`);
+  }
+  return ok;
+}
+
+/** True when the configured backend is this machine (its .env is what it reads). */
+function localBackend(): boolean {
+  try {
+    return /^(localhost|127\.0\.0\.1|\[::1\])$/i.test(new URL(backendUrl()).hostname);
+  } catch {
     return false;
   }
 }

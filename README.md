@@ -158,10 +158,40 @@ The webhook/backend modes and the OpenRabbit reviewer remain under Integrations 
 ## 1-click setup (Integrations tab)
 
 The desktop app's **Integrations** tab connects all seven providers without touching
-a terminal. Status dots show what is configured; **Test** hits a live check;
-**Connect** writes the token to `backend/.env` via the Tauri backend (git-ignored,
-never `localStorage`) — restart/redeploy the backend afterwards so it picks up
-the new values.
+a terminal. A **Setup status** card at the top shows what is still missing (backend
+reachable, token + encryption, Redis, review model, GitHub App, webhook, repos) with
+the fix next to each item. Status dots show what is configured; **Test** hits a live
+check; **Connect** saves the value to the **cloud backend** (see below), and also to
+the local `backend/.env` via the Tauri backend (git-ignored, never `localStorage`) for
+a backend run from this checkout.
+
+### Cloud settings (provider, model, keys saved to the FastAPI backend)
+
+Everything you configure in the app is saved to the *deployed* backend, not just to a
+file on your PC: `PUT /config/settings` stores it in the shared store (Redis) and
+applies it immediately, so there is no redeploy or restart.
+
+- **What can be saved:** `LLM_PROVIDER`, `LLM_MODEL`, the OpenRouter / Command Code /
+  OpenCode Go keys, `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `UPSTASH_BOX_API_KEY`,
+  `VERCEL_TOKEN` / `VERCEL_TEAM_ID`, and the GitHub App credentials. `REDIS_URL`,
+  `BACKEND_API_TOKEN` and `ALLOWED_ORIGINS` stay deploy-time env vars (the backend needs
+  them before it can read its own store).
+- **Where it comes from in the app:** Integrations → Connections (keys, *Backend LLM
+  provider & model*), Review → *Save config* (syncs the provider and model it writes to
+  `.pr_agent.toml`), the GitHub 1-click setup's "save webhook secret / token" options, and
+  Integrations → GitHub App (credentials go from the Rust side straight to the backend;
+  the private key never reaches the webview).
+- **Security:** secrets are Fernet-encrypted before they reach Redis, with a key derived
+  from `SETTINGS_ENCRYPTION_KEY` or, if unset, `BACKEND_API_TOKEN`. With neither set the
+  backend answers `409` and refuses to store secrets (non-secret provider/model changes
+  still work). Rotating that key makes stored secrets unreadable; the app shows which
+  ones, and you re-enter them. `GET /config/settings` returns provider/model and only
+  *whether* each secret is set, never a value.
+- **Precedence:** a value saved from the app wins over the process env var of the same
+  name; removing it falls back to the env var. Other workers pick changes up within
+  ~10 seconds.
+- **Persistence:** with no Redis the store is in-memory and cloud settings are lost on
+  restart. The Setup status card warns about this.
 
 | Provider | What to paste | Live check (`POST /config/test`) |
 |---|---|---|
@@ -206,6 +236,27 @@ With `BACKEND_API_TOKEN` set, agent CRUD, run history/approval, quota,
 `Authorization: Bearer <token>`. Only the SSE stream
 also accepts `?token=` because `EventSource` cannot set headers; other endpoints
 reject query-string credentials so they cannot leak through proxy logs.
+
+### GitHub App
+
+Integrations → **GitHub App** creates the App with one click (GitHub's manifest flow):
+the app opens GitHub in your browser, you confirm, and the credentials are stored on the
+cloud backend (and the local `backend/.env`). Then **Install on repositories**. The App
+needs a public https backend URL (the *Cloud app base URL* field); the button is disabled
+until it is set, because an App created without a webhook delivers nothing.
+
+Permissions: metadata R, contents R, pull requests RW, issues RW, checks RW, statuses RW.
+Events: `pull_request`, `pull_request_review`, `pull_request_review_comment`,
+`pull_request_review_thread`, `issue_comment`, `check_suite`, `check_run`, `status`, `push`
+(`installation*` events are always sent). Contents write is deliberately not requested yet:
+add it when the autofix push mode ships.
+
+**Check App** (`GET /github-app/health`) verifies this live: the credentials work, every
+permission and event above is granted, the webhook secret is set on the backend, the
+webhook URL is not a placeholder, and the App is installed somewhere. **Fix webhook URL**
+(`POST /github-app/webhook`) repoints the App's webhook at `<base URL>/webhooks/github`
+without opening GitHub's settings. If you use the Cloudflare worker, set the same
+`GITHUB_APP_WEBHOOK_SECRET` there.
 
 ### GitHub repo setup in one click
 
@@ -427,7 +478,8 @@ clients keep the stored v2 values.
 | `REDIS_URL` **or** `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | shared state (agents, runs, quota). `REDIS_URL` wins when both are set; FastAPI Cloud injects it from the Redis Cloud integration | unset = in-memory fallback |
 | `UPSTASH_BOX_API_KEY` | interactive (warm-box) runs | — |
 | `VERCEL_TOKEN` (or `VERCEL_API_TOKEN`), `VERCEL_TEAM_ID` | ephemeral sandbox runs | — |
-| `BACKEND_API_TOKEN` | Bearer auth on agent/run/quota/config-status + `/config/test` endpoints | empty = open (local dev only) |
+| `BACKEND_API_TOKEN` | Bearer auth on agent/run/quota/config + `/config/test` + `/config/settings` + `/github-app/*` endpoints. Also the default key for encrypting secrets saved from the app | empty = open (local dev only; secrets cannot be saved from the app) |
+| `SETTINGS_ENCRYPTION_KEY` | Optional separate secret for encrypting settings saved from the app (so rotating the API token does not orphan them) | falls back to `BACKEND_API_TOKEN` |
 | `ALLOWED_ORIGINS` | CORS allowlist, comma-separated. Desktop dev: `tauri://localhost,http://tauri.localhost,http://localhost:1420`. Browsers need their origin listed. Most app calls go through the Rust proxy, but the live SSE stream opens directly from the webview and needs its origin here | `[]` (no cross-origin; set `*` only for local dev) |
 | `DECIDER_ENABLED` / `DECIDER_DEFER_GRACE_S` | calibrated decision layer on/off; seconds to wait for the desktop daemon before the cloud decides | `1` / `120` |
 | `REVIEW_DIFF_MAX_CHARS` | diff budget for backend `review_only` reviews. Large files share it fairly; lockfiles/binaries are dropped; a new push updates the previous review comment instead of adding another | `60000` |

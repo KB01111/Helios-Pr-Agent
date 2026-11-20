@@ -25,3 +25,8 @@ def _in_memory_store(monkeypatch):
     import github_app
 
     github_app.clear_token_cache()
+    import runtime_settings
+
+    runtime_settings.reset_for_tests()
+    yield
+    runtime_settings.reset_for_tests()

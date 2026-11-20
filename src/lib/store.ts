@@ -320,6 +320,12 @@ export const LLM_PROVIDERS: Record<LlmProviderId, LlmProvider> = {
   },
 };
 
+/** OpenRouter models + "custom": the generated GitHub Actions workflow only runs on OpenRouter. */
+export const KNOWN_MODELS: { value: string; label: string }[] = [
+  ...LLM_PROVIDERS.openrouter.models,
+  { value: "custom", label: "custom…" },
+];
+
 export function toProviderId(id: string): LlmProviderId {
   return Object.prototype.hasOwnProperty.call(LLM_PROVIDERS, id) ? (id as LlmProviderId) : "openrouter";
 }

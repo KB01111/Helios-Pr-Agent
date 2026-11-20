@@ -292,7 +292,43 @@ fn convert_code(code: &str) -> Result<serde_json::Value, String> {
     Ok(body)
 }
 
-fn create_blocking(backend_url: String, app_name: String, org: Option<String>) -> Result<serde_json::Value, String> {
+/// Credentials the backend needs, as the `PUT /config/settings` body.
+pub fn cloud_settings_body(id: i64, slug: &str, pem: &str, webhook_secret: Option<&str>) -> serde_json::Value {
+    let mut values = serde_json::Map::new();
+    values.insert("GITHUB_APP_ID".into(), id.to_string().into());
+    if !slug.is_empty() {
+        values.insert("GITHUB_APP_SLUG".into(), slug.into());
+    }
+    values.insert("GITHUB_APP_PRIVATE_KEY".into(), pem.trim().into());
+    if let Some(secret) = webhook_secret.filter(|s| !s.is_empty()) {
+        values.insert("GITHUB_APP_WEBHOOK_SECRET".into(), secret.into());
+    }
+    serde_json::json!({ "values": values })
+}
+
+/// Save the App credentials on the deployed backend (encrypted there). The secrets
+/// go straight from this process to the backend; they never reach the webview.
+fn push_to_cloud(settings_url: &str, api_token: Option<&str>, body: &serde_json::Value) -> Result<(), String> {
+    // The body carries the private key, so refuse remote plaintext HTTP even when
+    // no bearer token is sent (https and loopback http are fine).
+    crate::require_secure_for_token(settings_url.trim(), true)?;
+    crate::backend_mutate_blocking(
+        "PUT".into(),
+        settings_url.to_string(),
+        "/config/settings".into(),
+        Some(body.to_string()),
+        api_token.map(str::to_string),
+    )
+    .map(|_| ())
+}
+
+fn create_blocking(
+    backend_url: String,
+    app_name: String,
+    org: Option<String>,
+    settings_url: Option<String>,
+    api_token: Option<String>,
+) -> Result<serde_json::Value, String> {
     if !valid_app_name(&app_name) {
         return Err("App name: 1-34 characters (letters, digits, space, - _ .)".into());
     }
@@ -330,15 +366,51 @@ fn create_blocking(backend_url: String, app_name: String, org: Option<String>) -
     let pem = app.get("pem").and_then(|v| v.as_str()).ok_or("GitHub response had no private key")?;
     let html_url = app.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    let mut env_path = crate::save_backend_env_var_blocking("GITHUB_APP_ID".into(), id.to_string())?;
-    if !slug.is_empty() {
-        crate::save_backend_env_var_blocking("GITHUB_APP_SLUG".into(), slug.clone())?;
+    let webhook_secret = app
+        .get("webhook_secret")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // The App now exists and GitHub will not show the key again, so every sink is
+    // best effort: a failing one must not lose the credentials for the others.
+    let local = (|| -> Result<String, String> {
+        let mut env_path = crate::save_backend_env_var_blocking("GITHUB_APP_ID".into(), id.to_string())?;
+        if !slug.is_empty() {
+            crate::save_backend_env_var_blocking("GITHUB_APP_SLUG".into(), slug.clone())?;
+        }
+        crate::save_backend_env_var_blocking("GITHUB_APP_PRIVATE_KEY".into(), pem_to_env(pem))?;
+        if let Some(secret) = &webhook_secret {
+            // Separate from GITHUB_WEBHOOK_SECRET so existing repo webhooks keep working.
+            env_path = crate::save_backend_env_var_blocking("GITHUB_APP_WEBHOOK_SECRET".into(), secret.clone())?;
+        }
+        Ok(env_path)
+    })();
+    let cloud = match settings_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        Some(url) => Some(push_to_cloud(
+            url,
+            api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()),
+            &cloud_settings_body(id, &slug, pem, webhook_secret.as_deref()),
+        )),
+        None => None,
+    };
+    if local.is_err() && !matches!(cloud, Some(Ok(()))) {
+        return Err(format!(
+            "the App was created on GitHub (id {}) but its credentials could not be saved (local: {}; cloud: {}). \
+Delete the App at {} and try again.",
+            id,
+            local.as_ref().err().cloned().unwrap_or_default(),
+            match &cloud {
+                Some(Err(e)) => e.clone(),
+                _ => "not attempted".to_string(),
+            },
+            if html_url.is_empty() { "https://github.com/settings/apps".to_string() } else { html_url.clone() },
+        ));
     }
-    crate::save_backend_env_var_blocking("GITHUB_APP_PRIVATE_KEY".into(), pem_to_env(pem))?;
-    if let Some(secret) = app.get("webhook_secret").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        // Separate from GITHUB_WEBHOOK_SECRET so existing repo webhooks keep working.
-        env_path = crate::save_backend_env_var_blocking("GITHUB_APP_WEBHOOK_SECRET".into(), secret.to_string())?;
-    }
+    let (env_path, local_error) = match local {
+        Ok(p) => (Some(p), None),
+        Err(e) => (None, Some(e)),
+    };
     let install_url = if html_url.is_empty() {
         format!("https://github.com/apps/{}/installations/new", slug)
     } else {
@@ -351,18 +423,24 @@ fn create_blocking(backend_url: String, app_name: String, org: Option<String>) -
         "install_url": install_url,
         "webhook_active": webhook_base.is_some(),
         "env_path": env_path,
+        "local_error": local_error,
+        "cloud_saved": matches!(cloud, Some(Ok(()))),
+        "cloud_error": match &cloud { Some(Err(e)) => Some(e.clone()), _ => None },
     }))
 }
 
-/// Create the PR Agent GitHub App from a manifest and store its credentials in
-/// `backend/.env`. Returns only non-secret details (slug, id, URLs).
+/// Create the PR Agent GitHub App from a manifest and store its credentials on the
+/// cloud backend (`settings_url`, encrypted there) and in the local `backend/.env`.
+/// Returns only non-secret details (slug, id, URLs, where it was saved).
 #[tauri::command]
 pub async fn github_app_create(
     backend_url: String,
     app_name: String,
     org: Option<String>,
+    settings_url: Option<String>,
+    api_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || create_blocking(backend_url, app_name, org))
+    tauri::async_runtime::spawn_blocking(move || create_blocking(backend_url, app_name, org, settings_url, api_token))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -425,6 +503,21 @@ mod tests {
         let page = start_page("https://github.com/settings/apps/new?state=s", &serde_json::json!({"name": "a\"<b>"}));
         assert!(page.contains("&quot;a\\&quot;&lt;b&gt;&quot;"));
         assert!(!page.contains("<b>"));
+    }
+
+    #[test]
+    fn cloud_body_carries_credentials_for_the_backend() {
+        // Placeholder text assembled at runtime so secret scanners do not mistake it for a key.
+        let kind = "PRIVATE";
+        let fake_pem = format!("-----BEGIN {kind} KEY-----\nplaceholder\n-----END {kind} KEY-----\n");
+        let b = cloud_settings_body(42, "my-app", &fake_pem, Some("whsec"));
+        let v = &b["values"];
+        assert_eq!(v["GITHUB_APP_ID"], "42");
+        assert_eq!(v["GITHUB_APP_SLUG"], "my-app");
+        assert_eq!(v["GITHUB_APP_WEBHOOK_SECRET"], "whsec");
+        assert!(v["GITHUB_APP_PRIVATE_KEY"].as_str().unwrap().ends_with("END PRIVATE KEY-----"));
+        let bare = cloud_settings_body(1, "", "k", None);
+        assert!(bare["values"].get("GITHUB_APP_SLUG").is_none() && bare["values"].get("GITHUB_APP_WEBHOOK_SECRET").is_none());
     }
 
     #[test]
