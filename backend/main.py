@@ -58,6 +58,13 @@ except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo r
     from backend import decision_flow as decision_flow  # type: ignore[no-redef]
 
 try:
+    import events  # GitHub event router (non-review events, activity log)
+    import github_app
+except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+    from backend import events as events  # type: ignore[no-redef]
+    from backend import github_app as github_app  # type: ignore[no-redef]
+
+try:
     from sandboxes.providers_review import LLM_PROVIDERS, llm_key_for, resolve_llm_provider
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
     from backend.sandboxes.providers_review import (  # type: ignore[no-redef]
@@ -185,6 +192,28 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 # ---------------------------------------------------------------------------
 
 
+class PathInstruction(BaseModel):
+    path: str = Field(min_length=1, max_length=200, description="Glob, e.g. src/**/*.ts")
+    instructions: str = Field(min_length=1, max_length=2000)
+
+
+_TOOL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+
+# Agent settings added for the review engine, repo memory and merge readiness.
+# Agents stored before they existed read back with these defaults.
+AGENT_V2_DEFAULTS: dict[str, Any] = {
+    "schema_version": 2,
+    "profile": "chill",
+    "memory_enabled": True,
+    "merge_gate": "advisory",
+    "score_threshold": 85,
+    "path_instructions": [],
+    "tools": [],
+    "chat_enabled": True,
+    "autofix": "suggest",
+}
+
+
 class AgentConfig(BaseModel):
     id: str = Field(default="", description="Unique id; auto-generated if empty")
     name: str = Field(default="Untitled agent")
@@ -193,12 +222,41 @@ class AgentConfig(BaseModel):
     trigger: Literal["on_commit", "on_label", "manual"] = "on_commit"
     trigger_label: str | None = None
     runtime_mode: Literal["review_only", "interactive", "ephemeral"] = "review_only"
+    # --- v2: review engine / memory / merge readiness ---
+    schema_version: int = 2
+    profile: Literal["chill", "assertive"] = Field(
+        default="chill", description="chill = fewer, higher-confidence comments")
+    memory_enabled: bool = Field(default=True, description="Use and grow repo-specific memory")
+    merge_gate: Literal["off", "advisory", "required"] = Field(
+        default="advisory", description="advisory = neutral check; required = fails below threshold")
+    score_threshold: int = Field(default=85, ge=0, le=100)
+    path_instructions: list[PathInstruction] = Field(default_factory=list, max_length=50)
+    tools: list[str] = Field(default_factory=list, max_length=20, description="Linters/scanners to run")
+    chat_enabled: bool = True
+    autofix: Literal["off", "suggest", "stacked", "push"] = Field(
+        default="suggest", description="suggest = suggestion blocks only; stacked = fix PR; push = commit to the PR branch")
 
     @model_validator(mode="after")
     def _require_trigger_label(self):
         if self.trigger == "on_label" and not (self.trigger_label or "").strip():
             raise ValueError("trigger_label is required when trigger is on_label")
         return self
+
+    @model_validator(mode="after")
+    def _valid_tools(self):
+        bad = [t for t in self.tools if not _TOOL_RE.fullmatch(t)]
+        if bad:
+            raise ValueError("tools must be lowercase names (a-z, 0-9, '-', '_')")
+        return self
+
+
+def _agent_v2(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Fill v2 settings missing from agents stored by older versions."""
+    out = dict(cfg)
+    for key, default in AGENT_V2_DEFAULTS.items():
+        if key not in out:
+            out[key] = list(default) if isinstance(default, list) else default
+    return out
 
 
 class PRContext(BaseModel):
@@ -238,16 +296,27 @@ def _new_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
+def _webhook_secrets() -> list[str]:
+    """Repo webhooks sign with GITHUB_WEBHOOK_SECRET; a GitHub App has its own
+    secret (GITHUB_APP_WEBHOOK_SECRET). Both are accepted so adding the App never
+    breaks repos that still use a plain webhook."""
+    app_secret = (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip()
+    return [s for s in (_get_webhook_secret(), app_secret) if s]
+
+
 def _verify_signature(raw: bytes, signature: str | None) -> bool:
     """Verify X-Hub-Signature-256. Dev mode (no secret) accepts with warning."""
-    secret = _get_webhook_secret()
-    if not secret:
+    secrets = _webhook_secrets()
+    if not secrets:
         log.warning("webhook: no GITHUB_WEBHOOK_SECRET set — accepting unsigned (dev mode)")
         return True
     if not signature:
         return False
-    mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    return _constant_time_equal(f"sha256={mac}", signature)
+    ok = False
+    for secret in secrets:  # check every secret: no early exit on a match
+        mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+        ok = _constant_time_equal(f"sha256={mac}", signature) or ok
+    return ok
 
 
 def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | None) -> bool:
@@ -514,15 +583,36 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="invalid payload")
 
-    sender = payload.get("sender")
-    if isinstance(sender, dict) and sender.get("type") == "Bot":
-        return JSONResponse({"skipped": "bot"}, status_code=202)
+    event = (request.headers.get("X-GitHub-Event") or "").strip()
+    delivery = (request.headers.get("X-GitHub-Delivery") or "").strip()
+    if event == "ping":
+        return JSONResponse({"pong": True}, status_code=202)
+    if event and event != "pull_request":
+        # Reviews, threads, comments, CI results, pushes, App installs: recorded
+        # by the event router (activity log, readiness marker, installations).
+        return JSONResponse(await events.route(event, payload, delivery), status_code=202)
 
     pr = payload.get("pull_request")
     raw_action = payload.get("action", "")
     action = raw_action if isinstance(raw_action, str) else ""
+    activity: dict[str, Any] = {}
+    if isinstance(pr, dict) and pr:
+        # Every PR action (closed, ready_for_review, ...) feeds the activity log,
+        # including bot-authored PRs; failures never block the review path.
+        try:
+            activity = await events.route("pull_request", payload, delivery)
+        except Exception as exc:
+            log.warning("webhook: activity recording failed (%s)", type(exc).__name__)
+
+    sender = payload.get("sender")
+    if isinstance(sender, dict) and sender.get("type") == "Bot":
+        return JSONResponse({"skipped": "bot"}, status_code=202)
+
     if not isinstance(pr, dict) or not pr or action not in VALID_PR_ACTIONS:
-        return JSONResponse({"skipped": action or "no-pull_request"}, status_code=202)
+        body: dict[str, Any] = {"skipped": action or "no-pull_request"}
+        if activity.get("recorded"):
+            body["recorded"] = activity["recorded"]
+        return JSONResponse(body, status_code=202)
 
     repository = payload.get("repository")
     repo = (repository.get("full_name") if isinstance(repository, dict) else "") or ""
@@ -717,7 +807,7 @@ def list_agents(request: Request) -> list[dict[str, Any]]:
     _require_auth(request)
     keys = store.rkeys("agent:*")
     configs = store.rget_json_many(keys)
-    out = [cfg for cfg in configs if isinstance(cfg, dict)]
+    out = [_agent_v2(cfg) for cfg in configs if isinstance(cfg, dict)]
     out.sort(key=lambda a: str(a.get("id")))
     return out
 
@@ -728,15 +818,21 @@ def get_agent(agent_id: str, request: Request) -> dict[str, Any]:
     cfg = store.rget_json(f"agent:{agent_id}")
     if not isinstance(cfg, dict):
         raise HTTPException(status_code=404, detail="agent not found")
-    return cfg
+    return _agent_v2(cfg)
 
 
 @app.put("/agents/{agent_id}")
 def update_agent(agent_id: str, agent: AgentConfig, request: Request) -> dict[str, Any]:
     _require_auth(request)
-    if not isinstance(store.rget_json(f"agent:{agent_id}"), dict):
+    existing = store.rget_json(f"agent:{agent_id}")
+    if not isinstance(existing, dict):
         raise HTTPException(status_code=404, detail="agent not found")
     data = agent.model_dump()
+    # Clients that predate the v2 settings send only the v1 fields: keep the
+    # stored v2 values instead of silently resetting them to defaults.
+    for key in AGENT_V2_DEFAULTS:
+        if key not in agent.model_fields_set and key in existing:
+            data[key] = existing[key]
     data["id"] = agent_id  # URL id wins
     store.rset_json(f"agent:{agent_id}", data)
     return data
@@ -792,6 +888,33 @@ def approve_run(run_id: str, request: Request, body: ApproveBody = Body(default_
 
 
 # ---------------------------------------------------------------------------
+# PR activity (recorded by the event router; input to merge readiness)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/repos/{owner}/{name}/pulls/{pr_number}/activity")
+def pr_activity(
+    owner: str,
+    name: str,
+    pr_number: int,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = f"{owner}/{name}"
+    if not _REPO_RE.fullmatch(repo) or owner in (".", "..") or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid repository name")
+    if pr_number <= 0:
+        raise HTTPException(status_code=400, detail="invalid pr_number")
+    return {
+        "repo": repo,
+        "pr_number": pr_number,
+        "readiness_stale": events.is_dirty(repo, pr_number),
+        "activity": events.pr_activity(repo, pr_number, limit),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 1-click configuration: status + connectivity tests (never leaks secrets)
 # ---------------------------------------------------------------------------
 
@@ -815,6 +938,11 @@ def config_status(request: Request) -> dict[str, Any]:
         "github": {
             "webhook_secret_set": _configured(_get_webhook_secret()),
             "token_set": _configured(os.getenv("GITHUB_TOKEN", "")),
+            "app_configured": github_app.app_configured(),
+            "app_webhook_secret_set": _configured(os.getenv("GITHUB_APP_WEBHOOK_SECRET", "")),
+            "app_slug": github_app.app_slug() or None,
+            "auth_mode": github_app.auth_mode(),
+            "events": events.handled_events(),
         },
         "redis": {
             "configured": store.redis_configured(),
@@ -844,7 +972,46 @@ def config_status(request: Request) -> dict[str, Any]:
     }
 
 
+async def _test_github_app() -> dict[str, Any]:
+    """Live check of the GitHub App credentials (``GET /app`` with the App JWT)."""
+    import httpx
+
+    if not github_app.app_configured():
+        return {"configured": False, "ok": None, "details": "GITHUB_APP_ID / private key not set"}
+    try:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {github_app.app_jwt()}",
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get("https://api.github.com/app", headers=headers)
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            return {
+                "configured": True, "ok": True, "slug": data.get("slug"),
+                "installations": data.get("installations_count"),
+                "details": f"App '{data.get('slug', '?')}' authenticated",
+            }
+        return {"configured": True, "ok": False, "details": f"App JWT rejected (HTTP {resp.status_code})"}
+    except github_app.GitHubAppError as exc:
+        return {"configured": True, "ok": False, "details": str(exc)}
+    except Exception as exc:
+        return {"configured": True, "ok": False, "details": f"GitHub API unreachable ({type(exc).__name__})"}
+
+
 async def _test_github() -> dict[str, Any]:
+    result = await _test_github_pat()
+    app_check = await _test_github_app()
+    result["app"] = app_check
+    if app_check.get("configured"):
+        # A working App is enough for backend reviews even without a PAT.
+        result["ok"] = bool(result.get("ok") or app_check.get("ok"))
+        result["configured"] = True
+        result["details"] = f"{result['details']}; {app_check['details']}"
+    return result
+
+
+async def _test_github_pat() -> dict[str, Any]:
     import httpx
 
     secret_set = _configured(_get_webhook_secret())

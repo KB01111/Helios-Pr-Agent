@@ -396,12 +396,29 @@ declared in `pyproject.toml` and `backend/requirements.txt`.
 
 Health: `GET /health` · status: `GET /config/status` (auth when a token is set) · docs: `/docs`.
 
+### GitHub events and PR activity
+
+`/webhooks/github` routes on `X-GitHub-Event`. `pull_request` opened/reopened/synchronize/labeled
+still drive reviews exactly as before. Every other PR action plus `pull_request_review`,
+`pull_request_review_comment`, `pull_request_review_thread`, `issue_comment` (on PRs),
+`check_suite`/`check_run` (completed), `status`, default-branch `push`, and App
+`installation*` events are recorded by `backend/events.py` into a capped per-PR activity log
+(redeliveries are deduped by `X-GitHub-Delivery`). That log is the input for the upcoming
+merge-readiness score: `GET /repos/{owner}/{name}/pulls/{n}/activity` returns it with a
+`readiness_stale` flag. Bot comments are ignored; CI results from bots are not. A push to the
+default branch that touches `.pragent.yaml` drops the cached repo config. Agents gained v2
+settings (`profile`, `memory_enabled`, `merge_gate`, `score_threshold`, `path_instructions`,
+`tools`, `chat_enabled`, `autofix`); older agents read back with defaults, and PUTs from older
+clients keep the stored v2 values.
+
 ### Env vars
 
 | Var | Required for | Default |
 |---|---|---|
 | `GITHUB_WEBHOOK_SECRET` | verifying `X-Hub-Signature-256` on `/webhooks/github` | empty = dev mode (accepts unsigned, logs warning) |
-| `GITHUB_TOKEN` | fetching diffs + posting review comments | — |
+| `GITHUB_TOKEN` | fetching diffs + posting review comments (fallback when no GitHub App is set or installed) | — |
+| `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (or `GITHUB_APP_PRIVATE_KEY_PATH`), `GITHUB_APP_SLUG` | GitHub App mode: per-repo installation tokens, bot identity, Check Runs. Created by Integrations → **GitHub App** | unset = PAT mode |
+| `GITHUB_APP_WEBHOOK_SECRET` | the App's webhook secret, accepted alongside `GITHUB_WEBHOOK_SECRET` (also set it on the Cloudflare worker) | — |
 | `LLM_PROVIDER` | selects the review LLM: `openrouter`, `commandcode`, or `opencode_go` | `openrouter` |
 | `LLM_MODEL` | override the selected provider's model | blank = provider default (`thinkingmachines/inkling-2-small:free`, `openai/deepseek/deepseek-v4-flash`, or `openai/kimi-k3`) |
 | `OPENROUTER_API_KEY` | OpenRouter reviews | — |

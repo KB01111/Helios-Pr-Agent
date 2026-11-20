@@ -87,15 +87,40 @@ test("verifySignature is false for malformed headers", async () => {
   assert.equal(await verifySignature(SECRET, raw, await sign("x")), true);
 });
 
-test("ping, non-PR events, ignored actions and bots are acknowledged without forwarding", async () => {
+test("ping, unknown events, uninteresting actions and bot comments are acknowledged without forwarding", async () => {
   const f = stubFetch(() => new Response("{}", { status: 202 }));
   try {
     assert.equal((await post("{}", { event: "ping" })).status, 200);
-    assert.equal((await post("{}", { event: "push" })).status, 202);
-    assert.deepEqual(await (await post(prBody({ action: "closed" }))).json(), { skipped: "closed" });
-    assert.deepEqual(await (await post(prBody({ sender: { type: "Bot" } }))).json(), { skipped: "bot" });
+    assert.deepEqual(await (await post("{}", { event: "star" })).json(), { skipped: "star" });
+    const push = JSON.stringify({ ref: "refs/heads/feat", repository: { full_name: "o/r", default_branch: "main" } });
+    assert.deepEqual(await (await post(push, { event: "push" })).json(), { skipped: "not-default-branch" });
+    const issue = JSON.stringify({ action: "created", issue: { number: 3 }, sender: { type: "User" } });
+    assert.deepEqual(await (await post(issue, { event: "issue_comment" })).json(), { skipped: "not-a-pull-request" });
+    const botComment = JSON.stringify({ action: "created", issue: { number: 3, pull_request: {} }, sender: { type: "Bot" } });
+    assert.deepEqual(await (await post(botComment, { event: "issue_comment" })).json(), { skipped: "bot" });
+    const suite = JSON.stringify({ action: "requested", check_suite: {}, repository: { full_name: "o/r" } });
+    assert.deepEqual(await (await post(suite, { event: "check_suite" })).json(), { skipped: "requested" });
     assert.equal((await post("not json")).status, 400);
     assert.equal(f.calls.length, 0);
+  } finally {
+    f.restore();
+  }
+});
+
+test("activity events (closed PRs, bot PRs, reviews, CI, default-branch pushes) are forwarded", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    assert.equal((await post(prBody({ action: "closed" }), { delivery: "c1" })).status, 202);
+    assert.equal((await post(prBody({ sender: { type: "Bot" } }), { delivery: "c2" })).status, 202);
+    const review = JSON.stringify({ action: "submitted", pull_request: { number: 7 }, sender: { type: "User" } });
+    assert.equal((await post(review, { event: "pull_request_review", delivery: "c3" })).status, 202);
+    const suite = JSON.stringify({ action: "completed", check_suite: { pull_requests: [] }, sender: { type: "Bot" } });
+    assert.equal((await post(suite, { event: "check_suite", delivery: "c4" })).status, 202);
+    const push = JSON.stringify({ ref: "refs/heads/main", repository: { full_name: "o/r", default_branch: "main" } });
+    assert.equal((await post(push, { event: "push", delivery: "c5" })).status, 202);
+    assert.deepEqual(f.calls.map((c) => c.init.headers["x-github-event"]), [
+      "pull_request", "pull_request", "pull_request_review", "check_suite", "push",
+    ]);
   } finally {
     f.restore();
   }
@@ -305,6 +330,20 @@ test("a small backlog costs exactly one list() call per replay", async () => {
   try {
     await replayParked({ ...baseEnv, PENDING: kv }, 1);
     assert.equal(kv.lists, 1);
+  } finally {
+    f.restore();
+  }
+});
+
+test("deliveries signed with the GitHub App secret are accepted when configured", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    const body = prBody();
+    const appSigned = await sign(body, "app-secret");
+    assert.equal((await post(body, { signature: appSigned })).status, 401);
+    const env = { ...baseEnv, GITHUB_APP_WEBHOOK_SECRET: "app-secret" };
+    assert.equal((await post(body, { signature: appSigned, env })).status, 202);
+    assert.equal((await post(body, { env })).status, 202); // repo secret still works
   } finally {
     f.restore();
   }

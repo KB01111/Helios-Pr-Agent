@@ -20,10 +20,29 @@
 // Config (wrangler.toml / `wrangler secret put`):
 //   BACKEND_URL             https://… base URL of the FastAPI backend   (var)
 //   GITHUB_WEBHOOK_SECRET   same secret as the repo webhook             (secret)
+//   GITHUB_APP_WEBHOOK_SECRET  the GitHub App's webhook secret          (secret, optional)
 //   BACKEND_API_TOKEN       Bearer token if the backend sets one        (secret, optional)
 //   PENDING                 KV binding for parked deliveries            (optional)
 
-const PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "labeled"]);
+// Events the backend acts on. pull_request commit actions drive reviews; the rest feed
+// the per-PR activity log (reviews, threads, CI results) used for merge readiness, the
+// GitHub App installation cache and config invalidation. Anything else is acked here.
+const FORWARDED_EVENTS = new Set([
+  "pull_request",
+  "issue_comment",
+  "pull_request_review",
+  "pull_request_review_comment",
+  "pull_request_review_thread",
+  "check_suite",
+  "check_run",
+  "status",
+  "push",
+  "installation",
+  "installation_repositories",
+]);
+// Conversational events from bots are dropped (no reply loops); CI results are not,
+// because check suites and statuses are usually reported by bots.
+const BOT_SKIPPED_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]);
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 // GitHub gives up on a webhook after 10 s, so the single inline attempt must finish well inside that.
 const FORWARD_TIMEOUT_MS = 7000;
@@ -148,6 +167,28 @@ async function readBounded(request, max) {
   return out;
 }
 
+/** Why an allow-listed event is not worth forwarding, or null to forward it. */
+export function skipReason(event, payload) {
+  if (!payload || typeof payload !== "object") return "no-payload";
+  const action = typeof payload.action === "string" ? payload.action : "";
+  if (BOT_SKIPPED_EVENTS.has(event) && payload.sender && payload.sender.type === "Bot") return "bot";
+  switch (event) {
+    case "pull_request":
+      return payload.pull_request && typeof payload.pull_request === "object" ? null : "no-pull_request";
+    case "issue_comment":
+      return payload.issue && payload.issue.pull_request ? null : "not-a-pull-request";
+    case "check_suite":
+    case "check_run":
+      return action === "completed" ? null : action || "no-action";
+    case "push": {
+      const branch = payload.repository && payload.repository.default_branch;
+      return branch && payload.ref === `refs/heads/${branch}` ? null : "not-default-branch";
+    }
+    default:
+      return null;
+  }
+}
+
 export async function handleWebhook(request, env, _ctx) {
   if (!env.GITHUB_WEBHOOK_SECRET || !backendBase(env)) {
     return json({ error: "worker not configured" }, 500);
@@ -158,12 +199,17 @@ export async function handleWebhook(request, env, _ctx) {
   if (raw === null) return json({ error: "payload too large" }, 413);
 
   const signature = request.headers.get("x-hub-signature-256") || "";
-  if (!(await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, signature))) {
+  // A GitHub App signs with its own secret; repo webhooks with GITHUB_WEBHOOK_SECRET.
+  const repoOk = await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, signature);
+  const appOk = env.GITHUB_APP_WEBHOOK_SECRET
+    ? await verifySignature(env.GITHUB_APP_WEBHOOK_SECRET, raw, signature)
+    : false;
+  if (!repoOk && !appOk) {
     return json({ error: "bad signature" }, 401);
   }
   const event = request.headers.get("x-github-event") || "";
   if (event === "ping") return json({ pong: true });
-  if (event !== "pull_request") return json({ skipped: event || "no-event" }, 202);
+  if (!FORWARDED_EVENTS.has(event)) return json({ skipped: event || "no-event" }, 202);
 
   let payload;
   try {
@@ -171,10 +217,8 @@ export async function handleWebhook(request, env, _ctx) {
   } catch {
     return json({ error: "invalid JSON" }, 400);
   }
-  const pr = payload && payload.pull_request;
-  const action = payload && payload.action;
-  if (!pr || typeof pr !== "object" || !PR_ACTIONS.has(action)) return json({ skipped: action || "no-pull_request" }, 202);
-  if (payload.sender && payload.sender.type === "Bot") return json({ skipped: "bot" }, 202);
+  const skip = skipReason(event, payload);
+  if (skip) return json({ skipped: skip }, 202);
 
   const delivery = request.headers.get("x-github-delivery") || crypto.randomUUID();
   const item = { body: new TextDecoder().decode(raw), event, delivery, signature };

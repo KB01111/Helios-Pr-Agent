@@ -18,3 +18,9 @@ def _in_memory_store(monkeypatch):
     monkeypatch.setattr(store, "_REST_TOKEN", "")
     monkeypatch.setattr(store, "_REDIS_CONFIGURED", False)
     store._MEM.clear()
+    # Nor a real GitHub App configured on the developer's machine.
+    for name in ("GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_APP_PRIVATE_KEY_PATH", "GITHUB_APP_SLUG"):
+        monkeypatch.delenv(name, raising=False)
+    import github_app
+
+    github_app.clear_token_cache()

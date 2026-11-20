@@ -14,6 +14,11 @@ import httpx
 
 from .safety import safe_label, safe_repo
 
+try:  # cwd=backend
+    import github_app
+except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+    from backend import github_app  # type: ignore[no-redef]
+
 log = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
@@ -182,7 +187,6 @@ class ReviewOnlyProvider:
         system_prompt = agent_config.get("system_prompt", "You are a code reviewer.")
         title = pr_context.get("title", "")
 
-        github_token = os.environ.get("GITHUB_TOKEN")
         llm_provider = resolve_llm_provider(os.environ.get("LLM_PROVIDER"))
         llm_key, llm_key_env = llm_key_for(llm_provider)
         configured_model = os.environ.get("LLM_MODEL", "").strip()
@@ -193,8 +197,8 @@ class ReviewOnlyProvider:
             configured_model = LLM_PROVIDERS[llm_provider]["default_model"]
         llm_model = configured_model
 
-        if not github_token:
-            logs.append("review_only: GITHUB_TOKEN missing — cannot fetch diff.")
+        if github_app.auth_mode() == "none":
+            logs.append("review_only: GITHUB_TOKEN (or a GitHub App) missing — cannot fetch diff.")
             return _result(logs, "", "failed", False, agent_name)
         if not llm_key:
             logs.append(f"review_only: {llm_key_env} missing — cannot call LLM.")
@@ -210,6 +214,11 @@ class ReviewOnlyProvider:
         except (ValueError, TypeError):
             logs.append("review_only: pr_context has an invalid repo/pr_number.")
             return _result(logs, "", "failed", False, agent_name)
+        github_token, auth_kind = await github_app.token_for_repo(repo)
+        if not github_token:
+            logs.append("review_only: no GitHub credentials for this repo — cannot fetch diff.")
+            return _result(logs, "", "failed", False, agent_name)
+        logs.append(f"review_only: GitHub auth via {auth_kind}.")
 
         # 1. Fetch diff
         diff = ""

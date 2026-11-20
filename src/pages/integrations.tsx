@@ -22,7 +22,7 @@ import {
   type WorkflowProvider,
 } from "@/lib/github";
 import { LLM_PROVIDERS, useApp, type LlmProviderId } from "@/lib/store";
-import { errText, tauriInvoke } from "@/lib/tauri";
+import { errText, openUrl, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -899,6 +899,93 @@ function WebhookCard() {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* GitHub App (bot identity, Check Runs, all PR events)                */
+/* ------------------------------------------------------------------ */
+
+type CreatedApp = {
+  app_id: number;
+  slug: string;
+  html_url: string;
+  install_url: string;
+  webhook_active: boolean;
+  env_path: string;
+};
+
+function GithubAppCard() {
+  const cloudBase = useApp((s) => s.cloudBase);
+  const [appName, setAppName] = React.useState("PR Agent Control");
+  const [org, setOrg] = React.useState("");
+  const [created, setCreated] = React.useState<CreatedApp | null>(null);
+  const base = cloudBase.trim().replace(/\/+$/, "");
+
+  const create = async () => {
+    try {
+      const res = await tauriInvoke<CreatedApp>("github_app_create", {
+        backendUrl: base,
+        appName: appName.trim(),
+        org: org.trim() || null,
+      });
+      setCreated(res);
+      toastOk("GitHub App created", `${res.slug} · credentials saved to backend/.env`);
+    } catch (e) {
+      toastErr("GitHub App", errText(e, 300));
+    }
+  };
+
+  return (
+    <Section
+      title="GitHub App (recommended)"
+      description={
+        <>
+          Gives the agent its own bot identity, lets it post the merge-readiness Check Run, and delivers every PR
+          event (reviews, resolved threads, CI results) to the backend. GitHub opens in your browser to confirm. The
+          private key and webhook secret are written to <code>backend/.env</code> only, never shown here.
+        </>
+      }
+      action={<Badge variant="outline">{created ? "created" : "manifest flow"}</Badge>}
+      footer={
+        <ButtonRow>
+          <AsyncButton onClick={create} disabled={!appName.trim()}>
+            <Plug /> Create GitHub App
+          </AsyncButton>
+          {created ? (
+            <Button type="button" variant="outline" size="sm" onClick={() => openUrl(created.install_url)}>
+              Install on repositories
+            </Button>
+          ) : null}
+        </ButtonRow>
+      }
+    >
+      <FieldGrid>
+        <Field label="App name" htmlFor="int-app-name" hint="Must be unique on GitHub (max 34 characters)">
+          <Input id="int-app-name" value={appName} maxLength={34} onChange={(e) => setAppName(e.target.value)} />
+        </Field>
+        <Field label="Organization (optional)" htmlFor="int-app-org" hint="Leave empty to create it on your account">
+          <Input id="int-app-org" value={org} onChange={(e) => setOrg(e.target.value)} placeholder="my-org" />
+        </Field>
+      </FieldGrid>
+      <Hint>
+        Webhook:{" "}
+        {base ? (
+          <code className="break-all">{base}/webhooks/github</code>
+        ) : (
+          <>none yet. Set the cloud app base URL below first, or the App is created with its webhook off.</>
+        )}
+      </Hint>
+      {created ? (
+        <Hint>
+          Created <b>{created.slug}</b> (id {created.app_id}). Next: install it on your repositories, then restart the
+          backend. On a hosted backend, copy <code>GITHUB_APP_ID</code>, <code>GITHUB_APP_PRIVATE_KEY</code> and{" "}
+          <code>GITHUB_APP_WEBHOOK_SECRET</code> from <code className="break-all">{created.env_path}</code> into its
+          environment (and the Cloudflare worker's <code>GITHUB_APP_WEBHOOK_SECRET</code>).
+          {created.webhook_active ? null : " Its webhook is off until you set a URL in the App settings."}
+        </Hint>
+      ) : null}
+    </Section>
+  );
+}
+
 export function IntegrationsPage({ active }: { active: boolean }) {
   const [drafts, setDrafts] = React.useState<Drafts>(EMPTY_DRAFTS);
   const clearNonce = useApp((s) => s.clearNonce);
@@ -907,6 +994,7 @@ export function IntegrationsPage({ active }: { active: boolean }) {
   return (
     <Page active={active}>
       <ConnectionsCard drafts={drafts} setDrafts={setDrafts} />
+      <GithubAppCard />
       <RepoSetupCard orKeyDraft={drafts.orKey} />
       <WebhookCard />
     </Page>
