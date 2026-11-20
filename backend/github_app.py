@@ -299,6 +299,48 @@ def _permission_gaps(granted: dict[str, Any]) -> list[str]:
     return gaps
 
 
+def _check_app_info(data: dict[str, Any], out: dict[str, Any], problems: list[str]) -> None:
+    out.update(slug=data.get("slug"), name=data.get("name"), html_url=data.get("html_url"))
+    problems.extend(_permission_gaps(data.get("permissions") or {}))
+    events = set(data.get("events") or [])
+    missing = [e for e in REQUIRED_EVENTS if e not in events]
+    if missing:
+        problems.append("not subscribed to events: " + ", ".join(missing))
+
+
+def _check_hook(resp: Any, out: dict[str, Any], problems: list[str]) -> None:
+    if resp.status_code != 200:
+        problems.append(f"could not read the App webhook config (HTTP {resp.status_code})")
+        return
+    hook_url = str((resp.json() or {}).get("url") or "")
+    out["webhook_url"] = hook_url
+    if not hook_url or "example.com" in hook_url:
+        problems.append("the App's webhook URL is a placeholder; use 'Fix webhook URL'")
+    if not (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip():
+        problems.append("GITHUB_APP_WEBHOOK_SECRET is not set on the backend, so deliveries cannot be verified")
+
+
+def _check_installations(resp: Any, out: dict[str, Any], problems: list[str]) -> None:
+    if resp.status_code != 200:
+        problems.append(f"could not list installations (HTTP {resp.status_code})")
+        return
+    installs = [
+        {
+            "id": i.get("id"),
+            "account": (i.get("account") or {}).get("login"),
+            "repository_selection": i.get("repository_selection"),
+            "suspended": bool(i.get("suspended_at")),
+        }
+        for i in (resp.json() or [])
+        if isinstance(i, dict)
+    ]
+    out["installations"] = installs
+    if not installs:
+        problems.append("the App is not installed on any account or repository yet")
+    if any(i["suspended"] for i in installs):
+        problems.append("an installation is suspended")
+
+
 async def health(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
     """Live check of the App: auth, permissions, events, webhook URL, installations.
 
@@ -317,44 +359,13 @@ async def health(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
         if resp.status_code != 200:
             problems.append(f"GitHub rejected the App credentials (HTTP {resp.status_code})")
             return out
-        data = resp.json() or {}
-        out.update(slug=data.get("slug"), name=data.get("name"), html_url=data.get("html_url"))
-        problems.extend(_permission_gaps(data.get("permissions") or {}))
-        events = set(data.get("events") or [])
-        missing = [e for e in REQUIRED_EVENTS if e not in events]
-        if missing:
-            problems.append("not subscribed to events: " + ", ".join(missing))
-
-        hook = await client.get(f"{GITHUB_API}/app/hook/config", headers=headers)
-        if hook.status_code == 200:
-            hook_url = str((hook.json() or {}).get("url") or "")
-            out["webhook_url"] = hook_url
-            if not hook_url or "example.com" in hook_url:
-                problems.append("the App's webhook URL is a placeholder; use 'Fix webhook URL'")
-            if not (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip():
-                problems.append("GITHUB_APP_WEBHOOK_SECRET is not set on the backend, so deliveries cannot be verified")
-        else:
-            problems.append(f"could not read the App webhook config (HTTP {hook.status_code})")
-
-        inst = await client.get(f"{GITHUB_API}/app/installations", headers=headers, params={"per_page": 100})
-        if inst.status_code == 200:
-            installs = [
-                {
-                    "id": i.get("id"),
-                    "account": (i.get("account") or {}).get("login"),
-                    "repository_selection": i.get("repository_selection"),
-                    "suspended": bool(i.get("suspended_at")),
-                }
-                for i in (inst.json() or [])
-                if isinstance(i, dict)
-            ]
-            out["installations"] = installs
-            if not installs:
-                problems.append("the App is not installed on any account or repository yet")
-            if any(i["suspended"] for i in installs):
-                problems.append("an installation is suspended")
-        else:
-            problems.append(f"could not list installations (HTTP {inst.status_code})")
+        _check_app_info(resp.json() or {}, out, problems)
+        _check_hook(await client.get(f"{GITHUB_API}/app/hook/config", headers=headers), out, problems)
+        _check_installations(
+            await client.get(f"{GITHUB_API}/app/installations", headers=headers, params={"per_page": 100}),
+            out,
+            problems,
+        )
     except GitHubAppError as exc:
         problems.append(str(exc))
     except Exception as exc:
