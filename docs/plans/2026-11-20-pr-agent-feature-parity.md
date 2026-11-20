@@ -270,8 +270,11 @@ summary) because P2 and P4 both consume its findings.
 
 ### Known limits of the current setup
 
-- Cloud settings need `BACKEND_API_TOKEN` (or `SETTINGS_ENCRYPTION_KEY`) set on the backend
-  and Redis connected to persist; the Integrations "Setup status" card flags both.
+- Saving secrets to a deployed backend needs `BACKEND_API_TOKEN` set on the backend, and
+  the same token entered in the app's Settings. `SETTINGS_ENCRYPTION_KEY` is optional and
+  only changes the key used to encrypt them; it does not replace the token (without the
+  token the API is open, so the backend refuses secret writes). Redis must also be connected
+  for settings to survive a restart. The Integrations "Setup status" card flags both.
 - The App cannot toggle its own webhook *active* flag through the API. The app therefore
   refuses to create an App without a public base URL, and "Fix webhook URL" only repoints
   the URL/secret.

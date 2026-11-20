@@ -68,6 +68,7 @@ _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,99}$")
 _PEM_HEADER = "-----BEGIN"
 
 _lock = threading.RLock()
+_refresh_lock = threading.Lock()  # one read+apply at a time
 _originals: dict[str, str | None] = {}  # process-env value before we overlaid a key
 _applied: dict[str, str] = {}  # key -> value we put into os.environ
 _errors: list[str] = []
@@ -216,15 +217,18 @@ def refresh(force: bool = False) -> None:
         if not force and now - _last_refresh < _REFRESH_TTL_S:
             return
         _last_refresh = now
-    try:
-        values, errors, broken = _decode(_load_doc())
-    except Exception as exc:
-        log.warning("runtime settings: could not load (%s); keeping the last applied values", type(exc).__name__)
-        return
-    _apply(values)
-    with _lock:
-        _errors = errors
-        _undecryptable = broken
+    # Read, decode and apply as one step: an older read must not be applied after a
+    # newer one (e.g. a slow refresh finishing after update() has returned).
+    with _refresh_lock:
+        try:
+            values, errors, broken = _decode(_load_doc())
+        except Exception as exc:
+            log.warning("runtime settings: could not load (%s); keeping the last applied values", type(exc).__name__)
+            return
+        _apply(values)
+        with _lock:
+            _errors = errors
+            _undecryptable = broken
 
 
 def webhook_secret_locked() -> bool:

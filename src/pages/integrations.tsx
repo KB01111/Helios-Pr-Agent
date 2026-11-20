@@ -1067,12 +1067,18 @@ function GithubAppCard() {
   const base = cloudBase.trim().replace(/\/+$/, "");
   const wantedHook = base ? `${base}/webhooks/github` : "";
 
+  const backend = useApp((s) => s.backendUrl);
+  const checkSeq = React.useRef(0);
   const check = React.useCallback(async () => {
-    setHealth(await fetchAppHealth());
+    // Newest check wins, so a slow answer from a previous backend cannot restore its state.
+    const mine = ++checkSeq.current;
+    const h = await fetchAppHealth();
+    if (mine === checkSeq.current) setHealth(h);
   }, []);
   React.useEffect(() => {
+    setHealth(undefined); // the old backend's App says nothing about the new one
     void check();
-  }, [check]);
+  }, [check, backend]);
 
   const create = async () => {
     // Re-check right before: an App may already exist (or the first check may still have been running).

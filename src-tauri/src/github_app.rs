@@ -309,6 +309,9 @@ pub fn cloud_settings_body(id: i64, slug: &str, pem: &str, webhook_secret: Optio
 /// Save the App credentials on the deployed backend (encrypted there). The secrets
 /// go straight from this process to the backend; they never reach the webview.
 fn push_to_cloud(settings_url: &str, api_token: Option<&str>, body: &serde_json::Value) -> Result<(), String> {
+    // The body carries the private key, so refuse remote plaintext HTTP even when
+    // no bearer token is sent (https and loopback http are fine).
+    crate::require_secure_for_token(settings_url.trim(), true)?;
     crate::backend_mutate_blocking(
         "PUT".into(),
         settings_url.to_string(),
