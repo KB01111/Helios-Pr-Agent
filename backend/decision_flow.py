@@ -32,10 +32,12 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 try:  # cwd=backend (`uvicorn main:app`)
+    import github_app
     import store
     from sandboxes import decider
     from sandboxes.safety import UnsafeSandboxInput, safe_repo
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+    from backend import github_app  # type: ignore[no-redef]
     from backend import store  # type: ignore[no-redef]
     from backend.sandboxes import decider  # type: ignore[no-redef]
     from backend.sandboxes.safety import UnsafeSandboxInput, safe_repo  # type: ignore[no-redef]
@@ -176,7 +178,11 @@ def _brief(rec: dict[str, Any]) -> dict[str, Any]:
 
 async def fetch_facts(repo: str, pr_number: int, title: str) -> dict[str, Any] | None:
     """PR facts from GitHub, or None when they cannot be fetched (caller fails open)."""
-    token = os.getenv("GITHUB_TOKEN", "").strip()
+    try:
+        token, _kind = await github_app.token_for_repo(repo)
+    except Exception as exc:  # credentials lookup must never strand the evaluation
+        log.warning("decision: GitHub credentials unavailable (%s)", type(exc).__name__)
+        return None
     if not token:
         return None
     files: list[dict[str, Any]] = []

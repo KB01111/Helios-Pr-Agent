@@ -9,6 +9,7 @@ mod local_runtime;
 mod autoreview;
 mod daemon;
 mod decider;
+mod github_app;
 
 use autoreview::WorkflowOptions;
 
@@ -1233,6 +1234,10 @@ fn allowed_env_key(key: &str) -> bool {
             | "LLM_MODEL"
             | "ALLOWED_ORIGINS"
             | "BACKEND_API_TOKEN"
+            | "GITHUB_APP_ID"
+            | "GITHUB_APP_SLUG"
+            | "GITHUB_APP_PRIVATE_KEY"
+            | "GITHUB_APP_WEBHOOK_SECRET"
     )
 }
 
@@ -2750,7 +2755,8 @@ pub fn run() {
             github_setup_repo,
             github_disable_repo,
             github_list_pulls,
-            github_pr_command
+            github_pr_command,
+            github_app::github_app_create
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

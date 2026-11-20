@@ -384,6 +384,90 @@ def rset_json(key: str, obj: object, ex: int | None = None, nx: bool = False) ->
 
 
 # ---------------------------------------------------------------------------
+# Capped lists (newest first): activity logs, finding history, digests.
+# ---------------------------------------------------------------------------
+
+
+def _mem_list(key: str) -> list[str]:
+    raw = _mem_get(key)
+    if raw is None:
+        return []
+    try:
+        val = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(v) for v in val] if isinstance(val, list) else []
+
+
+def rlpush_capped(key: str, value: str, cap: int, ex: int | None = None) -> int:
+    """LPUSH ``value``, keep the newest ``cap`` items, refresh the TTL. Returns the new length."""
+    cap = max(1, int(cap))
+    try:
+        if _REDIS is not None:
+            pipe = _REDIS.pipeline()
+            pipe.lpush(key, value)
+            pipe.ltrim(key, 0, cap - 1)
+            if ex:
+                pipe.expire(key, ex)
+            pipe.llen(key)
+            return int(pipe.execute()[-1])
+        if _SDK is not None:
+            _SDK.lpush(key, value)  # type: ignore[attr-defined]
+            _SDK.ltrim(key, 0, cap - 1)  # type: ignore[attr-defined]
+            if ex:
+                _SDK.expire(key, ex)  # type: ignore[attr-defined]
+            return int(_SDK.llen(key))  # type: ignore[attr-defined]
+        if _use_rest():
+            _rest_cmd("LPUSH", key, value)
+            _rest_cmd("LTRIM", key, "0", str(cap - 1))
+            if ex:
+                _rest_cmd("EXPIRE", key, str(ex))
+            return int(_rest_cmd("LLEN", key))  # type: ignore[arg-type]
+    except Exception as exc:
+        log.warning("store.rlpush_capped(%s) failed: %s", key, exc)
+        if _REDIS_CONFIGURED:
+            raise
+    with _MEM_LOCK:
+        items = [value] + _mem_list(key)
+        items = items[:cap]
+        _mem_set(key, json.dumps(items), ex=ex)
+        return len(items)
+
+
+def rlrange(key: str, start: int = 0, stop: int = -1) -> list[str]:
+    """LRANGE (inclusive ``stop``, ``-1`` = to the end), newest first."""
+    try:
+        if _REDIS is not None:
+            return [str(v) for v in _REDIS.lrange(key, start, stop)]
+        if _SDK is not None:
+            return [str(v) for v in (_SDK.lrange(key, start, stop) or [])]  # type: ignore[attr-defined]
+        if _use_rest():
+            res = _rest_cmd("LRANGE", key, str(start), str(stop))
+            return [str(v) for v in res] if isinstance(res, list) else []
+    except Exception as exc:
+        log.warning("store.rlrange(%s) failed: %s", key, exc)
+        if _REDIS_CONFIGURED:
+            raise
+    items = _mem_list(key)
+    end = None if stop == -1 else stop + 1
+    return items[start:end]
+
+
+def rlpush_json_capped(key: str, obj: object, cap: int, ex: int | None = None) -> int:
+    return rlpush_capped(key, json.dumps(obj, separators=(",", ":")), cap, ex=ex)
+
+
+def rlrange_json(key: str, start: int = 0, stop: int = -1) -> list[object]:
+    out: list[object] = []
+    for raw in rlrange(key, start, stop):
+        try:
+            out.append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            out.append(raw)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Async wrappers (run sync work in a thread so event loop stays free)
 # ---------------------------------------------------------------------------
 
