@@ -152,3 +152,13 @@ def test_finding_fingerprint_is_stable_across_whitespace_and_wording_tail():
         dm.finding_key("o/r", 3, "../x")
     with pytest.raises(ValueError):
         dm.activity_key("../r", 1)
+
+
+def test_installation_cache_failure_falls_back_to_pat(monkeypatch, app_env):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_fallback")
+
+    def broken(_key):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(github_app.store, "rget", broken)
+    assert asyncio.run(github_app.token_for_repo("o/r")) == ("ghp_fallback", "pat")  # nosec B101

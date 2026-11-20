@@ -115,7 +115,11 @@ function ConnectionsCard({
     const vercel = (data && data.vercel) || {};
     const redis = (data && data.redis) || {};
     const ok = {
-      githubFull: !!(github.token_set && github.webhook_secret_set),
+      // A GitHub App can stand in for the PAT (credentials) and its own webhook secret.
+      githubFull: !!(
+        (github.token_set || github.app_configured) &&
+        (github.webhook_secret_set || github.app_webhook_secret_set)
+      ),
       vercel: !!vercel.configured,
       box: !!(data && data.upstash_box && data.upstash_box.configured),
       redis: !!redis.configured,
@@ -139,7 +143,9 @@ function ConnectionsCard({
     if (data && data.llm_provider) setDrafts((d) => ({ ...d, llmProvider: String(data.llm_provider) }));
     setOut(
       [
-        `github: ${github.token_set ? "token set" : "token MISSING"} · ${github.webhook_secret_set ? "webhook secret set" : "webhook secret MISSING"}`,
+        `github: ${github.token_set ? "token set" : github.app_configured ? "no PAT" : "token MISSING"} · ${
+          github.webhook_secret_set ? "webhook secret set" : github.app_webhook_secret_set ? "no repo webhook secret" : "webhook secret MISSING"
+        }${github.app_configured ? ` · App ${github.app_slug || "configured"}${github.app_webhook_secret_set ? "" : " (App webhook secret MISSING)"}` : ""}`,
         `vercel: ${ok.vercel ? "configured" + (vercel.team_set ? " (team scoped)" : "") : "not configured"}`,
         `upstash_box: ${ok.box ? "configured" : "not configured"}`,
         `redis: ${

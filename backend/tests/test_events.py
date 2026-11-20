@@ -179,3 +179,31 @@ def test_webhooks_signed_with_either_the_repo_or_the_app_secret_are_accepted(mon
     assert post("repo-secret").status_code == 202  # nosec B101
     assert post("app-secret").status_code == 202  # nosec B101
     assert post("other").status_code == 401  # nosec B101
+
+
+def test_status_reaches_every_pr_that_shares_the_head_sha(client):
+    send(client, "pull_request", pr_payload("ready_for_review", number=7), "s1")
+    send(client, "pull_request", pr_payload("ready_for_review", number=9), "s2")
+    store.rset(dm.prhead_key(REPO, "e" * 40), "7")  # legacy single-number entry still reads
+    status = {"sha": SHA, "state": "success", "context": "ci", "repository": {"full_name": REPO}}
+    assert send(client, "status", status, "s3").json()["prs"] == [7, 9]  # nosec B101
+    assert events.prs_for_head(REPO, "e" * 40) == [7]  # nosec B101
+
+
+def test_github_config_test_fails_when_a_configured_app_is_rejected(monkeypatch):
+    import asyncio
+
+    async def pat():  # webhook secret set, no PAT: the PAT half reports ok
+        return {"provider": "github", "ok": True, "configured": True, "details": "secret only", "token_valid": None}
+
+    async def app_rejected():
+        return {"configured": True, "ok": False, "details": "App JWT rejected (HTTP 401)"}
+
+    async def app_ok():
+        return {"configured": True, "ok": True, "details": "App 'x' authenticated"}
+
+    monkeypatch.setattr(main, "_test_github_pat", pat)
+    monkeypatch.setattr(main, "_test_github_app", app_rejected)
+    assert asyncio.run(main._test_github())["ok"] is False  # nosec B101
+    monkeypatch.setattr(main, "_test_github_app", app_ok)
+    assert asyncio.run(main._test_github())["ok"] is True  # nosec B101

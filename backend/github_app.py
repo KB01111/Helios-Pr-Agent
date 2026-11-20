@@ -229,7 +229,7 @@ async def token_for_repo(repo: str) -> tuple[str, str]:
             log.info("github_app: not installed on %s; using PAT fallback", repo)
         except GitHubAppError as exc:
             log.warning("github_app: %s for %s; using PAT fallback", exc, repo)
-        except httpx.HTTPError as exc:
+        except Exception as exc:  # network errors, or the installation cache (Redis) failing
             log.warning("github_app: %s for %s; using PAT fallback", type(exc).__name__, repo)
     pat = pat_token()
     return (pat, "pat") if pat else ("", "none")

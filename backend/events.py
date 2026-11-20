@@ -116,19 +116,35 @@ def is_dirty(repo: str, pr_number: int) -> bool:
     return store.rget(dm.dirty_key(repo, pr_number)) is not None
 
 
+_MAX_PRS_PER_HEAD = 20
+
+
 def remember_head(repo: str, pr_number: int, sha: str) -> None:
-    if sha and dm.valid_repo(repo) and pr_number > 0:
-        store.rset(dm.prhead_key(repo, sha), str(pr_number), ex=dm.PRHEAD_TTL_S)
+    """Map a head sha to its PR(s). Several open PRs can share one head (the same
+    branch proposed into two bases), so the value is a small list, not one PR."""
+    if not (sha and dm.valid_repo(repo) and pr_number > 0):
+        return
+    prs = prs_for_head(repo, sha)
+    if pr_number not in prs:
+        prs = (prs + [pr_number])[-_MAX_PRS_PER_HEAD:]
+    store.rset_json(dm.prhead_key(repo, sha), prs, ex=dm.PRHEAD_TTL_S)
 
 
-def pr_for_head(repo: str, sha: str) -> int | None:
+def prs_for_head(repo: str, sha: str) -> list[int]:
     if not sha or not dm.valid_repo(repo):
-        return None
-    raw = store.rget(dm.prhead_key(repo, sha))
-    try:
-        return int(raw) if raw else None
-    except ValueError:
-        return None
+        return []
+    raw = store.rget_json(dm.prhead_key(repo, sha))
+    # Older entries hold a single PR number.
+    items = raw if isinstance(raw, list) else [raw]
+    out: list[int] = []
+    for item in items:
+        try:
+            num = int(item)
+        except (TypeError, ValueError):
+            continue
+        if num > 0 and num not in out:
+            out.append(num)
+    return out
 
 
 def mentions_agent(body: str) -> bool:
@@ -384,8 +400,8 @@ async def _status(ctx: EventContext) -> dict[str, Any]:
     sha = _str(ctx.payload, "sha")
     if not ctx.repo or not sha:
         return {"recorded": 0}
-    number = await asyncio.to_thread(pr_for_head, ctx.repo, sha)
-    if not number:
+    prs = await asyncio.to_thread(prs_for_head, ctx.repo, sha)
+    if not prs:
         return {"recorded": 0, "skipped": "unknown-head"}
     entry = {
         "kind": "status",
@@ -394,8 +410,9 @@ async def _status(ctx: EventContext) -> dict[str, Any]:
         "sha": sha,
         "url": _str(ctx.payload, "target_url"),
     }
-    await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry)
-    return {"recorded": 1, "prs": [number]}
+    for number in prs:
+        await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry)
+    return {"recorded": len(prs), "prs": prs}
 
 
 @on("push")

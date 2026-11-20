@@ -46,20 +46,54 @@ pub fn valid_org(org: &str) -> bool {
         && !org.starts_with('-')
 }
 
-/// `https://host/...` with a non-loopback host: GitHub must be able to reach it.
+/// True for addresses GitHub's servers can never reach: loopback, private,
+/// link-local, unspecified, and IPv6 unique-local ranges.
+fn non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                || v4.is_broadcast() || v4.octets()[0] == 0
+                // 100.64.0.0/10 carrier-grade NAT
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return non_public_ip(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link local
+        }
+    }
+}
+
+/// `https://host[:port][/path]` that GitHub can reach. The webhook path is
+/// appended to it, so a query, fragment or credentials are refused.
 pub fn public_webhook_base(url: &str) -> Result<String, String> {
     let b = url.trim().trim_end_matches('/').to_string();
     let rest = b
         .strip_prefix("https://")
         .ok_or("the backend URL must be public https:// for GitHub to deliver webhooks")?;
-    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
-    if host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".localhost")
-        || host.starts_with("127.")
-        || host == "[::1]"
-    {
-        return Err("GitHub cannot deliver webhooks to localhost; use the deployed backend URL".into());
+    if rest.contains(['?', '#', '@']) || rest.chars().any(char::is_whitespace) {
+        return Err("the backend URL must not contain a query, fragment, credentials or spaces".into());
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        // IPv6 literal: [addr] or [addr]:port
+        bracketed.split(']').next().unwrap_or("").to_ascii_lowercase()
+    } else {
+        authority.split(':').next().unwrap_or("").to_ascii_lowercase()
+    };
+    let unreachable = "GitHub cannot deliver webhooks to localhost or a private address; use the deployed backend URL";
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+        return Err(unreachable.into());
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if non_public_ip(ip) {
+            return Err(unreachable.into());
+        }
     }
     Ok(b)
 }
@@ -356,6 +390,18 @@ mod tests {
         assert!(public_webhook_base("http://api.example.com").is_err());
         assert!(public_webhook_base("https://localhost:8000").is_err());
         assert!(public_webhook_base("https://127.0.0.1").is_err());
+        assert!(public_webhook_base("https://[::1]:8443").is_err());
+        assert!(public_webhook_base("https://[fd00::1]").is_err());
+        assert!(public_webhook_base("https://[::ffff:10.0.0.1]").is_err());
+        for private in ["10.0.0.1", "172.16.4.2", "192.168.1.10", "169.254.1.1", "0.0.0.0", "100.64.0.1"] {
+            assert!(public_webhook_base(&format!("https://{}", private)).is_err(), "{}", private);
+        }
+        assert!(public_webhook_base("https://203.0.113.9:8443/api").is_ok());
+        assert!(public_webhook_base("https://[2001:db8::1]").is_ok());
+        assert!(public_webhook_base("https://api.example.com?x=1").is_err());
+        assert!(public_webhook_base("https://api.example.com/base#frag").is_err());
+        assert!(public_webhook_base("https://user:pw@api.example.com").is_err());
+        assert_eq!(public_webhook_base("https://api.example.com/base/").unwrap(), "https://api.example.com/base");
     }
 
     #[test]

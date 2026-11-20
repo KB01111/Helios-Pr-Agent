@@ -1004,8 +1004,9 @@ async def _test_github() -> dict[str, Any]:
     app_check = await _test_github_app()
     result["app"] = app_check
     if app_check.get("configured"):
-        # A working App is enough for backend reviews even without a PAT.
-        result["ok"] = bool(result.get("ok") or app_check.get("ok"))
+        # A configured App must itself work (a webhook secret alone used to make
+        # this pass); a PAT that is present must not be rejected either.
+        result["ok"] = bool(app_check.get("ok")) and result.get("token_valid") is not False
         result["configured"] = True
         result["details"] = f"{result['details']}; {app_check['details']}"
     return result
