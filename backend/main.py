@@ -60,9 +60,11 @@ except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo r
 try:
     import events  # GitHub event router (non-review events, activity log)
     import github_app
+    import runtime_settings  # provider/model/keys saved from the desktop app (cloud, Redis-backed)
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
     from backend import events as events  # type: ignore[no-redef]
     from backend import github_app as github_app  # type: ignore[no-redef]
+    from backend import runtime_settings as runtime_settings  # type: ignore[no-redef]
 
 try:
     from sandboxes.providers_review import LLM_PROVIDERS, llm_key_for, resolve_llm_provider
@@ -419,6 +421,7 @@ def enqueue_dispatch(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str)
 def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> None:
     """Run the PR agent synchronously (called via BackgroundTasks)."""
     log.info("dispatch run=%s agent=%s repo=%s pr=%s", run_id, agent_cfg.get("id"), pr.get("repo"), pr.get("pr_number"))
+    runtime_settings.refresh()  # pick up provider/model/keys saved from the desktop app
     try:
         started = store.rget_json(f"run:{run_id}")
         if isinstance(started, dict):
@@ -556,6 +559,7 @@ async def _startup_reap() -> None:
             import backend.sandboxes.router  # type: ignore[no-redef]  # noqa: F401
     except Exception as exc:
         log.warning("router preload failed: %s", exc)
+    await asyncio.to_thread(runtime_settings.refresh, True)
     _reap_stale_queued_runs()
     try:  # restore open-evaluation markers lost to a crash (or predating the index)
         await asyncio.to_thread(store.eval_reindex)
@@ -573,6 +577,8 @@ async def _startup_reap() -> None:
 async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONResponse:
     raw = await request.body()
     sig = request.headers.get("X-Hub-Signature-256")
+    # Webhook secrets and App credentials may live in the cloud settings.
+    await asyncio.to_thread(runtime_settings.refresh)
     if not _verify_signature(raw, sig):
         raise HTTPException(status_code=401, detail="bad webhook signature")
 
@@ -933,8 +939,16 @@ def _configured(value: str | None, min_len: int = 1) -> bool:
 def config_status(request: Request) -> dict[str, Any]:
     """Which providers are configured. Returns booleans/mode only — never secret values."""
     _require_auth(request)
+    runtime_settings.refresh()
     vercel_token = os.getenv("VERCEL_TOKEN", "") or os.getenv("VERCEL_API_TOKEN", "")
+    cloud = runtime_settings.describe()
     return {
+        "settings": {
+            "persistent": cloud["persistent"],
+            "encryption": cloud["encryption"],
+            "cloud_keys": cloud["cloud_keys"],
+            "errors": cloud["errors"],
+        },
         "github": {
             "webhook_secret_set": _configured(_get_webhook_secret()),
             "token_set": _configured(os.getenv("GITHUB_TOKEN", "")),
@@ -1267,6 +1281,63 @@ async def _test_commandcode() -> dict[str, Any]:
 
 async def _test_opencode_go() -> dict[str, Any]:
     return await _test_openai_compatible("opencode_go", "https://opencode.ai/inference/go/v1/models")
+
+
+class SettingsBody(BaseModel):
+    values: dict[str, str | None] = Field(
+        description="Setting name -> new value. null or an empty string removes the stored value."
+    )
+
+
+@app.get("/config/settings")
+def get_cloud_settings(request: Request) -> dict[str, Any]:
+    """Provider/model and which secrets are saved in the cloud. Secret values are never returned."""
+    _require_auth(request)
+    runtime_settings.refresh(force=True)
+    return runtime_settings.describe()
+
+
+@app.put("/config/settings")
+def put_cloud_settings(body: SettingsBody, request: Request) -> dict[str, Any]:
+    """Save provider, model, API keys and GitHub App credentials to the cloud backend.
+
+    Stored in the shared store (secrets encrypted) and applied immediately: no
+    redeploy or restart is needed.
+    """
+    _require_auth(request)
+    try:
+        return runtime_settings.update(dict(body.values))
+    except runtime_settings.SettingsNotReady as exc:
+        raise HTTPException(status_code=409, detail=str(exc))  # backend cannot store secrets yet
+    except runtime_settings.SettingsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))  # bad input
+
+
+class WebhookFixBody(BaseModel):
+    base_url: str = Field(description="Public https base URL of this backend, e.g. https://app.fastapicloud.dev")
+
+
+@app.get("/github-app/health")
+async def github_app_health(request: Request) -> dict[str, Any]:
+    """Live check of the GitHub App: credentials, permissions, events, webhook URL, installations."""
+    _require_auth(request)
+    await asyncio.to_thread(runtime_settings.refresh)
+    return await github_app.health()
+
+
+@app.post("/github-app/webhook")
+async def github_app_fix_webhook(body: WebhookFixBody, request: Request) -> dict[str, Any]:
+    """Point the App's webhook at this backend (repairs an App created before a public URL existed)."""
+    _require_auth(request)
+    await asyncio.to_thread(runtime_settings.refresh)
+    if not github_app.app_configured():
+        raise HTTPException(status_code=409, detail="GitHub App credentials are not set on the backend")
+    try:
+        return await github_app.set_webhook_url(body.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except github_app.GitHubAppError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.post("/config/test")

@@ -238,3 +238,149 @@ async def token_for_repo(repo: str) -> tuple[str, str]:
 def clear_token_cache() -> None:
     with _token_lock:
         _token_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Health: is the App set up the way the agent needs it?
+# ---------------------------------------------------------------------------
+
+# Mirrors src-tauri/src/github_app.rs (build_manifest / APP_EVENTS).
+REQUIRED_PERMISSIONS: dict[str, str] = {
+    "metadata": "read",
+    "contents": "read",
+    "pull_requests": "write",
+    "issues": "write",
+    "checks": "write",
+    "statuses": "write",
+}
+REQUIRED_EVENTS: tuple[str, ...] = (
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_review_thread",
+    "issue_comment",
+    "check_suite",
+    "check_run",
+    "status",
+    "push",
+)
+_PERM_RANK = {"read": 1, "write": 2, "admin": 3}
+
+
+def public_https_url(url: str) -> str:
+    """Normalised ``https://host[/path]`` that GitHub can reach, or ``ValueError``."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    raw = (url or "").strip().rstrip("/")
+    parts = urlsplit(raw)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("the webhook base URL must be https://")
+    if parts.username or parts.password or parts.query or parts.fragment or any(c.isspace() for c in raw):
+        raise ValueError("the webhook base URL must not contain credentials, a query, a fragment or spaces")
+    host = parts.hostname.lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("GitHub cannot deliver webhooks to localhost")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return raw
+    if not ip.is_global:
+        raise ValueError("GitHub cannot deliver webhooks to a private address")
+    return raw
+
+
+def _permission_gaps(granted: dict[str, Any]) -> list[str]:
+    gaps = []
+    for name, need in REQUIRED_PERMISSIONS.items():
+        have = str((granted or {}).get(name) or "")
+        if _PERM_RANK.get(have, 0) < _PERM_RANK[need]:
+            gaps.append(f"permission {name}: needs {need}, has {have or 'none'}")
+    return gaps
+
+
+async def health(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+    """Live check of the App: auth, permissions, events, webhook URL, installations.
+
+    Never raises; ``problems`` lists everything the user should fix and ``ok``
+    is true only when that list is empty.
+    """
+    if not app_configured():
+        return {"configured": False, "ok": False, "problems": ["GitHub App credentials are not set on the backend"]}
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=15.0)
+    out: dict[str, Any] = {"configured": True, "ok": False, "problems": []}
+    problems: list[str] = out["problems"]
+    try:
+        headers = _app_headers()
+        resp = await client.get(f"{GITHUB_API}/app", headers=headers)
+        if resp.status_code != 200:
+            problems.append(f"GitHub rejected the App credentials (HTTP {resp.status_code})")
+            return out
+        data = resp.json() or {}
+        out.update(slug=data.get("slug"), name=data.get("name"), html_url=data.get("html_url"))
+        problems.extend(_permission_gaps(data.get("permissions") or {}))
+        events = set(data.get("events") or [])
+        missing = [e for e in REQUIRED_EVENTS if e not in events]
+        if missing:
+            problems.append("not subscribed to events: " + ", ".join(missing))
+
+        hook = await client.get(f"{GITHUB_API}/app/hook/config", headers=headers)
+        if hook.status_code == 200:
+            hook_url = str((hook.json() or {}).get("url") or "")
+            out["webhook_url"] = hook_url
+            if not hook_url or "example.com" in hook_url:
+                problems.append("the App's webhook URL is a placeholder; use 'Fix webhook URL'")
+            if not (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip():
+                problems.append("GITHUB_APP_WEBHOOK_SECRET is not set on the backend, so deliveries cannot be verified")
+        else:
+            problems.append(f"could not read the App webhook config (HTTP {hook.status_code})")
+
+        inst = await client.get(f"{GITHUB_API}/app/installations", headers=headers, params={"per_page": 100})
+        if inst.status_code == 200:
+            installs = [
+                {
+                    "id": i.get("id"),
+                    "account": (i.get("account") or {}).get("login"),
+                    "repository_selection": i.get("repository_selection"),
+                    "suspended": bool(i.get("suspended_at")),
+                }
+                for i in (inst.json() or [])
+                if isinstance(i, dict)
+            ]
+            out["installations"] = installs
+            if not installs:
+                problems.append("the App is not installed on any account or repository yet")
+            if any(i["suspended"] for i in installs):
+                problems.append("an installation is suspended")
+        else:
+            problems.append(f"could not list installations (HTTP {inst.status_code})")
+    except GitHubAppError as exc:
+        problems.append(str(exc))
+    except Exception as exc:
+        problems.append(f"GitHub API unreachable ({type(exc).__name__})")
+    finally:
+        if own:
+            await client.aclose()
+    out["ok"] = not problems
+    return out
+
+
+async def set_webhook_url(base_url: str, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+    """Point the App's webhook at ``<base_url>/webhooks/github`` (JSON, secret kept in sync)."""
+    base = public_https_url(base_url)
+    url = f"{base}/webhooks/github"
+    body: dict[str, Any] = {"url": url, "content_type": "json", "insecure_ssl": "0"}
+    secret = (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip()
+    if secret:
+        body["secret"] = secret
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=15.0)
+    try:
+        resp = await client.patch(f"{GITHUB_API}/app/hook/config", headers=_app_headers(), json=body)
+        if resp.status_code != 200:
+            raise GitHubAppError(f"GitHub refused the webhook update (HTTP {resp.status_code})")
+        return {"url": url, "secret_synced": bool(secret)}
+    finally:
+        if own:
+            await client.aclose()

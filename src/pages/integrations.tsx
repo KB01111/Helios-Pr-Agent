@@ -21,7 +21,9 @@ import {
   type ReviewMode,
   type WorkflowProvider,
 } from "@/lib/github";
-import { LLM_PROVIDERS, useApp, type LlmProviderId } from "@/lib/store";
+import { SetupChecklist } from "@/components/setup-checklist";
+import { CLOUD_KEYS, cloudModelId, fetchAppHealth, saveCloudSettings, type AppHealth } from "@/lib/cloud";
+import { defaultModelFor, LLM_PROVIDERS, modelsForProvider, toProviderId, useApp, type LlmProviderId } from "@/lib/store";
 import { errText, openUrl, tauriInvoke } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -73,6 +75,8 @@ const EMPTY_DRAFTS = {
   ccKey: "",
   ocKey: "",
   llmProvider: "openrouter",
+  llmModel: "", // a model option value, "custom", or "" (provider default)
+  llmModelCustom: "",
 };
 type Drafts = typeof EMPTY_DRAFTS;
 
@@ -140,7 +144,18 @@ function ConnectionsCard({
     const n = all.filter(Boolean).length;
     setBadge({ text: `${n}/7 connected`, tone: n === 7 ? "success" : "outline" });
     const llm = (data && data.llm_provider) || "openrouter";
-    if (data && data.llm_provider) setDrafts((d) => ({ ...d, llmProvider: String(data.llm_provider) }));
+    if (data && data.llm_provider) {
+      // Show what the backend really runs: its provider and (if listed) its model.
+      const pid = toProviderId(String(data.llm_provider));
+      const model = String(data.model || "");
+      const listed = modelsForProvider(pid).find((m) => m.value !== "custom" && cloudModelId(pid, m.value) === model);
+      setDrafts((d) => ({
+        ...d,
+        llmProvider: pid,
+        llmModel: listed ? listed.value : model ? "custom" : "",
+        llmModelCustom: listed ? "" : model,
+      }));
+    }
     setOut(
       [
         `github: ${github.token_set ? "token set" : github.app_configured ? "no PAT" : "token MISSING"} · ${
@@ -156,7 +171,14 @@ function ConnectionsCard({
         `openrouter: ${ok.openrouter ? "configured" : "not configured"}`,
         `commandcode: ${ok.commandcode ? "configured" : "not configured"}`,
         `opencode_go: ${ok.opencodeGo ? "configured" : "not configured"}`,
-        `llm provider (backend): ${llm}`,
+        `llm provider (backend): ${llm} · model ${(data && data.model) || "default"}`,
+        `cloud settings: ${
+          data && data.settings
+            ? `${data.settings.cloud_keys.length} saved from the app · ${
+                data.settings.encryption ? "secrets encrypted" : "NO encryption secret — set BACKEND_API_TOKEN to store keys"
+              } · ${data.settings.persistent ? "persistent (Redis)" : "NOT persistent (in-memory store: lost on restart)"}`
+            : "unavailable (older backend — redeploy it to enable)"
+        }${data && data.settings && data.settings.errors.length ? `\n  ⚠ ${data.settings.errors.join("\n  ⚠ ")}` : ""}`,
         `auth: ${data && data.auth_required ? "BACKEND_API_TOKEN required" : "open (no BACKEND_API_TOKEN)"}`,
       ].join("\n"),
     );
@@ -182,57 +204,117 @@ function ConnectionsCard({
     else toastErr("Test failed", `${provider}: ${(res && res.details) || "check failed"}`);
   };
 
-  // Save token inputs to backend/.env via the Tauri backend (never localStorage).
+  /**
+   * Save settings where the backend can see them:
+   *  1. the cloud backend (`PUT /config/settings`): encrypted in its store, live
+   *     immediately, no redeploy;
+   *  2. the local `backend/.env` via the Tauri backend, for a backend run from this
+   *     checkout. Never `localStorage`.
+   * `drop` keys are removed from the cloud (e.g. a blank model = provider default).
+   * Returns true when every value landed somewhere.
+   */
+  const persist = async (todo: readonly (readonly [string, string])[], drop: string[], label: string): Promise<boolean> => {
+    setOut(`Saving ${label}…`);
+    const cloudValues: Record<string, string | null> = {};
+    for (const [key, val] of todo) if (CLOUD_KEYS.has(key)) cloudValues[key] = val;
+    for (const key of drop) cloudValues[key] = null;
+
+    let cloudOk = false;
+    let cloudErr = "";
+    if (Object.keys(cloudValues).length) {
+      try {
+        await saveCloudSettings(cloudValues);
+        cloudOk = true;
+      } catch (e) {
+        cloudErr = errText(e, 300);
+      }
+    }
+    const localOnly = todo.filter(([key]) => !CLOUD_KEYS.has(key)); // e.g. REDIS_URL: must exist before the backend starts
+    const localPaths = new Set<string>();
+    let localErr = "";
+    for (const [key, val] of todo) {
+      try {
+        localPaths.add(await tauriInvoke<string>("save_backend_env_var", { key, value: val }));
+      } catch (e) {
+        localErr = errText(e, 200);
+        break;
+      }
+    }
+    const cloudWanted = Object.keys(cloudValues).length > 0;
+    const everySaved = (!cloudWanted || cloudOk || (!!localPaths.size && !localErr)) && (!localOnly.length || !localErr);
+    const lines: string[] = [];
+    if (cloudWanted) {
+      lines.push(cloudOk ? `✓ cloud backend (${backendUrl()}): saved, live now — no redeploy needed` : `✗ cloud backend: ${cloudErr}`);
+    }
+    if (todo.length) {
+      lines.push(
+        localPaths.size && !localErr
+          ? `✓ local file ${Array.from(localPaths).join(", ")}${cloudOk ? "" : " — restart a locally run backend to apply"}`
+          : `– local backend/.env not written${localErr ? `: ${localErr}` : ""}`,
+      );
+    }
+    if (!cloudOk && cloudWanted && /BACKEND_API_TOKEN/.test(cloudErr)) {
+      lines.push("Set BACKEND_API_TOKEN on the deployed backend (and in Settings) so secrets can be stored there.");
+    }
+    setOut(lines.join("\n"));
+    if (everySaved) toastOk("Saved", `${label}${cloudOk ? " → cloud backend" : " → backend/.env"}`);
+    else toastErr("Save failed", cloudErr || localErr || "nothing was saved");
+    return everySaved;
+  };
+
+  // Save token inputs: cloud backend first, local backend/.env as well (never localStorage).
   const save =
     (pairs: [string, keyof Drafts][], label: string, keep: (keyof Drafts)[] = []) =>
     async () => {
       const todo = pairs.map(([key, field]) => [key, drafts[field].trim(), field] as const).filter(([, v]) => v);
       if (!todo.length) return toastErr("Connect", "Enter a value first.");
-      setOut(`Saving ${label} to backend/.env…`);
       const nonce = useApp.getState().clearNonce;
-      try {
-        const paths = new Set<string>();
-        for (const [key, val] of todo) paths.add(await tauriInvoke<string>("save_backend_env_var", { key, value: val }));
-        // Mirror session-usable secrets into memory + sessionStorage (same convention as
-        // Settings) — unless the user cleared session secrets while the save was pending.
-        const sessionCleared = useApp.getState().clearNonce !== nonce;
-        if (!sessionCleared) {
-          for (const [key, val] of todo) {
-            if (key === "GITHUB_TOKEN") setSecret("github", val);
-            if (key === "OPENROUTER_API_KEY") setSecret("openrouter", val);
-            if (key === "COMMANDCODE_API_KEY") setSecret("commandcode", val);
-            if (key === "OPENCODE_GO_API_KEY") setSecret("opencodeGo", val);
-            if (key === "UPSTASH_BOX_API_KEY") setSecret("box", val);
-          }
-          if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
+      const saved = await persist(
+        todo.map(([key, val]) => [key, val] as const),
+        [],
+        label,
+      );
+      if (!saved) return;
+      // Mirror session-usable secrets into memory + sessionStorage (same convention as
+      // Settings) — unless the user cleared session secrets while the save was pending.
+      if (useApp.getState().clearNonce === nonce) {
+        for (const [key, val] of todo) {
+          if (key === "GITHUB_TOKEN") setSecret("github", val);
+          if (key === "OPENROUTER_API_KEY") setSecret("openrouter", val);
+          if (key === "COMMANDCODE_API_KEY") setSecret("commandcode", val);
+          if (key === "OPENCODE_GO_API_KEY") setSecret("opencodeGo", val);
+          if (key === "UPSTASH_BOX_API_KEY") setSecret("box", val);
         }
-        setDrafts((d) => {
-          const next = { ...d };
-          for (const [, field] of pairs) if (!keep.includes(field)) next[field] = "";
-          return next;
-        });
-        const savedKeys = todo.map(([k]) => k).join(", ");
-        setOut(`Saved ${savedKeys} to ${Array.from(paths).join(", ")}.\nRestart/redeploy the backend so it picks up the new values, then Test.`);
-        toastOk("Saved", `${savedKeys} → backend/.env`);
-        // The backend still reports the old provider until it restarts: keep the saved choice in the select.
-        const savedLlm = todo.find(([key]) => key === "LLM_PROVIDER")?.[1];
-        void refresh().then(() => {
-          if (savedLlm) patch({ llmProvider: savedLlm });
-        });
-      } catch (e) {
-        setOut(`Save failed: ${errText(e, 300)}\n(Outside the desktop app? Set these env vars where the backend runs instead.)`);
-        toastErr("Save failed", errText(e, 220));
+        if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
       }
+      setDrafts((d) => {
+        const next = { ...d };
+        for (const [, field] of pairs) if (!keep.includes(field)) next[field] = "";
+        return next;
+      });
+      void refresh();
     };
+
+  // Backend LLM provider + model: one save, applied to the cloud immediately.
+  const saveLlm = async () => {
+    const pid = toProviderId(drafts.llmProvider);
+    const chosen = drafts.llmModel === "custom" ? drafts.llmModelCustom.trim() : drafts.llmModel;
+    const model = chosen ? cloudModelId(pid, chosen) : "";
+    const todo: [string, string][] = [["LLM_PROVIDER", pid]];
+    if (model) todo.push(["LLM_MODEL", model]);
+    const saved = await persist(todo, model ? [] : ["LLM_MODEL"], "LLM provider & model");
+    if (saved) void refresh();
+  };
 
   return (
     <Section
       title="Connections — 1-click setup"
       description={
         <>
-          Tokens are written to <code>backend/.env</code> via the Tauri backend (git-ignored) — never to{" "}
-          <code>localStorage</code>. Inputs clear on save. Restart or redeploy the backend afterwards so it picks up the new
-          values.
+          Saved to your <b>cloud backend</b> (encrypted in its store, live immediately — no redeploy) and, for a backend
+          run from this checkout, to <code>backend/.env</code> (git-ignored). Never to <code>localStorage</code>. Inputs
+          clear on save. The backend needs <code>BACKEND_API_TOKEN</code> set to accept secrets. <code>REDIS_URL</code> must
+          stay a deploy-time environment variable.
         </>
       }
       action={<Badge variant={badge.tone}>{badge.text}</Badge>}
@@ -476,24 +558,61 @@ function ConnectionsCard({
 
       {/* Backend LLM provider */}
       <div className="grid gap-3">
-        <ConnectionHead name="Backend LLM provider" hint="which LLM the backend uses for reviews" dot="idle" />
-        <Field label="LLM provider" htmlFor="int-llm-provider" hint="Saved as LLM_PROVIDER in backend/.env — restart the backend after saving.">
-          <Select value={drafts.llmProvider} onValueChange={(v) => patch({ llmProvider: v })}>
-            <SelectTrigger id="int-llm-provider" className="w-full">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {(Object.keys(LLM_PROVIDERS) as LlmProviderId[]).map((id) => (
-                <SelectItem key={id} value={id}>
-                  {LLM_PROVIDERS[id].label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
+        <ConnectionHead name="Backend LLM provider & model" hint="which LLM the cloud backend uses for reviews" dot="idle" />
+        <FieldGrid>
+          <Field
+            label="LLM provider"
+            htmlFor="int-llm-provider"
+            hint="Saved to the cloud backend — applies to the next review, no redeploy."
+          >
+            <Select
+              value={drafts.llmProvider}
+              onValueChange={(v) => {
+                const pid = toProviderId(v);
+                patch({ llmProvider: pid, llmModel: defaultModelFor(pid), llmModelCustom: "" });
+              }}
+            >
+              <SelectTrigger id="int-llm-provider" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(LLM_PROVIDERS) as LlmProviderId[]).map((id) => (
+                  <SelectItem key={id} value={id}>
+                    {LLM_PROVIDERS[id].label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="Model" htmlFor="int-llm-model">
+            <Select value={drafts.llmModel || defaultModelFor(drafts.llmProvider)} onValueChange={(v) => patch({ llmModel: v })}>
+              <SelectTrigger id="int-llm-model" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {modelsForProvider(drafts.llmProvider).map((m) => (
+                  <SelectItem key={m.value} value={m.value}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+        </FieldGrid>
+        {drafts.llmModel === "custom" ? (
+          <Field label="Custom model id" htmlFor="int-llm-model-custom" hint="Blank = the provider's default model.">
+            <Input
+              id="int-llm-model-custom"
+              value={drafts.llmModelCustom}
+              placeholder={defaultModelFor(drafts.llmProvider)}
+              onChange={(e) => patch({ llmModelCustom: e.target.value })}
+              autoComplete="off"
+            />
+          </Field>
+        ) : null}
         <ButtonRow>
-          <AsyncButton size="sm" onClick={save([["LLM_PROVIDER", "llmProvider"]], "LLM provider", ["llmProvider"])}>
-            <Plug /> Save LLM provider
+          <AsyncButton size="sm" onClick={saveLlm}>
+            <Plug /> Save provider &amp; model
           </AsyncButton>
         </ButtonRow>
       </div>
@@ -915,15 +1034,28 @@ type CreatedApp = {
   html_url: string;
   install_url: string;
   webhook_active: boolean;
-  env_path: string;
+  env_path: string | null;
+  local_error: string | null;
+  cloud_saved: boolean;
+  cloud_error: string | null;
 };
 
 function GithubAppCard() {
   const cloudBase = useApp((s) => s.cloudBase);
+  const apiToken = useApp((s) => s.secrets.api);
   const [appName, setAppName] = React.useState("PR Agent Control");
   const [org, setOrg] = React.useState("");
   const [created, setCreated] = React.useState<CreatedApp | null>(null);
+  const [health, setHealth] = React.useState<AppHealth | null>(null);
   const base = cloudBase.trim().replace(/\/+$/, "");
+  const wantedHook = base ? `${base}/webhooks/github` : "";
+
+  const check = React.useCallback(async () => {
+    setHealth(await fetchAppHealth());
+  }, []);
+  React.useEffect(() => {
+    void check();
+  }, [check]);
 
   const create = async () => {
     try {
@@ -931,13 +1063,31 @@ function GithubAppCard() {
         backendUrl: base,
         appName: appName.trim(),
         org: org.trim() || null,
+        // Credentials go from the Rust side straight to the cloud backend (never via the webview).
+        settingsUrl: backendUrl(),
+        apiToken: apiToken || null,
       });
       setCreated(res);
-      toastOk("GitHub App created", `${res.slug} · credentials saved to backend/.env`);
+      if (res.cloud_saved) toastOk("GitHub App created", `${res.slug} · credentials saved to the cloud backend`);
+      else toastErr("GitHub App created, cloud backend not updated", res.cloud_error || "backend URL / API token missing");
+      void check();
     } catch (e) {
       toastErr("GitHub App", errText(e, 300));
     }
   };
+
+  const fixWebhook = async () => {
+    try {
+      await apiMut("POST", "/github-app/webhook", { base_url: base });
+      toastOk("Webhook updated", wantedHook);
+    } catch (e) {
+      toastErr("Webhook update failed", errText(e, 300));
+    }
+    await check();
+  };
+
+  const installUrl = created?.install_url || (health?.html_url ? `${health.html_url.replace(/\/+$/, "")}/installations/new` : "");
+  const hookMismatch = !!(health?.configured && wantedHook && health.webhook_url && health.webhook_url !== wantedHook);
 
   return (
     <Section
@@ -946,19 +1096,32 @@ function GithubAppCard() {
         <>
           Gives the agent its own bot identity, lets it post the merge-readiness Check Run, and delivers every PR
           event (reviews, resolved threads, CI results) to the backend. GitHub opens in your browser to confirm. The
-          private key and webhook secret are written to <code>backend/.env</code> only, never shown here.
+          private key and webhook secret go straight to your cloud backend (and the local <code>backend/.env</code>), never
+          through this window.
         </>
       }
-      action={<Badge variant="outline">{created ? "created" : "manifest flow"}</Badge>}
+      action={
+        <Badge variant={health?.configured ? (health.ok ? "success" : "warning") : "outline"}>
+          {health?.configured ? (health.ok ? "healthy" : `${health.problems.length} issue(s)`) : created ? "created" : "not set up"}
+        </Badge>
+      }
       footer={
         <ButtonRow>
-          <AsyncButton onClick={create} disabled={!appName.trim()}>
-            <Plug /> Create GitHub App
+          <AsyncButton onClick={create} disabled={!appName.trim() || !base || !!health?.configured}>
+            <Plug /> {health?.configured ? "App already set up" : "Create GitHub App"}
           </AsyncButton>
-          {created ? (
-            <Button type="button" variant="outline" size="sm" onClick={() => openUrl(created.install_url)}>
+          {installUrl ? (
+            <Button type="button" variant="outline" size="sm" onClick={() => openUrl(installUrl)}>
               Install on repositories
             </Button>
+          ) : null}
+          <AsyncButton variant="outline" size="sm" onClick={check}>
+            <RefreshCw /> Check App
+          </AsyncButton>
+          {hookMismatch ? (
+            <AsyncButton variant="outline" size="sm" onClick={fixWebhook}>
+              Fix webhook URL
+            </AsyncButton>
           ) : null}
         </ButtonRow>
       }
@@ -979,14 +1142,55 @@ function GithubAppCard() {
           <>none yet. Set the cloud app base URL below first, or the App is created with its webhook off.</>
         )}
       </Hint>
+      {!base ? (
+        <Hint className="text-warning">
+          Set the <b>Cloud app base URL</b> (webhook URL card below) first: the App can only deliver events to a public https
+          backend.
+        </Hint>
+      ) : null}
       {created ? (
         <Hint>
-          Created <b>{created.slug}</b> (id {created.app_id}). Next: install it on your repositories, then restart the
-          backend. On a hosted backend, copy <code>GITHUB_APP_ID</code>, <code>GITHUB_APP_PRIVATE_KEY</code> and{" "}
-          <code>GITHUB_APP_WEBHOOK_SECRET</code> from <code className="break-all">{created.env_path}</code> into its
-          environment (and the Cloudflare worker's <code>GITHUB_APP_WEBHOOK_SECRET</code>).
-          {created.webhook_active ? null : " Its webhook is off until you set a URL in the App settings."}
+          Created <b>{created.slug}</b> (id {created.app_id}).{" "}
+          {created.cloud_saved ? (
+            <>
+              Credentials are saved on the cloud backend (private key and webhook secret are encrypted there; no redeploy
+              needed).
+            </>
+          ) : (
+            <span className="text-destructive">
+              The cloud backend did not accept the credentials ({created.cloud_error || "no backend URL"}). Fix that (is{" "}
+              <code>BACKEND_API_TOKEN</code> set on it and in Settings?) and recreate the App, or copy the values from{" "}
+              <code className="break-all">{created.env_path || "backend/.env"}</code>.
+            </span>
+          )}{" "}
+          {created.env_path ? "A copy is in the local backend/.env. " : ""}
+          Next: <b>Install on repositories</b>, and set the same <code>GITHUB_APP_WEBHOOK_SECRET</code> on the Cloudflare
+          worker if you use it.
+          {created.webhook_active ? null : " Its webhook is off until you set a URL in the App settings on GitHub."}
         </Hint>
+      ) : null}
+      {health && health.configured ? (
+        <div className="grid gap-1.5">
+          <p className="text-[13px] font-medium">
+            {health.ok ? "✓ " : "⚠ "}
+            {health.slug ? `App ${health.slug}` : "App"}
+            {health.installations?.length
+              ? ` · installed on ${health.installations.map((i) => `${i.account} (${i.repository_selection})`).join(", ")}`
+              : ""}
+          </p>
+          {health.problems.map((p) => (
+            <p key={p} className="text-warning text-xs break-words">
+              • {p}
+            </p>
+          ))}
+          {hookMismatch ? (
+            <p className="text-warning text-xs break-words">
+              • the App delivers to <code>{health.webhook_url}</code>, not <code>{wantedHook}</code>. Use “Fix webhook URL”.
+            </p>
+          ) : null}
+        </div>
+      ) : health === null ? (
+        <Hint>Backend unreachable — App status unknown.</Hint>
       ) : null}
     </Section>
   );
@@ -995,10 +1199,20 @@ function GithubAppCard() {
 export function IntegrationsPage({ active }: { active: boolean }) {
   const [drafts, setDrafts] = React.useState<Drafts>(EMPTY_DRAFTS);
   const clearNonce = useApp((s) => s.clearNonce);
-  React.useEffect(() => setDrafts((d) => ({ ...EMPTY_DRAFTS, llmProvider: d.llmProvider })), [clearNonce]);
+  React.useEffect(
+    () =>
+      setDrafts((d) => ({
+        ...EMPTY_DRAFTS,
+        llmProvider: d.llmProvider,
+        llmModel: d.llmModel,
+        llmModelCustom: d.llmModelCustom,
+      })),
+    [clearNonce],
+  );
 
   return (
     <Page active={active}>
+      <SetupChecklist active={active} />
       <ConnectionsCard drafts={drafts} setDrafts={setDrafts} />
       <GithubAppCard />
       <RepoSetupCard orKeyDraft={drafts.orKey} />

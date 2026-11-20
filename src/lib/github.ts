@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { apiGet, apiMut, backendUrl } from "./api";
 import { agentList, refreshAgents } from "./actions";
 import { optionsProblem, useAutoReview, type WorkflowOptions } from "./autoreview";
+import { CLOUD_KEYS, saveCloudSettings } from "./cloud";
 import { lsGet, lsSet, useApp } from "./store";
 import { errText, jsonObj, openUrl, tauriInvoke } from "./tauri";
 import { toastErr, toastOk } from "./toast";
@@ -386,12 +387,24 @@ export async function checkStatus(filter: string) {
 
 /* ---------- configure batch (sequential; failures never abort the batch) ---------- */
 async function saveEnv(key: string, value: string): Promise<boolean> {
+  // Cloud backend first (what a deployed backend actually reads), then the local file.
+  let cloud = false;
+  if (CLOUD_KEYS.has(key)) {
+    try {
+      await saveCloudSettings({ [key]: value });
+      ghOut(`[env] ${key} saved to the cloud backend`);
+      cloud = true;
+    } catch (e) {
+      ghOut(`[env] ${key} cloud save failed: ${errText(e, 220)}`);
+    }
+  }
   try {
     const p = await tauriInvoke("save_backend_env_var", { key, value });
     ghOut(`[env] ${key} saved to ${p}`);
     return true;
   } catch (e) {
-    ghOut(`[env] ${key} save failed: ${errText(e, 220)}`);
+    ghOut(`[env] ${key} local save failed: ${errText(e, 220)}`);
+    if (cloud) return true;
     toastErr("Env save failed", `${key}: ${errText(e, 180)}`);
     return false;
   }

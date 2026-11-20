@@ -1,4 +1,5 @@
 import { apiGet, apiMut, backendUrl } from "./api";
+import { syncProviderToCloud } from "./cloud";
 import {
   defaultModelFor,
   providerOf,
@@ -82,9 +83,12 @@ export async function saveConfig(): Promise<string> {
   };
   try {
     const p = await tauriInvoke("save_config", { cfg: payload });
-    toastOk("Config saved", String(p));
     void loadConfig();
-    return "Saved to " + p;
+    // The cloud backend runs reviews too: keep it on the same provider + model.
+    const cloud = await syncProviderToCloud(selectedProvider(), selectedModel());
+    if (cloud.ok) toastOk("Config saved", `${p} · ${cloud.message}`);
+    else toastErr("Saved locally, not to the cloud", cloud.message);
+    return `Saved to ${p} · ${cloud.message}`;
   } catch (e) {
     toastErr("Save failed", errText(e, 200));
     return "Save failed: " + errText(e, 300);

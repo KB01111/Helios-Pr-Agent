@@ -238,3 +238,42 @@ Recommended order: **P0 → P1 → P2 → P4 → P3 → P5 → P6**. P4 is pulle
 2. Should learnings from merged PRs be **auto-approved** or always need your approval in the app? The proposed default is "needs approval".
 3. Merge gate default: **advisory** (`neutral` Check Run) or **required** below the threshold?
 4. Should autofix be allowed to **push to PR branches**, or only open stacked PRs?
+
+---
+
+## 8. Status check and what we actually need (added after the P0 merge)
+
+**P0 is done and wired end to end.** The App is created from the desktop app, its
+credentials now go to the *cloud* backend (previously only a local `backend/.env`, which a
+deployed backend never saw), the event router records every PR event, and the backend can
+verify the App live (`GET /github-app/health`) and repair its webhook URL. Provider, model
+and keys chosen in the app are saved to the backend (`PUT /config/settings`).
+
+Judged against what CodeRabbit and Macroscope are actually used for, in priority order:
+
+| Need | Why it matters | Verdict |
+|---|---|---|
+| **Inline comments + committable suggestions + incremental review (P1)** | The backend still posts one free-text comment. This is the single biggest quality gap against both products and the base for everything else. | **Must have, next** |
+| **Walkthrough / PR summary (P1)** | Both products lead with it; cheap once the pipeline is structured. | **Must have** (ship with P1) |
+| **Repo memory + dismissal learning (P2)** | Your stated requirement and the main thing that keeps noise down over time. | **Must have** |
+| **Merge-readiness score and Check Run (P4)** | Your stated requirement; the App already has `checks: write`. | **Must have** |
+| Path instructions / `.pragent.yaml`, `chill`/`assertive` profile | Config fields already exist on the agent; needs the loader. | Should have (P1) |
+| Chat in PR threads (`@agent ...`) | Makes memory capture natural ("remember this"). Events are already routed. | Should have (P5, first half) |
+| Linked-issue check, a handful of linters (ruff, eslint, gitleaks, actionlint) | Real precision gains for little cost. Skip the "40+ tools" claim. | Nice to have (P3, reduced) |
+| Approvability (auto-approve low-risk PRs) | Valuable but risky; opt-in only, after the score is trusted. | Later |
+| Code graph / AST cross-file context | Macroscope's core strength and the most expensive thing to build. Not worth it before P1/P2/P4 prove out. | Later |
+| Fix-it agents, generate tests/docstrings, sequence diagrams | Polish. Needs `contents: write`, which the App deliberately does not request yet. | Later |
+| Slack/Linear/Jira digests, analytics dashboard | Team features, irrelevant for a single-user free-tier setup. | Skip for now |
+
+**Recommended next step:** P1 (structured findings, review with inline suggestions, sticky
+summary) because P2 and P4 both consume its findings.
+
+### Known limits of the current setup
+
+- Cloud settings need `BACKEND_API_TOKEN` (or `SETTINGS_ENCRYPTION_KEY`) set on the backend
+  and Redis connected to persist; the Integrations "Setup status" card flags both.
+- The App cannot toggle its own webhook *active* flag through the API. The app therefore
+  refuses to create an App without a public base URL, and "Fix webhook URL" only repoints
+  the URL/secret.
+- The Cloudflare worker still takes `GITHUB_APP_WEBHOOK_SECRET` from its own secrets; it is
+  not synced from the backend.
