@@ -178,7 +178,11 @@ def _brief(rec: dict[str, Any]) -> dict[str, Any]:
 
 async def fetch_facts(repo: str, pr_number: int, title: str) -> dict[str, Any] | None:
     """PR facts from GitHub, or None when they cannot be fetched (caller fails open)."""
-    token, _kind = await github_app.token_for_repo(repo)
+    try:
+        token, _kind = await github_app.token_for_repo(repo)
+    except Exception as exc:  # credentials lookup must never strand the evaluation
+        log.warning("decision: GitHub credentials unavailable (%s)", type(exc).__name__)
+        return None
     if not token:
         return None
     files: list[dict[str, Any]] = []

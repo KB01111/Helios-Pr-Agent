@@ -162,3 +162,13 @@ def test_installation_cache_failure_falls_back_to_pat(monkeypatch, app_env):
 
     monkeypatch.setattr(github_app.store, "rget", broken)
     assert asyncio.run(github_app.token_for_repo("o/r")) == ("ghp_fallback", "pat")  # nosec B101
+
+
+def test_fetch_facts_fails_open_when_credentials_lookup_breaks(monkeypatch):
+    import decision_flow
+
+    async def boom(_repo):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(decision_flow.github_app, "token_for_repo", boom)
+    assert asyncio.run(decision_flow.fetch_facts("o/r", 1, "t")) is None  # nosec B101
