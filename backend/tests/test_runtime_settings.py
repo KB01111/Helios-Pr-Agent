@@ -248,3 +248,40 @@ def test_health_endpoints_need_auth(secured, monkeypatch, app_creds):
     monkeypatch.setattr(github_app.httpx, "AsyncClient", lambda *a, **k: _Client(_routes(), []))
     assert c.get("/github-app/health", headers=secured).json()["configured"] is True  # nosec B101
     assert c.post("/github-app/webhook", headers=secured, json={"base_url": "http://nope"}).status_code == 422  # nosec B101
+
+
+# ---------------------------------------------------------------------------
+# Review hardening
+# ---------------------------------------------------------------------------
+
+
+def test_pem_with_control_characters_is_rejected(secured):
+    bad = "-----BEGIN PRIVATE KEY-----\nab\x00c\n-----END PRIVATE KEY-----"
+    with pytest.raises(rs.SettingsError):
+        rs.update({"GITHUB_APP_PRIVATE_KEY": bad})
+
+
+def test_encryption_key_alone_does_not_open_anonymous_secret_writes(monkeypatch):
+    monkeypatch.setenv("SETTINGS_ENCRYPTION_KEY", "k" * 40)  # no BACKEND_API_TOKEN: the route is open
+    c = _client()
+    assert c.put("/config/settings", json={"values": {"OPENROUTER_API_KEY": FAKE_KEY}}).status_code == 409  # nosec B101
+    assert c.put("/config/settings", json={"values": {"LLM_MODEL": "m/x"}}).status_code == 200  # nosec B101
+
+
+def test_unreadable_webhook_secret_fails_closed(monkeypatch, secured):
+    rs.update({"GITHUB_APP_WEBHOOK_SECRET": "app-secret-value"})
+    rs.reset_for_tests()
+    monkeypatch.setenv("BACKEND_API_TOKEN", "x" * 40)  # rotated: the stored secret is now unreadable
+    rs.refresh(force=True)
+    assert rs.webhook_secret_locked()  # nosec B101
+    r = _client().post("/webhooks/github", content=b"{}", headers={"X-GitHub-Event": "ping"})
+    assert r.status_code == 401  # unsigned must not be accepted as "dev mode"  # nosec B101
+
+
+def test_concurrent_update_lock_is_released_and_respected(secured):
+    rs.update({"LLM_MODEL": "a/b"})
+    assert store.rget(rs._LOCK_KEY) is None  # nosec B101
+    store.rset(rs._LOCK_KEY, "someone-else", ex=30)
+    with pytest.raises(rs.SettingsNotReady):
+        with rs._write_lock(wait_s=0.1):
+            pass  # pragma: no cover

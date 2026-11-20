@@ -36,24 +36,37 @@ export function SetupChecklist({ active }: { active: boolean }) {
   const [agents, setAgents] = React.useState<number | null>(null);
   const [err, setErr] = React.useState("");
 
+  const seq = React.useRef(0);
   const refresh = React.useCallback(async () => {
+    // Only the newest check may write state: a slow answer from a previous
+    // backend must not overwrite the current one.
+    const mine = ++seq.current;
+    const current = () => mine === seq.current;
     setErr("");
+    let st: any;
     try {
-      setStatus(await apiGet("/config/status"));
+      st = await apiGet("/config/status");
     } catch (e) {
+      if (!current()) return;
       setStatus(null);
       setHealth(undefined);
       setAgents(null);
       setErr(errText(e, 200));
       return;
     }
-    setHealth(await fetchAppHealth());
+    if (!current()) return;
+    setStatus(st);
+    const h = await fetchAppHealth();
+    if (!current()) return;
+    setHealth(h);
+    let count: number | null = null;
     try {
       const list = await apiGet("/agents");
-      setAgents(Array.isArray(list) ? list.length : Array.isArray(list?.agents) ? list.agents.length : 0);
+      count = Array.isArray(list) ? list.length : Array.isArray(list?.agents) ? list.agents.length : 0;
     } catch {
-      setAgents(null);
+      /* leave unknown */
     }
+    if (current()) setAgents(count);
   }, []);
 
   // Re-check whenever the tab is shown or the backend URL changes.

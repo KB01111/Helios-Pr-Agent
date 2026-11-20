@@ -22,12 +22,14 @@ shared document at most every ``_REFRESH_TTL_S`` seconds.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import logging
 import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -69,6 +71,7 @@ _lock = threading.RLock()
 _originals: dict[str, str | None] = {}  # process-env value before we overlaid a key
 _applied: dict[str, str] = {}  # key -> value we put into os.environ
 _errors: list[str] = []
+_undecryptable: set[str] = set()
 _last_refresh = 0.0
 
 
@@ -127,6 +130,9 @@ def _clean_value(key: str, raw: str) -> str:
         value = value.replace("\r\n", "\n").replace("\n", "\\n")
         if not value.startswith(_PEM_HEADER) or "PRIVATE KEY" not in value:
             raise SettingsError("GITHUB_APP_PRIVATE_KEY must be a PEM private key")
+        # NUL and other control characters cannot live in an environment variable.
+        if any(ord(ch) < 32 and ch != "\n" for ch in value.replace("\\n", "")):
+            raise SettingsError("GITHUB_APP_PRIVATE_KEY contains control characters")
         return value
     if len(value) > 4096:
         raise SettingsError(f"{key} is too long")
@@ -166,9 +172,10 @@ def _load_doc() -> dict[str, Any]:
     return {"values": {}}
 
 
-def _decode(doc: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+def _decode(doc: dict[str, Any]) -> tuple[dict[str, str], list[str], set[str]]:
     values: dict[str, str] = {}
     errors: list[str] = []
+    broken: set[str] = set()
     for key, item in (doc.get("values") or {}).items():
         if key not in ALL_KEYS or not isinstance(item, dict):
             continue
@@ -178,8 +185,9 @@ def _decode(doc: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
             elif "v" in item and key in PLAIN_KEYS:
                 values[key] = str(item["v"])
         except Exception:  # wrong/rotated key or corrupt token; never log the token
+            broken.add(key)
             errors.append(f"{key}: stored value cannot be decrypted (was BACKEND_API_TOKEN / SETTINGS_ENCRYPTION_KEY rotated?)")
-    return values, errors
+    return values, errors, broken
 
 
 def _apply(values: dict[str, str]) -> None:
@@ -202,20 +210,52 @@ def _apply(values: dict[str, str]) -> None:
 
 def refresh(force: bool = False) -> None:
     """Re-read the shared document (rate limited). Never raises: a Redis blip must not break reviews."""
-    global _last_refresh, _errors
+    global _last_refresh, _errors, _undecryptable
     now = time.monotonic()
     with _lock:
         if not force and now - _last_refresh < _REFRESH_TTL_S:
             return
         _last_refresh = now
     try:
-        values, errors = _decode(_load_doc())
+        values, errors, broken = _decode(_load_doc())
     except Exception as exc:
         log.warning("runtime settings: could not load (%s); keeping the last applied values", type(exc).__name__)
         return
     _apply(values)
     with _lock:
         _errors = errors
+        _undecryptable = broken
+
+
+def webhook_secret_locked() -> bool:
+    """True when a webhook secret is stored but unreadable (rotated key).
+
+    Callers must then fail closed: treating "no secret" as dev mode would accept
+    unsigned deliveries.
+    """
+    with _lock:
+        return bool(_undecryptable & {"GITHUB_WEBHOOK_SECRET", "GITHUB_APP_WEBHOOK_SECRET"})
+
+
+_LOCK_KEY = "settings:runtime:lock"
+
+
+@contextlib.contextmanager
+def _write_lock(wait_s: float = 5.0, lease_s: int = 15):
+    """Serialise read-modify-write across workers (Redis NX lease)."""
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + wait_s
+    while not store.rset(_LOCK_KEY, token, ex=lease_s, nx=True):
+        if time.monotonic() >= deadline:
+            raise SettingsNotReady("another settings update is in progress; try again")
+        time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            store.rdelete_if_equal(_LOCK_KEY, token)
+        except Exception as exc:  # the lease expires on its own
+            log.warning("runtime settings: could not release lock (%s)", type(exc).__name__)
 
 
 def update(changes: dict[str, str | None]) -> dict[str, Any]:
@@ -236,7 +276,7 @@ def update(changes: dict[str, str | None]) -> dict[str, Any]:
     if any(v is not None and k in SECRET_KEYS for k, v in cleaned.items()) and not encryption_available():
         _fernet()  # raises the actionable error
 
-    with _lock:
+    with _write_lock():
         doc = _load_doc()
         stored = dict(doc.get("values") or {})
         for key, value in cleaned.items():
@@ -278,7 +318,7 @@ def describe() -> dict[str, Any]:
 
 def reset_for_tests() -> None:
     """Undo every overlay and forget cached state (tests only)."""
-    global _last_refresh, _errors
+    global _last_refresh, _errors, _undecryptable
     with _lock:
         for key in list(_applied):
             original = _originals.pop(key, None)
@@ -289,4 +329,5 @@ def reset_for_tests() -> None:
         _applied.clear()
         _originals.clear()
         _errors = []
+        _undecryptable = set()
         _last_refresh = 0.0

@@ -309,6 +309,10 @@ def _webhook_secrets() -> list[str]:
 def _verify_signature(raw: bytes, signature: str | None) -> bool:
     """Verify X-Hub-Signature-256. Dev mode (no secret) accepts with warning."""
     secrets = _webhook_secrets()
+    if not secrets and runtime_settings.webhook_secret_locked():
+        # A secret is stored but cannot be decrypted: never fall back to accepting unsigned.
+        log.error("webhook: stored webhook secret is unreadable; rejecting until it is re-saved")
+        return False
     if not secrets:
         log.warning("webhook: no GITHUB_WEBHOOK_SECRET set — accepting unsigned (dev mode)")
         return True
@@ -1305,6 +1309,10 @@ def put_cloud_settings(body: SettingsBody, request: Request) -> dict[str, Any]:
     redeploy or restart is needed.
     """
     _require_auth(request)
+    # An encryption key alone must not open anonymous writes: with no API token the
+    # route is open, so only non-secret settings may be changed.
+    if not _get_api_token() and any(k in runtime_settings.SECRET_KEYS for k in body.values):
+        raise HTTPException(status_code=409, detail="set BACKEND_API_TOKEN on the backend before saving secrets to it")
     try:
         return runtime_settings.update(dict(body.values))
     except runtime_settings.SettingsNotReady as exc:

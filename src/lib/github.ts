@@ -398,14 +398,30 @@ async function saveEnv(key: string, value: string): Promise<boolean> {
       ghOut(`[env] ${key} cloud save failed: ${errText(e, 220)}`);
     }
   }
+  // A deployed backend only sees the cloud copy: a local-file-only save would let
+  // `configure` register webhooks the backend cannot verify. A backend run from
+  // this checkout reads the local file, so there that alone is enough.
+  const cloudRequired = CLOUD_KEYS.has(key) && !localBackend();
+  let local = false;
   try {
     const p = await tauriInvoke("save_backend_env_var", { key, value });
     ghOut(`[env] ${key} saved to ${p}`);
-    return true;
+    local = true;
   } catch (e) {
     ghOut(`[env] ${key} local save failed: ${errText(e, 220)}`);
-    if (cloud) return true;
-    toastErr("Env save failed", `${key}: ${errText(e, 180)}`);
+  }
+  const ok = cloudRequired ? cloud : cloud || local;
+  if (!ok) {
+    toastErr("Env save failed", `${key}: ${cloudRequired && local ? "not saved to the cloud backend" : "not saved"}`);
+  }
+  return ok;
+}
+
+/** True when the configured backend is this machine (its .env is what it reads). */
+function localBackend(): boolean {
+  try {
+    return /^(localhost|127\.0\.0\.1|\[::1\])$/i.test(new URL(backendUrl()).hostname);
+  } catch {
     return false;
   }
 }

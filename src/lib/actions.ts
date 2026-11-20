@@ -70,9 +70,12 @@ export async function loadConfig(): Promise<string> {
 export async function saveConfig(): Promise<string> {
   const r = useApp.getState().review;
   const maxTokens = r.maxTokens.trim() || "200000";
+  // Read once: the selection may change while the saves below are awaited.
+  const provider = selectedProvider();
+  const model = selectedModel();
   const payload = {
-    llm_provider: selectedProvider(),
-    model: selectedModel(),
+    llm_provider: provider,
+    model,
     fallback_models: r.fallbacks.split(",").map((s) => s.trim()).filter(Boolean),
     max_model_tokens: maxTokens,
     custom_model_max_tokens: maxTokens,
@@ -85,7 +88,7 @@ export async function saveConfig(): Promise<string> {
     const p = await tauriInvoke("save_config", { cfg: payload });
     void loadConfig();
     // The cloud backend runs reviews too: keep it on the same provider + model.
-    const cloud = await syncProviderToCloud(selectedProvider(), selectedModel());
+    const cloud = await syncProviderToCloud(provider, model);
     if (cloud.ok) toastOk("Config saved", `${p} · ${cloud.message}`);
     else toastErr("Saved locally, not to the cloud", cloud.message);
     return `Saved to ${p} · ${cloud.message}`;

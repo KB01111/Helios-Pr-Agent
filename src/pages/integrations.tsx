@@ -102,7 +102,11 @@ function ConnectionsCard({
     tone: "outline",
   });
   const [out, setOut] = React.useState("Integrations not checked.");
-  const patch = (p: Partial<Drafts>) => setDrafts((d) => ({ ...d, ...p }));
+  const llmDirty = React.useRef(false); // unsaved provider/model edits
+  const patch = (p: Partial<Drafts>) => {
+    if ("llmProvider" in p || "llmModel" in p || "llmModelCustom" in p) llmDirty.current = true;
+    setDrafts((d) => ({ ...d, ...p }));
+  };
 
   const refresh = React.useCallback(async () => {
     setOut("Checking status…");
@@ -144,8 +148,9 @@ function ConnectionsCard({
     const n = all.filter(Boolean).length;
     setBadge({ text: `${n}/7 connected`, tone: n === 7 ? "success" : "outline" });
     const llm = (data && data.llm_provider) || "openrouter";
-    if (data && data.llm_provider) {
+    if (data && data.llm_provider && !llmDirty.current) {
       // Show what the backend really runs: its provider and (if listed) its model.
+      // Skipped while the user has unsaved edits, which a late response must not erase.
       const pid = toProviderId(String(data.llm_provider));
       const model = String(data.model || "");
       const listed = modelsForProvider(pid).find((m) => m.value !== "custom" && cloudModelId(pid, m.value) === model);
@@ -287,9 +292,10 @@ function ConnectionsCard({
         }
         if (todo.some(([key]) => key === "GITHUB_TOKEN")) tokenAdopted();
       }
+      // Clear only what was submitted: text typed while the save was pending stays.
       setDrafts((d) => {
         const next = { ...d };
-        for (const [, field] of pairs) if (!keep.includes(field)) next[field] = "";
+        for (const [, val, field] of todo) if (!keep.includes(field) && d[field].trim() === val) next[field] = "";
         return next;
       });
       void refresh();
@@ -299,11 +305,21 @@ function ConnectionsCard({
   const saveLlm = async () => {
     const pid = toProviderId(drafts.llmProvider);
     const chosen = drafts.llmModel === "custom" ? drafts.llmModelCustom.trim() : drafts.llmModel;
-    const model = chosen ? cloudModelId(pid, chosen) : "";
-    const todo: [string, string][] = [["LLM_PROVIDER", pid]];
-    if (model) todo.push(["LLM_MODEL", model]);
-    const saved = await persist(todo, model ? [] : ["LLM_MODEL"], "LLM provider & model");
-    if (saved) void refresh();
+    // A blank model means "the provider's default": store it explicitly so a deploy-time
+    // LLM_MODEL env var cannot silently stay in force.
+    const model = cloudModelId(pid, chosen || defaultModelFor(pid));
+    const saved = await persist(
+      [
+        ["LLM_PROVIDER", pid],
+        ["LLM_MODEL", model],
+      ],
+      [],
+      "LLM provider & model",
+    );
+    if (saved) {
+      llmDirty.current = false;
+      void refresh();
+    }
   };
 
   return (
@@ -1046,7 +1062,8 @@ function GithubAppCard() {
   const [appName, setAppName] = React.useState("PR Agent Control");
   const [org, setOrg] = React.useState("");
   const [created, setCreated] = React.useState<CreatedApp | null>(null);
-  const [health, setHealth] = React.useState<AppHealth | null>(null);
+  // undefined = first check still running, null = backend cannot answer
+  const [health, setHealth] = React.useState<AppHealth | null | undefined>(undefined);
   const base = cloudBase.trim().replace(/\/+$/, "");
   const wantedHook = base ? `${base}/webhooks/github` : "";
 
@@ -1058,6 +1075,13 @@ function GithubAppCard() {
   }, [check]);
 
   const create = async () => {
+    // Re-check right before: an App may already exist (or the first check may still have been running).
+    const existing = await fetchAppHealth();
+    setHealth(existing);
+    if (existing?.configured) {
+      toastErr("GitHub App", "An App is already set up on this backend; use Check App.");
+      return;
+    }
     try {
       const res = await tauriInvoke<CreatedApp>("github_app_create", {
         backendUrl: base,
@@ -1107,7 +1131,7 @@ function GithubAppCard() {
       }
       footer={
         <ButtonRow>
-          <AsyncButton onClick={create} disabled={!appName.trim() || !base || !!health?.configured}>
+          <AsyncButton onClick={create} disabled={!appName.trim() || !base || health === undefined || !!health?.configured}>
             <Plug /> {health?.configured ? "App already set up" : "Create GitHub App"}
           </AsyncButton>
           {installUrl ? (
