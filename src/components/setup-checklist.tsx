@@ -4,7 +4,7 @@ import { AsyncButton, Hint, Section, StatusDot } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { apiGet, apiMut } from "@/lib/api";
-import { fetchAppHealth, type AppHealth } from "@/lib/cloud";
+import { fetchAppHealth, saveCloudSettings, type AppHealth } from "@/lib/cloud";
 import {
   connectGitHubOAuth,
   connectOpenRouterOAuth,
@@ -41,8 +41,10 @@ export function SetupChecklist({ active }: { active: boolean }) {
   const setTab = useApp((s) => s.setTab);
   const cloudBase = useApp((s) => s.cloudBase);
   const backend = useApp((s) => s.backendUrl);
+  const sessionOrKey = useApp((s) => s.secrets.openrouter);
   const revision = useOAuth((s) => s.revision);
   const oauthStatus = useOAuth((s) => s.status);
+  const lastOrCloudErr = useOAuth((s) => s.lastOpenRouterCloudError);
   const [status, setStatus] = React.useState<any>(undefined); // undefined = loading, null = unreachable
   const [health, setHealth] = React.useState<AppHealth | null | undefined>(undefined);
   const [agents, setAgents] = React.useState<number | null>(null);
@@ -125,27 +127,41 @@ export function SetupChecklist({ active }: { active: boolean }) {
         : "In-memory only: agents, runs and cloud settings are lost on restart. Connect Redis Cloud on FastAPI Cloud (sets REDIS_URL).",
     });
     let llmAction: Step["action"];
+    let llmDetail = llmReady
+      ? `${llm} · ${status.model}`
+      : `${llm} has no API key on the backend. Connect with 1 click or add it under Integrations below.`;
     if (!llmReady) {
-      if (llm === "openrouter") {
+      if (llm === "openrouter" && sessionOrKey) {
+        llmDetail = `OpenRouter key is in this session, but could not be saved to the backend${
+          lastOrCloudErr ? ` (${lastOrCloudErr})` : ""
+        }. Ensure BACKEND_API_TOKEN is set on the backend and in Settings, then click Save session key to backend.`;
+        llmAction = {
+          label: "Save session key to backend",
+          run: async () => {
+            try {
+              await saveCloudSettings({ OPENROUTER_API_KEY: sessionOrKey });
+              useOAuth.setState({ lastOpenRouterCloudError: "" });
+              toastOk("Saved to cloud backend", "OPENROUTER_API_KEY");
+              await refresh();
+            } catch (e) {
+              toastErr("Backend save failed", errText(e, 240));
+            }
+          },
+        };
+      } else if (llm === "openrouter") {
         llmAction = {
           label: "Connect OpenRouter",
-          run: async () => {
-            if (await connectOpenRouterOAuth()) await refresh();
-          },
+          run: () => connectOpenRouterOAuth(),
         };
       } else if (llm === "commandcode" && oauthStatus.cli.commandcode_cli) {
         llmAction = {
           label: "Import CLI key",
-          run: async () => {
-            if (await importCommandCodeCli()) await refresh();
-          },
+          run: () => importCommandCodeCli(),
         };
       } else if (llm === "opencode_go" && oauthStatus.cli.opencode_cli) {
         llmAction = {
           label: "Import CLI key",
-          run: async () => {
-            if (await importOpenCodeCli()) await refresh();
-          },
+          run: () => importOpenCodeCli(),
         };
       }
     }
@@ -153,9 +169,7 @@ export function SetupChecklist({ active }: { active: boolean }) {
       id: "llm",
       title: "Review model",
       state: llmReady ? "ok" : "warn",
-      detail: llmReady
-        ? `${llm} · ${status.model}`
-        : `${llm} has no API key on the backend. Connect with 1 click or add it under Integrations below.`,
+      detail: llmDetail,
       action: llmAction,
     });
     const slugOk = !!(health && health.configured && health.ok);
@@ -167,9 +181,7 @@ export function SetupChecklist({ active }: { active: boolean }) {
     if (health && !health.configured) {
       appAction = {
         label: "Connect GitHub App",
-        run: async () => {
-          if (await connectGitHubOAuth({ forceNewApp: true })) await refresh();
-        },
+        run: () => connectGitHubOAuth({ forceNewApp: true }),
       };
     } else if (health && health.configured && !health.ok && installUrl) {
       appAction = {

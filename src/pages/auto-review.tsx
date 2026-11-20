@@ -40,6 +40,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import {
   actionsUrl,
   isActive,
+  isPrAgentDeployed,
   optionsProblem,
   repoState,
   sameOptions,
@@ -167,7 +168,7 @@ function SetupCard() {
   const [manualOr, setManualOr] = React.useState(false);
 
   const activeRepoCount = React.useMemo(
-    () => Object.values(statusMap).filter((st) => isActive(repoState(st))).length,
+    () => Object.values(statusMap).filter((st) => isPrAgentDeployed(repoState(st))).length,
     [statusMap],
   );
 
@@ -206,8 +207,8 @@ function SetupCard() {
             <ButtonRow>
               <AsyncButton
                 size="sm"
-                onClick={connectOpenRouterOAuth}
-                disabled={activeFlow === "openrouter"}
+                onClick={() => connectOpenRouterOAuth()}
+                disabled={activeFlow !== null}
               >
                 <Plug /> {orKey ? "Reconnect OpenRouter" : "Connect with OpenRouter"}
               </AsyncButton>
@@ -473,6 +474,7 @@ const STATE_TONE: Record<RepoState, "success" | "warning" | "danger" | "outline"
   "needs-key": "danger",
   openrabbit: "success",
   backend: "outline",
+  "hook-unavailable": "outline",
   off: "outline",
 };
 
@@ -515,7 +517,7 @@ function RepoRow({
 
   let primary: { label: string; run: () => unknown; variant: "default" | "outline" } | null = null;
   if (repo.admin) {
-    if (state === "off" || state === "unknown" || state === "backend") primary = { label: "Enable", run: () => enableWithSwitch([name]), variant: "default" };
+    if (state === "off" || state === "unknown" || state === "backend" || state === "hook-unavailable") primary = { label: "Enable", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "outdated" || state === "custom" || differs) primary = { label: "Update", run: () => enableRepos([name]), variant: "default" };
     else if (state === "needs-key") primary = { label: "Add key", run: () => enableWithSwitch([name]), variant: "default" };
     else if (state === "openrabbit") primary = { label: "Switch to PR Agent", run: () => enableWithSwitch([name]), variant: "outline" };
@@ -523,7 +525,7 @@ function RepoRow({
   }
   const active = isActive(state) || state === "needs-key";
   // /review etc. are answered only by the PR Agent workflow with its secret in place.
-  const runsPrAgent = state === "on" || state === "outdated" || state === "custom";
+  const runsPrAgent = isPrAgentDeployed(state);
 
   return (
     <div
@@ -839,7 +841,7 @@ function ReposCard({ active }: { active: boolean }) {
     if (q && !v.repo.full_name.toLowerCase().includes(q)) return false;
     if (filter === "active") return isActive(v.state);
     if (filter === "attention") return needsAttention(v.state, v.differs);
-    if (filter === "off") return v.state === "off";
+    if (filter === "off") return v.state === "off" || v.state === "hook-unavailable";
     return true;
   });
   // The button's count and its action use the same candidates: the repos shown, not yet checked.

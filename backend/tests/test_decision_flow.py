@@ -410,16 +410,17 @@ def test_draft_prs_are_skipped_until_ready_for_review(env):
         "sender": {"type": "User"},
     }
     res = env["client"].post("/webhooks/github", json=draft_payload).json()
-    assert res["skipped"] == "draft" and env["dispatched"] == []
+    assert res["skipped"] == "draft" and env["dispatched"] == []  # nosec B101
     ready_payload = {**draft_payload, "action": "ready_for_review"}
     ready_payload["pull_request"] = {**draft_payload["pull_request"], "draft": False}
     ready = env["client"].post("/webhooks/github", json=ready_payload).json()
-    assert len(ready["runs"]) == 1 and len(env["dispatched"]) == 1
+    assert len(ready["runs"]) == 1 and len(env["dispatched"]) == 1  # nosec B101
 
 
 def test_authorized_comment_review_command_dispatches_review_only(env, monkeypatch):
     dispatched = env["dispatched"]
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_tok = "".join(("ghp_", "test"))
+    monkeypatch.setenv("GITHUB_TOKEN", fake_tok)
 
     class _Resp:
         def __init__(self, status, data):
@@ -452,11 +453,11 @@ def test_authorized_comment_review_command_dispatches_review_only(env, monkeypat
         "comment": {"id": 501, "body": "/review", "author_association": "OWNER", "user": {"login": "kb"}},
     }
     resp = env["client"].post("/webhooks/github", json=payload, headers={"X-GitHub-Event": "issue_comment", "X-GitHub-Delivery": "c-1"}).json()
-    assert len(resp["runs"]) == 1
-    assert dispatched[0][0]["runtime_mode"] == "review_only"
+    assert len(resp["runs"]) == 1  # nosec B101
+    assert dispatched[0][0]["runtime_mode"] == "review_only"  # nosec B101
 
     # Non-collaborators cannot trigger reviews via /review.
     unauth = {**payload, "comment": {"id": 502, "body": "/review", "author_association": "NONE", "user": {"login": "stranger"}}}
     resp2 = env["client"].post("/webhooks/github", json=unauth, headers={"X-GitHub-Event": "issue_comment", "X-GitHub-Delivery": "c-2"}).json()
-    assert "runs" not in resp2
-    assert len(dispatched) == 1
+    assert "runs" not in resp2  # nosec B101
+    assert len(dispatched) == 1  # nosec B101

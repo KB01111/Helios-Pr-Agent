@@ -115,8 +115,8 @@ export function SettingsPage({ active }: { active: boolean }) {
             </div>
             <AsyncButton
               variant="outline"
-              onClick={connectOpenRouterOAuth}
-              disabled={activeFlow === "openrouter"}
+              onClick={() => connectOpenRouterOAuth({ persist: false })}
+              disabled={activeFlow !== null}
             >
               <Plug /> {openrouter ? "Reconnect OpenRouter" : "Connect with OpenRouter"}
             </AsyncButton>

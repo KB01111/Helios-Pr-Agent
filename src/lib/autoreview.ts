@@ -118,6 +118,7 @@ export type RepoState =
   | "needs-key" // workflow present but OPENROUTER_API_KEY secret missing
   | "openrabbit" // reviewed by the OpenRabbit workflow
   | "backend" // only the backend webhook reviews this repo
+  | "hook-unavailable" // no workflow, and token lacks permission to read repo webhooks (HTTP 403)
   | "off";
 
 export function repoState(st: any): RepoState {
@@ -137,12 +138,18 @@ export function repoState(st: any): RepoState {
     return "on";
   }
   if (st.webhook && st.webhook.configured) return "backend";
+  if (st.webhook && st.webhook.unavailable) return "hook-unavailable";
   return "off";
 }
 
 /** Auto review is running in some form (any reviewer posts on new PRs). */
 export function isActive(state: RepoState) {
   return state === "on" || state === "outdated" || state === "custom" || state === "openrabbit" || state === "backend";
+}
+
+/** True only when the PR Agent GitHub Actions workflow is deployed with its secret. */
+export function isPrAgentDeployed(state: RepoState) {
+  return state === "on" || state === "outdated" || state === "custom";
 }
 
 export const STATE_LABEL: Record<RepoState, string> = {
@@ -154,6 +161,7 @@ export const STATE_LABEL: Record<RepoState, string> = {
   "needs-key": "Missing API key",
   openrabbit: "On · OpenRabbit",
   backend: "On · backend webhook",
+  "hook-unavailable": "No Action · webhook unreadable",
   off: "Off",
 };
 

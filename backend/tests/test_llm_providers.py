@@ -248,6 +248,15 @@ def test_openrouter_vendor_prefix_is_stripped_while_routers_stay():
     assert pr.normalize_openrouter_model("openai/gpt-4o") == "openai/gpt-4o"  # nosec B101
 
 
+def test_glob_matches_preserves_dot_prefixed_paths_and_supports_brackets():
+    assert pr._glob_matches(".github/workflows/ci.yml", ".github/**")  # nosec B101
+    assert not pr._glob_matches("github/workflows/ci.yml", ".github/**")  # nosec B101
+    assert pr._glob_matches("./.github/workflows/ci.yml", "./.github/**")  # nosec B101
+    assert pr._glob_matches("src/a.py", "src/[ab].py")  # nosec B101
+    assert not pr._glob_matches("src/c.py", "src/[ab].py")  # nosec B101
+    assert pr._glob_matches("src/c.py", "src/[!ab].py")  # nosec B101
+
+
 def test_review_normalizes_openrouter_model_uses_default_prompt_and_formats_heading(monkeypatch):
     calls = []
     _install_fake_httpx(monkeypatch, calls)

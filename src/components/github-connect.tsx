@@ -49,9 +49,21 @@ export function GithubConnect({
     if (signingIn || userCode) setMoreOpen(true);
   }, [signingIn, userCode]);
 
-  const busy = activeFlow === "github" || activeFlow === "github-cli" || signingIn;
+  const busy = activeFlow !== null || signingIn;
   const ghLogin = oauthStatus.cli.gh_login;
   const installUrl = oauthStatus.github.install_url;
+
+  const submitPat = async () => {
+    await cancelOAuth();
+    if (await signInWithPat(pat)) {
+      setPat("");
+    }
+  };
+
+  const beginDeviceFlow = async () => {
+    await cancelOAuth();
+    await startDeviceFlow();
+  };
 
   return (
     <div className="grid gap-3">
@@ -111,12 +123,13 @@ export function GithubConnect({
                 <SecretInput
                   id={`${uid}-gh-pat`}
                   value={pat}
+                  disabled={busy}
                   placeholder="ghp_… / github_pat_…"
                   onChange={(e) => setPat(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && void signInWithPat(pat).then((ok) => ok && setPat(""))}
+                  onKeyDown={(e) => e.key === "Enter" && !busy && void submitPat()}
                 />
               </div>
-              <AsyncButton variant="outline" onClick={async () => (await signInWithPat(pat)) && setPat("")}>
+              <AsyncButton variant="outline" disabled={busy} onClick={submitPat}>
                 <KeyRound /> Use PAT
               </AsyncButton>
             </div>
@@ -132,12 +145,13 @@ export function GithubConnect({
                 id={`${uid}-gh-client-id`}
                 placeholder="Ov23…"
                 value={clientId}
+                disabled={busy}
                 onChange={(e) => setClientId(e.target.value)}
                 autoComplete="off"
               />
             </Field>
             <ButtonRow className="sm:mb-6">
-              <AsyncButton variant="outline" onClick={startDeviceFlow} disabled={signingIn}>
+              <AsyncButton variant="outline" onClick={beginDeviceFlow} disabled={busy}>
                 <GitBranch /> Start device flow
               </AsyncButton>
               {signingIn ? (

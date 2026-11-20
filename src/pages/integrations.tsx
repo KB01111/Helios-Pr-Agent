@@ -149,6 +149,7 @@ function ConnectionsCard({
   const revision = useOAuth((s) => s.revision);
   const vercelUser = useOAuth((s) => s.vercelUser);
   const vercelTeams = useOAuth((s) => s.vercelTeams);
+  const vercelTeamsFromSavedToken = useOAuth((s) => s.vercelTeamsFromSavedToken);
 
   const [dots, setDots] = React.useState<Record<ProviderKey, Dot>>({
     github: "warn",
@@ -177,8 +178,12 @@ function ConnectionsCard({
   };
 
   const checkApp = React.useCallback(async () => {
+    const mine = ++seq.current;
+    const targetBackend = backendUrl();
     const h = await fetchAppHealth();
-    setHealth(h);
+    if (mine === seq.current && backendUrl() === targetBackend) {
+      setHealth(h);
+    }
   }, []);
 
   const refresh = React.useCallback(async () => {
@@ -455,9 +460,19 @@ function ConnectionsCard({
     dots.openrouter === "ok" ? "success" : sessionOr ? "warning" : "outline";
 
   const vercelSaveTeam = async (teamId: string) => {
-    patch({ vercelTeam: teamId });
     if (!teamId) return;
-    await persist([["VERCEL_TEAM_ID", teamId]], [], "Vercel team");
+    if (!vercelTeamsFromSavedToken || drafts.vercelToken.trim()) {
+      patch({ vercelTeam: teamId });
+      toastOk("Team staged", "Click Save token & team under Manual token to apply this token and team together.");
+      return;
+    }
+    const prev = drafts.vercelTeam;
+    patch({ vercelTeam: teamId });
+    const ok = await persist([["VERCEL_TEAM_ID", teamId]], [], "Vercel team");
+    if (!ok) {
+      patch({ vercelTeam: prev });
+      return;
+    }
     void refresh();
   };
 
@@ -505,7 +520,7 @@ function ConnectionsCard({
             <AsyncButton
               size="sm"
               onClick={() => connectGitHubOAuth()}
-              disabled={activeFlow === "github" || activeFlow === "github-cli"}
+              disabled={activeFlow !== null}
             >
               <GitBranch /> {sessionGh ? "Reconnect GitHub" : "Connect with GitHub"}
             </AsyncButton>
@@ -514,7 +529,7 @@ function ConnectionsCard({
                 variant="outline"
                 size="sm"
                 onClick={() => importGitHubCli(true)}
-                disabled={activeFlow === "github" || activeFlow === "github-cli"}
+                disabled={activeFlow !== null}
               >
                 <Terminal />{" "}
                 {oauthStatus.cli.gh_login ? `Use GitHub CLI (@${oauthStatus.cli.gh_login})` : "Use GitHub CLI"}
@@ -611,7 +626,7 @@ function ConnectionsCard({
                   variant="outline"
                   size="sm"
                   onClick={() => connectGitHubOAuth({ forceNewApp: true, appName, org })}
-                  disabled={activeFlow === "github" || !appName.trim()}
+                  disabled={activeFlow !== null || !appName.trim()}
                 >
                   <Plug /> Create / replace GitHub App
                 </AsyncButton>
@@ -620,8 +635,12 @@ function ConnectionsCard({
                     variant="ghost"
                     size="sm"
                     onClick={async () => {
-                      await clearOAuthClient("github");
-                      toastOk("Cleared saved GitHub OAuth client", "Next Connect will set up a fresh GitHub App.");
+                      try {
+                        await clearOAuthClient("github");
+                        toastOk("Cleared saved GitHub OAuth client", "Next Connect will set up a fresh GitHub App.");
+                      } catch (e) {
+                        toastErr("Could not reset GitHub OAuth client", errText(e, 200));
+                      }
                     }}
                   >
                     <Trash2 /> Reset saved OAuth client
@@ -677,7 +696,7 @@ function ConnectionsCard({
           />
 
           <ButtonRow>
-            <AsyncButton size="sm" onClick={connectOpenRouterOAuth} disabled={activeFlow === "openrouter"}>
+            <AsyncButton size="sm" onClick={() => connectOpenRouterOAuth()} disabled={activeFlow !== null}>
               <Plug /> {dots.openrouter === "ok" || sessionOr ? "Reconnect OpenRouter" : "Connect with OpenRouter"}
             </AsyncButton>
             {activeFlow === "openrouter" ? (
@@ -807,7 +826,7 @@ function ConnectionsCard({
               variant={oauthStatus.cli.commandcode_cli ? "default" : "outline"}
               size="sm"
               onClick={importCommandCodeCli}
-              disabled={activeFlow === "commandcode-cli"}
+              disabled={activeFlow !== null}
             >
               <Terminal /> Import from CLI
             </AsyncButton>
@@ -859,7 +878,7 @@ function ConnectionsCard({
               variant={oauthStatus.cli.opencode_cli ? "default" : "outline"}
               size="sm"
               onClick={importOpenCodeCli}
-              disabled={activeFlow === "opencode-cli"}
+              disabled={activeFlow !== null}
             >
               <Terminal /> Import from CLI
             </AsyncButton>
@@ -909,7 +928,7 @@ function ConnectionsCard({
               <AsyncButton
                 size="sm"
                 onClick={importVercelCli}
-                disabled={activeFlow === "vercel-cli" || activeFlow === "vercel"}
+                disabled={activeFlow !== null}
               >
                 <Terminal /> Import from Vercel CLI
               </AsyncButton>
@@ -919,7 +938,7 @@ function ConnectionsCard({
                 variant={oauthStatus.cli.vercel_cli ? "outline" : "default"}
                 size="sm"
                 onClick={connectVercelOAuth}
-                disabled={activeFlow === "vercel" || activeFlow === "vercel-cli"}
+                disabled={activeFlow !== null}
               >
                 <Plug /> Connect with Vercel
               </AsyncButton>
@@ -1045,8 +1064,12 @@ function ConnectionsCard({
                     variant="ghost"
                     size="sm"
                     onClick={async () => {
-                      await clearOAuthClient("vercel");
-                      toastOk("Cleared Vercel OAuth client");
+                      try {
+                        await clearOAuthClient("vercel");
+                        toastOk("Cleared Vercel OAuth client");
+                      } catch (e) {
+                        toastErr("Could not clear Vercel OAuth client", errText(e, 200));
+                      }
                     }}
                   >
                     Clear
@@ -1228,8 +1251,24 @@ function RepoRow({ name }: { name: string }) {
       <div className="flex flex-wrap items-center gap-1.5 pl-6">
         <StepPill
           label="hook"
-          state={st ? (webhook.configured ? "ok" : mode === "actions" ? "" : "warn") : ""}
-          title={webhook.error || generic || (mode === "actions" ? "not needed: reviews run in GitHub Actions" : "")}
+          state={
+            st
+              ? webhook.configured
+                ? "ok"
+                : mode === "actions" || webhook.unavailable
+                  ? ""
+                  : "warn"
+              : ""
+          }
+          title={
+            webhook.error ||
+            generic ||
+            (webhook.unavailable
+              ? "token lacks permission to inspect repo webhooks (HTTP 403)"
+              : mode === "actions"
+                ? "not needed: reviews run in GitHub Actions"
+                : "")
+          }
         />
         <StepPill
           label="workflow"
@@ -1301,19 +1340,21 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
   }, [log]);
 
   const orKey = orKeyDraft.trim() || sessionOrKey || "";
-  const base = resolvePublicWebhookBase(cloudBase, backend) || webhookBase(cloudBase);
-  let isLocal = false;
-  try {
-    isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/i.test(new URL(base).hostname);
-  } catch {
-    /* not a URL */
-  }
+  const publicBase = resolvePublicWebhookBase(cloudBase, backend);
+  const base = mode === "actions" ? publicBase || webhookBase(cloudBase) : publicBase;
 
   const q = filter.trim().toLowerCase();
   const visible = repos.filter((r) => !q || r.full_name.toLowerCase().includes(q));
 
-  const run = (retryOnly: boolean) =>
-    configure({
+  const run = (retryOnly: boolean) => {
+    if (mode !== "actions" && !publicBase) {
+      toastErr(
+        "Webhook URL required",
+        "Set a public HTTPS Cloud app base URL (or HTTPS Settings Backend URL) before configuring webhook modes.",
+      );
+      return;
+    }
+    return configure({
       retryOnly,
       mode,
       base,
@@ -1326,6 +1367,7 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
       agentCreate,
       onSecretGenerated: setSecretText,
     });
+  };
 
   return (
     <Section
@@ -1465,13 +1507,12 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
               </Select>
             </Field>
           </FieldGrid>
-          <Hint className={mode !== "actions" && isLocal ? "text-warning" : ""}>
+          <Hint className={mode !== "actions" && !publicBase ? "text-warning" : ""}>
             {mode === "actions"
               ? "GitHub Actions mode: no webhook and no public backend needed. Reviews run inside GitHub."
-              : `Webhook target: ${base}/webhooks/github` +
-                (isLocal
-                  ? " — GitHub cannot deliver webhooks to localhost/127.0.0.1; use a public tunnel or a deployed URL."
-                  : "")}
+              : publicBase
+                ? `Webhook target: ${publicBase}/webhooks/github`
+                : "Webhook target requires a public HTTPS URL — set Cloud app base URL below (or an HTTPS Settings Backend URL)."}
           </Hint>
           <Hint>
             The base URL comes from “Cloud app base URL” in the webhook URL card below; it falls back to an HTTPS
@@ -1508,11 +1549,20 @@ function RepoSetupCard({ orKeyDraft }: { orKeyDraft: string }) {
             </Field>
           </FieldGrid>
           <ButtonRow>
-            <Button type="button" disabled={batchRunning || selected.length === 0} onClick={() => run(false)}>
+            <Button
+              type="button"
+              disabled={batchRunning || selected.length === 0 || (mode !== "actions" && !publicBase)}
+              onClick={() => run(false)}
+            >
               <Settings2 /> Configure selected ({selected.length})
             </Button>
             {failed.length > 0 && !batchRunning ? (
-              <Button type="button" variant="outline" onClick={() => run(true)}>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={mode !== "actions" && !publicBase}
+                onClick={() => run(true)}
+              >
                 <RotateCcw /> Retry failed ({failed.length})
               </Button>
             ) : null}
@@ -1580,6 +1630,11 @@ function WebhookCard() {
           autoComplete="off"
         />
       </Field>
+      {cloudBase.trim() && !base ? (
+        <Hint className="text-warning">
+          GitHub webhooks require a public <code>https://</code> URL (not localhost or a private IP).
+        </Hint>
+      ) : null}
       <Hint>
         Payload URL: <code className="break-all">{url}</code>
       </Hint>

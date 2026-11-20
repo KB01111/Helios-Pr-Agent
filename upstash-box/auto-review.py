@@ -99,13 +99,18 @@ def review_with_openrouter(title, diff):
         "Be concrete, skip nitpicks.\n\nPR title: " + title + "\n\nDiff (truncated):\n" + diff[:MAX_DIFF_CHARS]
     )
     try:
-        content = _call_openrouter(MODEL, prompt)
-        if content or MODEL == FALLBACK_MODEL:
+        content = (_call_openrouter(MODEL, prompt) or "").strip()
+        if content:
             return content
+        if MODEL == FALLBACK_MODEL:
+            raise RuntimeError("OpenRouter returned an empty review response")
     except urllib.error.HTTPError as e:
         if e.code not in RETRY_CODES or MODEL == FALLBACK_MODEL:
             raise
-    return _call_openrouter(FALLBACK_MODEL, prompt)
+    fallback_content = (_call_openrouter(FALLBACK_MODEL, prompt) or "").strip()
+    if not fallback_content:
+        raise RuntimeError("OpenRouter fallback returned an empty review response")
+    return fallback_content
 
 
 def save_state(done):

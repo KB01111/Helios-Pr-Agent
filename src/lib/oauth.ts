@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { agentList, refreshAgents } from "./actions";
 import { apiGet, apiMut, backendUrl } from "./api";
-import { tokenAdopted, useGh } from "./github";
+import { cancelDeviceFlow, tokenAdopted, useGh } from "./github";
 import { useApp } from "./store";
 import { errText, tauriInvoke, tauriUnavailable } from "./tauri";
 import { toastErr, toastOk } from "./toast";
@@ -73,6 +73,8 @@ interface OAuthStoreState {
   revision: number;
   vercelUser: string;
   vercelTeams: VercelTeam[];
+  vercelTeamsFromSavedToken: boolean;
+  lastOpenRouterCloudError: string;
   bump: () => void;
 }
 
@@ -83,15 +85,27 @@ export const useOAuth = create<OAuthStoreState>((set) => ({
   revision: 0,
   vercelUser: "",
   vercelTeams: [],
+  vercelTeamsFromSavedToken: false,
+  lastOpenRouterCloudError: "",
   bump: () => set((s) => ({ revision: s.revision + 1 })),
 }));
 
 let flowSeq = 0;
+let statusSeq = 0;
 
-function startFlow(flow: Exclude<ActiveOAuthFlow, null>, flowMessage: string): number {
+function startFlow(flow: Exclude<ActiveOAuthFlow, null>, flowMessage: string): number | null {
+  const current = useOAuth.getState().activeFlow;
+  if (current) {
+    toastErr("OAuth in progress", `Finish or cancel the active ${current} connection first.`);
+    return null;
+  }
   const id = ++flowSeq;
   useOAuth.setState({ activeFlow: flow, flowMessage });
   return id;
+}
+
+function isFlowCurrent(id: number): boolean {
+  return flowSeq === id && useOAuth.getState().activeFlow !== null;
 }
 
 function finishFlow(id: number) {
@@ -100,57 +114,123 @@ function finishFlow(id: number) {
   }
 }
 
-function isLocalHostname(host: string): boolean {
-  const h = host.toLowerCase();
-  return h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1" || h === "[::1]";
+function isNonPublicIpv4(host: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if (octets.some((o) => o < 0 || o > 255)) return true;
+  const [a, b] = octets;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 255 && octets[1] === 255 && octets[2] === 255 && octets[3] === 255)
+  );
 }
 
-/**
- * Resolve the public HTTPS base URL used for GitHub webhooks. Uses `cloudBase`
- * first, then falls back to `backend` if it is a non-local HTTPS URL.
- */
-export function resolvePublicWebhookBase(cloudBase: string, backend: string): string {
-  const explicit = cloudBase.trim().replace(/\/+$/, "");
-  if (explicit) return explicit;
-  const candidate = backend.trim().replace(/\/+$/, "");
+function isLocalOrPrivateHostname(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h === "0.0.0.0" || h === "::1" || h === "::") {
+    return true;
+  }
+  if (isNonPublicIpv4(h)) return true;
+  if (h.includes(":")) {
+    if (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) {
+      return true;
+    }
+    const v4Mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    if (v4Mapped && isNonPublicIpv4(v4Mapped[1])) return true;
+  }
+  return false;
+}
+
+/** Validate a single candidate URL as a public HTTPS webhook base. Returns "" if invalid. */
+export function validatePublicHttpsUrl(raw: string): string {
+  const candidate = raw.trim().replace(/\/+$/, "");
   if (!candidate) return "";
   try {
     const parsed = new URL(candidate);
-    if (parsed.protocol === "https:" && !isLocalHostname(parsed.hostname)) {
-      return candidate;
-    }
+    if (parsed.protocol !== "https:") return "";
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return "";
+    if (isLocalOrPrivateHostname(parsed.hostname)) return "";
+    return candidate;
   } catch {
-    /* ignore malformed URL */
+    return "";
   }
-  return "";
+}
+
+/**
+ * Resolve the public HTTPS base URL used for GitHub webhooks.
+ * If `cloudBase` is non-empty, it must be a valid public HTTPS URL (invalid overrides are not
+ * silently replaced by `backend`, so the UI can warn the user about their override).
+ * If `cloudBase` is empty, falls back to `backend` when `backend` is a valid public HTTPS URL.
+ */
+export function resolvePublicWebhookBase(cloudBase: string, backend: string): string {
+  if (cloudBase.trim()) {
+    return validatePublicHttpsUrl(cloudBase);
+  }
+  return validatePublicHttpsUrl(backend);
 }
 
 /**
  * Ensure the backend has at least one review agent configured so webhooks can
  * trigger reviews immediately after connecting the GitHub App.
+ * Bound to a single captured backend URL + API token and uses a deterministic
+ * agent id (`pr-agent-control`) for idempotency.
  */
 export async function ensureDefaultBackendAgent(): Promise<{ created: boolean; count: number }> {
-  const existing = agentList(await apiGet("/agents"));
+  const targetBase = backendUrl();
+  const targetToken = useApp.getState().secrets.api;
+  const existing = agentList(await apiGet("/agents", targetBase));
   if (existing.length > 0) {
     return { created: false, count: existing.length };
   }
-  await apiMut("POST", "/agents", {
-    name: "pr-agent-control",
-    system_prompt: "",
-    target_repos: [],
-    trigger: "on_commit",
-    trigger_label: null,
-    runtime_mode: "review_only",
-  });
-  void refreshAgents();
+  if (backendUrl() !== targetBase) {
+    throw new Error("Backend URL changed while checking agents; please retry.");
+  }
+  try {
+    await apiMut(
+      "POST",
+      "/agents",
+      {
+        id: "pr-agent-control",
+        name: "pr-agent-control",
+        system_prompt: "",
+        target_repos: [],
+        trigger: "on_commit",
+        trigger_label: null,
+        runtime_mode: "review_only",
+      },
+      targetBase,
+      targetToken,
+    );
+  } catch (e) {
+    if (!/409|already exists/i.test(String(e))) {
+      throw e;
+    }
+    if (backendUrl() === targetBase) {
+      void refreshAgents();
+    }
+    return { created: false, count: 1 };
+  }
+  if (backendUrl() === targetBase) {
+    void refreshAgents();
+  }
   return { created: true, count: 1 };
 }
 
 export async function refreshOAuthStatus(): Promise<OAuthStatus | null> {
+  const mine = ++statusSeq;
   try {
     const status = await tauriInvoke<OAuthStatus>("oauth_status");
-    useOAuth.setState({ status });
-    return status;
+    if (mine === statusSeq) {
+      useOAuth.setState({ status });
+    }
+    return useOAuth.getState().status;
   } catch (e) {
     if (!tauriUnavailable(e)) {
       console.warn("oauth_status failed:", e);
@@ -177,6 +257,7 @@ export async function saveOAuthClient(
   clientSecret?: string,
   isApp?: boolean,
 ): Promise<void> {
+  ++statusSeq;
   await tauriInvoke("oauth_save_client", {
     provider,
     clientId: clientId.trim(),
@@ -187,6 +268,7 @@ export async function saveOAuthClient(
 }
 
 export async function clearOAuthClient(provider: "github" | "vercel"): Promise<void> {
+  ++statusSeq;
   await tauriInvoke("oauth_clear_client", { provider });
   await refreshOAuthStatus();
 }
@@ -197,8 +279,10 @@ function summarizePersistTarget(res: { cloud_saved?: boolean; env_path?: string 
   return "Saved in session";
 }
 
-export async function connectOpenRouterOAuth(): Promise<boolean> {
+export async function connectOpenRouterOAuth(opts?: { persist?: boolean }): Promise<boolean> {
+  const persist = opts?.persist ?? true;
   const id = startFlow("openrouter", "Browser opened — click Authorize on OpenRouter…");
+  if (id === null) return false;
   const nonce = useApp.getState().clearNonce;
   try {
     const res = await tauriInvoke<{
@@ -209,20 +293,29 @@ export async function connectOpenRouterOAuth(): Promise<boolean> {
       env_path?: string | null;
       local_error?: string | null;
     }>("openrouter_oauth_connect", {
-      settingsUrl: backendUrl() || null,
-      apiToken: useApp.getState().secrets.api || null,
+      settingsUrl: persist ? backendUrl() || null : null,
+      apiToken: persist ? useApp.getState().secrets.api || null : null,
+      persist,
     });
-    if (useApp.getState().clearNonce === nonce && res.key) {
+    if (!isFlowCurrent(id) || useApp.getState().clearNonce !== nonce) {
+      return false;
+    }
+    if (res.key) {
       useApp.getState().setSecret("openrouter", res.key);
     }
+    useOAuth.setState({
+      lastOpenRouterCloudError: persist && !res.cloud_saved ? String(res.cloud_error || "") : "",
+    });
     useOAuth.getState().bump();
-    const target = summarizePersistTarget(res);
+    const target = persist ? summarizePersistTarget(res) : "Saved in session only";
     toastOk("OpenRouter connected", res.user_id ? `${target} (${res.user_id})` : target);
     return true;
   } catch (e) {
-    const msg = errText(e, 260);
-    if (!/cancelled/i.test(msg)) {
-      toastErr("OpenRouter OAuth failed", msg);
+    if (isFlowCurrent(id)) {
+      const msg = errText(e, 260);
+      if (!/cancelled/i.test(msg)) {
+        toastErr("OpenRouter OAuth failed", msg);
+      }
     }
     return false;
   } finally {
@@ -244,6 +337,8 @@ export async function connectGitHubOAuth(opts?: {
       ? "Browser opened — approve GitHub App setup, then install it on your repositories…"
       : "Browser opened — click Authorize on GitHub…",
   );
+  if (id === null) return false;
+  cancelDeviceFlow();
   const nonce = useApp.getState().clearNonce;
   try {
     const res = await tauriInvoke<{
@@ -261,6 +356,7 @@ export async function connectGitHubOAuth(opts?: {
       cloud_error?: string | null;
       env_path?: string | null;
       local_error?: string | null;
+      client_save_error?: string | null;
     }>("github_oauth_connect", {
       backendUrl: webhookBase || null,
       settingsUrl: backendUrl() || null,
@@ -270,9 +366,12 @@ export async function connectGitHubOAuth(opts?: {
       appName: opts?.appName?.trim() || null,
       org: opts?.org?.trim() || null,
     });
+    if (!isFlowCurrent(id) || useApp.getState().clearNonce !== nonce) {
+      return false;
+    }
 
     const login = String(res.login || "").trim();
-    if (useApp.getState().clearNonce === nonce && res.access_token) {
+    if (res.access_token) {
       useApp.getState().setSecret("github", res.access_token);
     }
     useGh.setState({
@@ -299,12 +398,15 @@ export async function connectGitHubOAuth(opts?: {
     }
     if (res.cloud_saved) parts.push("saved to cloud backend");
     else if (res.env_path) parts.push("saved to backend/.env");
+    if (res.client_save_error) parts.push(`warning: client file not saved (${res.client_save_error})`);
     toastOk("GitHub connected", parts.join(" · ") || "Session ready");
     return true;
   } catch (e) {
-    const msg = errText(e, 260);
-    if (!/cancelled/i.test(msg)) {
-      toastErr("GitHub OAuth failed", msg);
+    if (isFlowCurrent(id)) {
+      const msg = errText(e, 260);
+      if (!/cancelled/i.test(msg)) {
+        toastErr("GitHub OAuth failed", msg);
+      }
     }
     return false;
   } finally {
@@ -314,6 +416,8 @@ export async function connectGitHubOAuth(opts?: {
 
 export async function importGitHubCli(saveToBackend = false): Promise<boolean> {
   const id = startFlow("github-cli", "Importing GitHub CLI session…");
+  if (id === null) return false;
+  cancelDeviceFlow();
   const nonce = useApp.getState().clearNonce;
   try {
     const res = await tauriInvoke<{
@@ -326,8 +430,11 @@ export async function importGitHubCli(saveToBackend = false): Promise<boolean> {
       apiToken: useApp.getState().secrets.api || null,
       saveToBackend,
     });
+    if (!isFlowCurrent(id) || useApp.getState().clearNonce !== nonce) {
+      return false;
+    }
     const login = String(res.login || "").trim();
-    if (useApp.getState().clearNonce === nonce && res.access_token) {
+    if (res.access_token) {
       useApp.getState().setSecret("github", res.access_token);
     }
     useGh.setState({
@@ -344,7 +451,9 @@ export async function importGitHubCli(saveToBackend = false): Promise<boolean> {
     toastOk("GitHub CLI imported", login ? `Signed in as @${login}` : "Session token ready");
     return true;
   } catch (e) {
-    toastErr("GitHub CLI import failed", errText(e, 240));
+    if (isFlowCurrent(id)) {
+      toastErr("GitHub CLI import failed", errText(e, 240));
+    }
     return false;
   } finally {
     finishFlow(id);
@@ -357,6 +466,7 @@ export async function fetchVercelTeams(token: string): Promise<VercelTeam[]> {
   useOAuth.setState({
     vercelUser: String(res.user || ""),
     vercelTeams: teams,
+    vercelTeamsFromSavedToken: false,
   });
   return teams;
 }
@@ -365,6 +475,7 @@ async function handleVercelResult(
   res: {
     user?: string;
     teams?: VercelTeam[];
+    teams_error?: string | null;
     team_id?: string | null;
     cloud_saved?: boolean;
     env_path?: string | null;
@@ -375,11 +486,13 @@ async function handleVercelResult(
   useOAuth.setState({
     vercelUser: String(res.user || ""),
     vercelTeams: teams,
+    vercelTeamsFromSavedToken: true,
   });
   useOAuth.getState().bump();
   const detail = [
     res.user ? `@${res.user}` : "",
     res.team_id ? `team ${res.team_id}` : teams.length > 1 ? `${teams.length} teams found` : "",
+    res.teams_error ? `team lookup warning: ${res.teams_error}` : "",
     summarizePersistTarget(res),
   ]
     .filter(Boolean)
@@ -389,10 +502,12 @@ async function handleVercelResult(
 
 export async function importVercelCli(): Promise<boolean> {
   const id = startFlow("vercel-cli", "Importing Vercel CLI login…");
+  if (id === null) return false;
   try {
     const res = await tauriInvoke<{
       user?: string;
       teams?: VercelTeam[];
+      teams_error?: string | null;
       team_id?: string | null;
       cloud_saved?: boolean;
       env_path?: string | null;
@@ -400,10 +515,13 @@ export async function importVercelCli(): Promise<boolean> {
       settingsUrl: backendUrl() || null,
       apiToken: useApp.getState().secrets.api || null,
     });
+    if (!isFlowCurrent(id)) return false;
     await handleVercelResult(res, "Vercel CLI imported");
     return true;
   } catch (e) {
-    toastErr("Vercel CLI import failed", errText(e, 240));
+    if (isFlowCurrent(id)) {
+      toastErr("Vercel CLI import failed", errText(e, 240));
+    }
     return false;
   } finally {
     finishFlow(id);
@@ -412,10 +530,12 @@ export async function importVercelCli(): Promise<boolean> {
 
 export async function connectVercelOAuth(): Promise<boolean> {
   const id = startFlow("vercel", "Browser opened — authorize Vercel integration…");
+  if (id === null) return false;
   try {
     const res = await tauriInvoke<{
       user?: string;
       teams?: VercelTeam[];
+      teams_error?: string | null;
       team_id?: string | null;
       cloud_saved?: boolean;
       env_path?: string | null;
@@ -423,12 +543,15 @@ export async function connectVercelOAuth(): Promise<boolean> {
       settingsUrl: backendUrl() || null,
       apiToken: useApp.getState().secrets.api || null,
     });
+    if (!isFlowCurrent(id)) return false;
     await handleVercelResult(res, "Vercel connected");
     return true;
   } catch (e) {
-    const msg = errText(e, 260);
-    if (!/cancelled/i.test(msg)) {
-      toastErr("Vercel OAuth failed", msg);
+    if (isFlowCurrent(id)) {
+      const msg = errText(e, 260);
+      if (!/cancelled/i.test(msg)) {
+        toastErr("Vercel OAuth failed", msg);
+      }
     }
     return false;
   } finally {
@@ -438,6 +561,7 @@ export async function connectVercelOAuth(): Promise<boolean> {
 
 export async function importCommandCodeCli(): Promise<boolean> {
   const id = startFlow("commandcode-cli", "Importing Command Code CLI key…");
+  if (id === null) return false;
   const nonce = useApp.getState().clearNonce;
   try {
     const res = await tauriInvoke<{
@@ -448,14 +572,19 @@ export async function importCommandCodeCli(): Promise<boolean> {
       settingsUrl: backendUrl() || null,
       apiToken: useApp.getState().secrets.api || null,
     });
-    if (useApp.getState().clearNonce === nonce && res.key) {
+    if (!isFlowCurrent(id) || useApp.getState().clearNonce !== nonce) {
+      return false;
+    }
+    if (res.key) {
       useApp.getState().setSecret("commandcode", res.key);
     }
     useOAuth.getState().bump();
     toastOk("Command Code connected", summarizePersistTarget(res));
     return true;
   } catch (e) {
-    toastErr("Command Code import failed", errText(e, 240));
+    if (isFlowCurrent(id)) {
+      toastErr("Command Code import failed", errText(e, 240));
+    }
     return false;
   } finally {
     finishFlow(id);
@@ -464,6 +593,7 @@ export async function importCommandCodeCli(): Promise<boolean> {
 
 export async function importOpenCodeCli(): Promise<boolean> {
   const id = startFlow("opencode-cli", "Importing OpenCode Go CLI key…");
+  if (id === null) return false;
   const nonce = useApp.getState().clearNonce;
   try {
     const res = await tauriInvoke<{
@@ -474,14 +604,19 @@ export async function importOpenCodeCli(): Promise<boolean> {
       settingsUrl: backendUrl() || null,
       apiToken: useApp.getState().secrets.api || null,
     });
-    if (useApp.getState().clearNonce === nonce && res.key) {
+    if (!isFlowCurrent(id) || useApp.getState().clearNonce !== nonce) {
+      return false;
+    }
+    if (res.key) {
       useApp.getState().setSecret("opencodeGo", res.key);
     }
     useOAuth.getState().bump();
     toastOk("OpenCode Go connected", summarizePersistTarget(res));
     return true;
   } catch (e) {
-    toastErr("OpenCode Go import failed", errText(e, 240));
+    if (isFlowCurrent(id)) {
+      toastErr("OpenCode Go import failed", errText(e, 240));
+    }
     return false;
   } finally {
     finishFlow(id);

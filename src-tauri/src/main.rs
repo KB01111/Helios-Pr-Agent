@@ -1314,15 +1314,35 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
         return Err("refusing to write unknown env key".into());
     }
     let v = value.trim();
-    if v.is_empty() {
-        return Err(format!("{} is empty — nothing written", k));
-    }
     if v.contains('\n') || v.contains('\r') {
         return Err("value must be a single line".into());
     }
     // Serialize the whole read-modify-write so concurrent saves don't drop keys.
     let _guard = ENV_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = backend_env_for_write();
+    if v.is_empty() {
+        if !path.is_file() {
+            return Ok(path.to_string_lossy().to_string());
+        }
+        let prefix = format!("{}=", k);
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())?
+            .lines()
+            .filter(|line| !(line.starts_with(&prefix) || line.trim_start().starts_with(&prefix)))
+            .map(|s| s.to_string())
+            .collect();
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        std::fs::write(&path, content).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        return Ok(path.to_string_lossy().to_string());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -2712,6 +2732,9 @@ fn backend_approve_run_blocking(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(daemon::DaemonState::default())
+        .manage(oauth::OAuthState::default())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let _ = APP_CONFIG_DIR.set(config_dir.clone());
@@ -2725,12 +2748,6 @@ pub fn run() {
             CONFIG_PATH
                 .set(path)
                 .map_err(|_| std::io::Error::other("configuration already initialized"))?;
-            Ok(())
-        })
-        .plugin(tauri_plugin_opener::init())
-        .manage(daemon::DaemonState::default())
-        .manage(oauth::OAuthState::default())
-        .setup(|app| {
             // Non-fatal: without a tray the window simply closes normally.
             if let Err(e) = daemon::setup_tray(app) {
                 eprintln!("tray unavailable, daemon will stop when the window closes: {}", e);

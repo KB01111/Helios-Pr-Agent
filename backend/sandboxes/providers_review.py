@@ -182,10 +182,17 @@ def normalize_openrouter_model(model: str) -> str:
     return rest if "/" in rest else m
 
 
+def _strip_leading_rel(value: str) -> str:
+    s = value.strip()
+    while s.startswith("./"):
+        s = s[2:]
+    return s.lstrip("/")
+
+
 def _glob_matches(path: str, pattern: str) -> bool:
-    """Match POSIX repo path against a glob pattern supporting ``**``."""
-    p = path.strip().lstrip("./").lstrip("/")
-    pat = pattern.strip().lstrip("./").lstrip("/")
+    """Match POSIX repo path against a glob pattern supporting ``**`` and ``[...]``."""
+    p = _strip_leading_rel(path)
+    pat = _strip_leading_rel(pattern)
     if not p or not pat:
         return False
     parts: list[str] = ["^"]
@@ -203,11 +210,27 @@ def _glob_matches(path: str, pattern: str) -> bool:
         elif pat[i] == "?":
             parts.append("[^/]")
             i += 1
+        elif pat[i] == "[":
+            end = pat.find("]", i + 1)
+            if end != -1:
+                inner = pat[i + 1:end]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                elif inner.startswith("^"):
+                    inner = "\\" + inner
+                parts.append(f"[{inner}]")
+                i = end + 1
+            else:
+                parts.append(re.escape(pat[i]))
+                i += 1
         else:
             parts.append(re.escape(pat[i]))
             i += 1
     parts.append("$")
-    return bool(re.match("".join(parts), p))
+    try:
+        return bool(re.match("".join(parts), p))
+    except re.error:
+        return False
 
 
 def _sanitize_error_snippet(resp: Any, secret: str = "", max_chars: int = 180) -> str:
@@ -244,13 +267,18 @@ def llm_chat_request(provider: str, model: str, repo: str, pr_number: int) -> tu
     return f"{base}/chat/completions", headers, send_model
 
 
-async def _fetch_pr_files_diff(client: Any, repo: str, pr_number: int, github_token: str) -> str | None:
+async def _fetch_pr_files_diff(
+    client: Any, repo: str, pr_number: int, github_token: str
+) -> tuple[str, list[str]] | None:
     """Fallback when GitHub returns 406 for diffs larger than the raw diff limit."""
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {github_token}",
     }
     chunks: list[str] = []
+    notes: list[str] = []
+    file_count = 0
+    hit_page_cap = False
     for page in range(1, _LARGE_DIFF_MAX_PAGES + 1):
         resp = await client.get(
             f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files",
@@ -262,6 +290,7 @@ async def _fetch_pr_files_diff(client: Any, repo: str, pr_number: int, github_to
         batch = resp.json()
         if not isinstance(batch, list):
             return None
+        file_count += len(batch)
         for item in batch:
             if not isinstance(item, dict):
                 continue
@@ -282,7 +311,11 @@ async def _fetch_pr_files_diff(client: Any, repo: str, pr_number: int, github_to
                 )
         if len(batch) < 100:
             break
-    return "".join(chunks)
+        if page == _LARGE_DIFF_MAX_PAGES:
+            hit_page_cap = True
+    if hit_page_cap:
+        notes.append(f"PR files fallback reached the {file_count}-file page limit; additional files were omitted")
+    return "".join(chunks), notes
 
 
 def _build_guidance(agent_config: dict, diff: str) -> str:
@@ -367,6 +400,7 @@ class ReviewOnlyProvider:
 
         # 1. Fetch diff
         diff = ""
+        fallback_notes: list[str] = []
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.get(
@@ -378,11 +412,11 @@ class ReviewOnlyProvider:
                 )
                 if resp.status_code == 406:
                     logs.append("review_only: diff exceeded GitHub 406 limit; falling back to PR files patches.")
-                    fallback_diff = await _fetch_pr_files_diff(client, repo, pr_number, github_token)
-                    if fallback_diff is None:
+                    fallback_res = await _fetch_pr_files_diff(client, repo, pr_number, github_token)
+                    if fallback_res is None:
                         logs.append("review_only: PR files fallback failed.")
                         return _result(logs, "", "failed", False, agent_name)
-                    diff = fallback_diff
+                    diff, fallback_notes = fallback_res
                 elif resp.status_code != 200:
                     logs.append(f"review_only: diff fetch failed HTTP {resp.status_code}.")
                     return _result(logs, "", "failed", False, agent_name)
@@ -394,6 +428,8 @@ class ReviewOnlyProvider:
             return _result(logs, "", "failed", False, agent_name)
 
         truncated, cut_notes = prepare_diff(diff)
+        if fallback_notes:
+            cut_notes = fallback_notes + cut_notes
         for note in cut_notes[:10]:
             logs.append(f"review_only: {note}.")
 

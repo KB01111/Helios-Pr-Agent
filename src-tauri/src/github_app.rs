@@ -19,9 +19,18 @@ const FLOW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const HOMEPAGE: &str = "https://github.com/KB01111/Helios-Pr-Agent";
 pub const GITHUB_OAUTH_PORTS: &[u16] = &[17492, 17493, 17494];
 
-pub fn github_callback_urls() -> Vec<String> {
-    GITHUB_OAUTH_PORTS
-        .iter()
+pub fn github_callback_urls_for(preferred_port: Option<u16>) -> Vec<String> {
+    let mut ports: Vec<u16> = Vec::with_capacity(GITHUB_OAUTH_PORTS.len() + 1);
+    if let Some(p) = preferred_port {
+        ports.push(p);
+    }
+    for &p in GITHUB_OAUTH_PORTS {
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    ports
+        .into_iter()
         .map(|p| format!("http://127.0.0.1:{}/oauth/callback", p))
         .collect()
 }
@@ -106,7 +115,12 @@ pub fn public_webhook_base(url: &str) -> Result<String, String> {
     Ok(b)
 }
 
-pub fn build_manifest(app_name: &str, webhook_base: Option<&str>, redirect_url: &str) -> serde_json::Value {
+pub fn build_manifest_with_port(
+    app_name: &str,
+    webhook_base: Option<&str>,
+    redirect_url: &str,
+    preferred_oauth_port: Option<u16>,
+) -> serde_json::Value {
     let hook = match webhook_base {
         Some(base) => serde_json::json!({ "url": format!("{}/webhooks/github", base), "active": true }),
         // No public backend yet: create the App with an inactive hook; set it later.
@@ -117,7 +131,7 @@ pub fn build_manifest(app_name: &str, webhook_base: Option<&str>, redirect_url: 
         "url": HOMEPAGE,
         "hook_attributes": hook,
         "redirect_url": redirect_url,
-        "callback_urls": github_callback_urls(),
+        "callback_urls": github_callback_urls_for(preferred_oauth_port),
         "request_oauth_on_install": true,
         "public": false,
         "default_permissions": {
@@ -132,6 +146,10 @@ pub fn build_manifest(app_name: &str, webhook_base: Option<&str>, redirect_url: 
         },
         "default_events": APP_EVENTS,
     })
+}
+
+pub fn build_manifest(app_name: &str, webhook_base: Option<&str>, redirect_url: &str) -> serde_json::Value {
+    build_manifest_with_port(app_name, webhook_base, redirect_url, None)
 }
 
 pub(crate) fn html_escape(s: &str) -> String {
@@ -433,16 +451,6 @@ fn create_blocking(
     } else {
         format!("{}/installations/new", html_url.trim_end_matches('/'))
     };
-    if !client_id.is_empty() && !client_secret.is_empty() {
-        let _ = crate::oauth::save_github_oauth_client(
-            &client_id,
-            &client_secret,
-            true,
-            Some(&slug),
-            Some(&html_url),
-            Some(&install_url),
-        );
-    }
 
     // The App now exists and GitHub will not show the key again, so every sink is
     // best effort: a failing one must not lose the credentials for the others.
@@ -478,6 +486,18 @@ Delete the App at {} and try again.",
             },
             if html_url.is_empty() { "https://github.com/settings/apps".to_string() } else { html_url.clone() },
         ));
+    }
+    if !client_id.is_empty() && !client_secret.is_empty() {
+        let _ = crate::oauth::save_github_oauth_client(
+            &client_id,
+            &client_secret,
+            crate::oauth::GitHubOAuthClientMeta {
+                is_app: true,
+                slug: Some(&slug),
+                html_url: Some(&html_url),
+                install_url: Some(&install_url),
+            },
+        );
     }
     let (env_path, local_error) = match local {
         Ok(p) => (Some(p), None),

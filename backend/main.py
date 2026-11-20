@@ -346,23 +346,23 @@ def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | N
     return False
 
 
+_AGENT_KEY_PATTERN = "agent:*"
 _COMMENT_ASSOC_ALLOWED = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _REVIEW_CMD_RE = re.compile(r"^\s*/review(?:\s|$)", re.IGNORECASE)
 
 
-async def _handle_issue_comment_trigger(
-    payload: dict[str, Any], res: dict[str, Any], delivery: str, tasks: BackgroundTasks
-) -> dict[str, Any]:
-    """Trigger a review_only run when an authorized user @mentions the agent or posts /review."""
+def _comment_trigger_target(
+    payload: dict[str, Any], res: dict[str, Any]
+) -> tuple[str, int, dict[str, Any], dict[str, Any]] | None:
     if not (res.get("recorded") and res.get("action") == "created") or res.get("duplicate"):
-        return res
+        return None
     comment = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
     assoc = str(comment.get("author_association") or "").upper()
     if assoc not in _COMMENT_ASSOC_ALLOWED:
-        return res
+        return None
     body_text = str(comment.get("body") or "")
     if not res.get("mentions_agent") and not _REVIEW_CMD_RE.match(body_text):
-        return res
+        return None
     repository = payload.get("repository") if isinstance(payload.get("repository"), dict) else {}
     repo = str(repository.get("full_name") or "")
     issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
@@ -371,27 +371,28 @@ async def _handle_issue_comment_trigger(
     except (TypeError, ValueError):
         pr_number = 0
     if not repo or pr_number <= 0 or not _REPO_RE.fullmatch(repo):
-        return res
+        return None
     owner, name = repo.split("/", 1)
     if owner in (".", "..") or name in (".", ".."):
-        return res
+        return None
+    return repo, pr_number, issue, comment
 
-    agent_keys = await store.arkeys("agent:*")
-    agent_configs = await store.arget_json_many(agent_keys)
-    matched = [
-        {**cfg, "runtime_mode": "review_only"}
-        for cfg in agent_configs
-        if isinstance(cfg, dict)
-        and cfg.get("enabled") is not False
-        and cfg.get("chat_enabled", True) is not False
-        and (not (cfg.get("target_repos") or []) or repo in cfg.get("target_repos", []) or "*" in cfg.get("target_repos", []))
-    ]
-    if not matched:
-        return res
 
+def _match_comment_agents(agent_configs: list[Any], repo: str) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for cfg in agent_configs:
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False or cfg.get("chat_enabled", True) is False:
+            continue
+        targets = cfg.get("target_repos") or []
+        if not targets or repo in targets or "*" in targets:
+            matched.append({**cfg, "runtime_mode": "review_only"})
+    return matched
+
+
+async def _fetch_pr_head_meta(repo: str, pr_number: int, fallback_title: str) -> tuple[str, str, str]:
     sha = ""
     head_ref = ""
-    title = str(issue.get("title") or "")
+    title = fallback_title
     try:
         import httpx
 
@@ -410,21 +411,44 @@ async def _handle_issue_comment_trigger(
                 title = str(pr_data.get("title") or title)
     except Exception as exc:
         log.warning("comment trigger PR lookup failed for %s#%d: %s", repo, pr_number, type(exc).__name__)
+    return sha, head_ref, title
 
-    comment_id = comment.get("id") or delivery or uuid.uuid4().hex[:8]
-    action = f"comment:{comment_id}"
-    pr_ctx = PRContext(
-        repo=repo,
-        pr_number=pr_number,
-        sha=sha,
-        action=action,
-        label=None,
-        title=title,
-        head_ref=head_ref,
-    )
-    run_ids: list[str] = []
-    await _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks)
-    return {**res, "runs": run_ids}
+
+async def _handle_issue_comment_trigger(
+    payload: dict[str, Any], res: dict[str, Any], delivery: str, tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Trigger a review_only run when an authorized user @mentions the agent or posts /review."""
+    target = _comment_trigger_target(payload, res)
+    if target is None:
+        return res
+    repo, pr_number, issue, comment = target
+    try:
+        agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
+        agent_configs = await store.arget_json_many(agent_keys)
+        matched = _match_comment_agents(agent_configs, repo)
+        if not matched:
+            return res
+        sha, head_ref, title = await _fetch_pr_head_meta(repo, pr_number, str(issue.get("title") or ""))
+        comment_id = comment.get("id") or delivery or uuid.uuid4().hex[:8]
+        action = f"comment:{comment_id}"
+        pr_ctx = PRContext(
+            repo=repo,
+            pr_number=pr_number,
+            sha=sha,
+            action=action,
+            label=None,
+            title=title,
+            head_ref=head_ref,
+        )
+        run_ids: list[str] = []
+        await _create_runs(matched, repo, pr_number, sha, action, pr_ctx, run_ids, tasks)
+        return {**res, "runs": run_ids}
+    except Exception:
+        try:
+            await asyncio.to_thread(events.release_delivery, delivery)
+        except Exception as exc:
+            log.warning("could not release delivery=%s after comment trigger failure: %s", delivery, exc)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +775,7 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
 
     # Load agent configs first: don't consume the debounce window for events
     # that match no agent (and scope it to the action/label).
-    agent_keys = await store.arkeys("agent:*")
+    agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
     agent_configs = await store.arget_json_many(agent_keys)
     agents = [cfg for cfg in agent_configs if isinstance(cfg, dict)]
     matched = [a for a in agents if _agent_matches(a, repo, action, label)]
@@ -914,7 +938,7 @@ def create_agent(agent: AgentConfig, request: Request) -> dict[str, Any]:
 @app.get("/agents")
 def list_agents(request: Request) -> list[dict[str, Any]]:
     _require_auth(request)
-    keys = store.rkeys("agent:*")
+    keys = store.rkeys(_AGENT_KEY_PATTERN)
     configs = store.rget_json_many(keys)
     out = [_agent_v2(cfg) for cfg in configs if isinstance(cfg, dict)]
     out.sort(key=lambda a: str(a.get("id")))

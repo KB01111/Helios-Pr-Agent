@@ -79,13 +79,47 @@ fn save_clients_to_path(path: &Path, clients: &StoredOAuthClients) -> Result<(),
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(clients).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("oauth_clients.json");
+    let tmp_name = format!(
+        ".{}.tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        github_app::random_state().unwrap_or_else(|_| "0".into())
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    let write_res = (|| -> Result<(), String> {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        #[cfg(windows)]
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    Ok(())
+    write_res
 }
 
 fn load_clients() -> StoredOAuthClients {
@@ -105,13 +139,18 @@ fn mutate_clients(f: impl FnOnce(&mut StoredOAuthClients)) -> Result<StoredOAuth
     Ok(clients)
 }
 
+#[derive(Default)]
+pub struct GitHubOAuthClientMeta<'a> {
+    pub is_app: bool,
+    pub slug: Option<&'a str>,
+    pub html_url: Option<&'a str>,
+    pub install_url: Option<&'a str>,
+}
+
 pub fn save_github_oauth_client(
     client_id: &str,
     client_secret: &str,
-    is_app: bool,
-    slug: Option<&str>,
-    html_url: Option<&str>,
-    install_url: Option<&str>,
+    meta: GitHubOAuthClientMeta<'_>,
 ) -> Result<(), String> {
     let cid = client_id.trim().to_string();
     let csec = client_secret.trim().to_string();
@@ -121,10 +160,10 @@ pub fn save_github_oauth_client(
     mutate_clients(|c| {
         c.github_client_id = Some(cid);
         c.github_client_secret = Some(csec);
-        c.github_is_app = is_app;
-        c.github_app_slug = slug.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        c.github_html_url = html_url.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        c.github_install_url = install_url.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        c.github_is_app = meta.is_app;
+        c.github_app_slug = meta.slug.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        c.github_html_url = meta.html_url.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        c.github_install_url = meta.install_url.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     })?;
     Ok(())
 }
@@ -210,13 +249,22 @@ struct PersistResult {
     local_error: Option<String>,
 }
 
-fn persist_settings(
+fn ensure_active(cancelled: &Arc<AtomicBool>) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err("Authorization cancelled.".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn persist_settings_with_drops(
     settings_url: Option<&str>,
     api_token: Option<&str>,
     pairs: &[(&str, &str)],
+    drop_keys: &[&str],
 ) -> PersistResult {
     let mut out = PersistResult::default();
-    if pairs.is_empty() {
+    if pairs.is_empty() && drop_keys.is_empty() {
         return out;
     }
 
@@ -231,6 +279,17 @@ fn persist_settings(
             }
         }
     }
+    if local_err.is_none() {
+        for &k in drop_keys {
+            match crate::save_backend_env_var_blocking(k.to_string(), String::new()) {
+                Ok(p) => env_path = Some(p),
+                Err(e) => {
+                    local_err = Some(e);
+                    break;
+                }
+            }
+        }
+    }
     out.env_path = env_path;
     out.local_error = local_err;
 
@@ -238,6 +297,9 @@ fn persist_settings(
         let mut values = serde_json::Map::new();
         for &(k, v) in pairs {
             values.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+        for &k in drop_keys {
+            values.insert(k.to_string(), serde_json::Value::Null);
         }
         let body = serde_json::json!({ "values": values });
         match github_app::push_to_cloud(
@@ -250,6 +312,14 @@ fn persist_settings(
         }
     }
     out
+}
+
+fn persist_settings(
+    settings_url: Option<&str>,
+    api_token: Option<&str>,
+    pairs: &[(&str, &str)],
+) -> PersistResult {
+    persist_settings_with_drops(settings_url, api_token, pairs, &[])
 }
 
 fn wait_for_oauth_code(
@@ -284,15 +354,6 @@ fn wait_for_oauth_code(
             github_app::respond(&mut stream, "404 Not Found", "");
             continue;
         }
-        if let Some(err) = param(&params, "error").filter(|e| !e.is_empty()) {
-            let desc = param(&params, "error_description").unwrap_or(err);
-            github_app::respond(
-                &mut stream,
-                "400 Bad Request",
-                &github_app::result_page(false, "Authorization declined", desc),
-            );
-            return Err(format!("Authorization declined: {}", desc));
-        }
         if let Some(exp) = expected_state {
             let got = param(&params, "state").unwrap_or("");
             if !constant_time_eq(got, exp) {
@@ -307,6 +368,15 @@ fn wait_for_oauth_code(
                 );
                 continue;
             }
+        }
+        if let Some(err) = param(&params, "error").filter(|e| !e.is_empty()) {
+            let desc = param(&params, "error_description").unwrap_or(err);
+            github_app::respond(
+                &mut stream,
+                "400 Bad Request",
+                &github_app::result_page(false, "Authorization declined", desc),
+            );
+            return Err(format!("Authorization declined: {}", desc));
         }
         match param(&params, "code").filter(|c| !c.is_empty() && c.len() <= 512) {
             Some(code) => {
@@ -381,7 +451,10 @@ fn read_gh_cli_login() -> Option<String> {
 }
 
 fn read_gh_cli_token() -> Option<String> {
-    let out = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    let out = Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -447,7 +520,7 @@ fn opencode_auth_candidates() -> Vec<PathBuf> {
 }
 
 fn extract_opencode_key_from_json(val: &serde_json::Value) -> Option<String> {
-    for section in ["opencode-go", "opencode_go", "opencode"] {
+    for section in ["opencode-go", "opencode_go"] {
         let Some(obj) = val.get(section) else {
             continue;
         };
@@ -551,9 +624,15 @@ pub async fn oauth_save_client(
                     return Err("client_secret is required for GitHub OAuth".into());
                 };
                 mutate_clients(|c| {
+                    let changed = c.github_client_id.as_deref() != Some(cid.as_str());
                     c.github_client_id = Some(cid);
                     c.github_client_secret = Some(secret);
                     c.github_is_app = is_app.unwrap_or(false);
+                    if changed || !c.github_is_app {
+                        c.github_app_slug = None;
+                        c.github_html_url = None;
+                        c.github_install_url = None;
+                    }
                 })?;
                 Ok(())
             }
@@ -610,10 +689,11 @@ pub async fn openrouter_oauth_connect(
     state: tauri::State<'_, OAuthState>,
     settings_url: Option<String>,
     api_token: Option<String>,
+    persist: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let cancelled = state.begin_flow();
     tauri::async_runtime::spawn_blocking(move || {
-        openrouter_oauth_blocking(cancelled, settings_url, api_token)
+        openrouter_oauth_blocking(cancelled, settings_url, api_token, persist.unwrap_or(true))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -623,6 +703,7 @@ fn openrouter_oauth_blocking(
     cancelled: Arc<AtomicBool>,
     settings_url: Option<String>,
     api_token: Option<String>,
+    persist: bool,
 ) -> Result<serde_json::Value, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -640,10 +721,11 @@ fn openrouter_oauth_blocking(
         &callback_path,
         None,
         &cancelled,
-        "OpenRouter connected",
-        "Your OpenRouter API key has been generated and sent to PR Agent Control.",
+        "Authorization received",
+        "Return to PR Agent Control to complete the OpenRouter key exchange.",
     )?;
     drop(listener);
+    ensure_active(&cancelled)?;
 
     let res = crate::gh_client()?
         .post("https://openrouter.ai/api/v1/auth/keys")
@@ -673,12 +755,17 @@ fn openrouter_oauth_blocking(
         .ok_or("OpenRouter did not return an API key")?
         .to_string();
     let user_id = body.get("user_id").and_then(|v| v.as_str()).map(str::to_string);
+    ensure_active(&cancelled)?;
 
-    let saved = persist_settings(
-        settings_url.as_deref(),
-        api_token.as_deref(),
-        &[("OPENROUTER_API_KEY", &key)],
-    );
+    let saved = if persist {
+        persist_settings(
+            settings_url.as_deref(),
+            api_token.as_deref(),
+            &[("OPENROUTER_API_KEY", &key)],
+        )
+    } else {
+        PersistResult::default()
+    };
     Ok(serde_json::json!({
         "key": key,
         "user_id": user_id,
@@ -830,14 +917,16 @@ fn github_oauth_blocking(
             "/oauth/callback",
             Some(&oauth_state),
             &cancelled,
-            "GitHub connected",
-            "You are signed in to PR Agent Control.",
+            "Authorization received",
+            "Return to PR Agent Control to finish signing in.",
         )?;
         drop(listener);
+        ensure_active(&cancelled)?;
 
         let access_token = exchange_github_code(cid, csec, &code, Some(&oauth_redirect))?;
         let (login, avatar_url) = fetch_github_user(&access_token)?;
-        let saved = if save_to_backend {
+        ensure_active(&cancelled)?;
+        let saved = if save_to_backend && !clients.github_is_app {
             persist_settings(
                 settings_url.as_deref(),
                 api_token.as_deref(),
@@ -887,7 +976,7 @@ fn github_oauth_blocking(
     let manifest_state = github_app::random_state()?;
     let oauth_state = github_app::random_state()?;
     let manifest_redirect = format!("http://127.0.0.1:{}/manifest/callback", port);
-    let manifest = github_app::build_manifest(&resolved_name, webhook_base.as_deref(), &manifest_redirect);
+    let manifest = github_app::build_manifest_with_port(&resolved_name, webhook_base.as_deref(), &manifest_redirect, Some(port));
     let action = match &org {
         Some(o) => format!("https://github.com/organizations/{}/settings/apps/new?state={}", o, manifest_state),
         None => format!("https://github.com/settings/apps/new?state={}", manifest_state),
@@ -907,13 +996,12 @@ fn github_oauth_blocking(
         install_url: String,
         client_id: String,
         client_secret: String,
-        cloud_saved: bool,
-        cloud_error: Option<String>,
-        env_path: Option<String>,
-        local_error: Option<String>,
+        pem: String,
+        webhook_secret: Option<String>,
     }
     let mut converted: Option<ConvertedApp> = None;
     let mut oauth_code: Option<String> = None;
+    let mut oauth_used_explicit_redirect = false;
     let mut installation_id: Option<String> = None;
 
     while Instant::now() < deadline {
@@ -971,7 +1059,7 @@ fn github_oauth_blocking(
                 };
                 let id = app.get("id").and_then(|v| v.as_i64()).ok_or("GitHub response had no App id")?;
                 let slug = app.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let pem = app.get("pem").and_then(|v| v.as_str()).ok_or("GitHub response had no private key")?;
+                let pem = app.get("pem").and_then(|v| v.as_str()).ok_or("GitHub response had no private key")?.to_string();
                 let html_url = app.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let client_id = app.get("client_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
                 let client_secret = app.get("client_secret").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -991,39 +1079,6 @@ fn github_oauth_blocking(
                     format!("{}/installations/new", html_url.trim_end_matches('/'))
                 };
 
-                let _ = save_github_oauth_client(
-                    &client_id,
-                    &client_secret,
-                    true,
-                    Some(&slug),
-                    Some(&html_url),
-                    Some(&install_url),
-                );
-
-                // Best-effort save to local backend/.env + cloud backend.
-                let local = (|| -> Result<String, String> {
-                    let mut p = crate::save_backend_env_var_blocking("GITHUB_APP_ID".into(), id.to_string())?;
-                    if !slug.is_empty() {
-                        crate::save_backend_env_var_blocking("GITHUB_APP_SLUG".into(), slug.clone())?;
-                    }
-                    crate::save_backend_env_var_blocking("GITHUB_APP_PRIVATE_KEY".into(), github_app::pem_to_env(pem))?;
-                    if let Some(secret) = &webhook_secret {
-                        p = crate::save_backend_env_var_blocking("GITHUB_APP_WEBHOOK_SECRET".into(), secret.clone())?;
-                    }
-                    Ok(p)
-                })();
-                let cloud = match settings_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-                    Some(url) => Some(github_app::push_to_cloud(
-                        url,
-                        api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()),
-                        &github_app::cloud_settings_body(id, &slug, pem, webhook_secret.as_deref()),
-                    )),
-                    None => None,
-                };
-                let (env_path, local_error) = match local {
-                    Ok(p) => (Some(p), None),
-                    Err(e) => (None, Some(e)),
-                };
                 converted = Some(ConvertedApp {
                     id,
                     slug,
@@ -1031,10 +1086,8 @@ fn github_oauth_blocking(
                     install_url: install_url.clone(),
                     client_id,
                     client_secret,
-                    cloud_saved: matches!(cloud, Some(Ok(()))),
-                    cloud_error: match &cloud { Some(Err(e)) => Some(e.clone()), _ => None },
-                    env_path,
-                    local_error,
+                    pem,
+                    webhook_secret,
                 });
 
                 let next = format!("{}?state={}", install_url, url_encode(&oauth_state));
@@ -1049,7 +1102,38 @@ fn github_oauth_blocking(
                     );
                     continue;
                 };
-                let _ = conv;
+                if let Some(inst) = param(&params, "installation_id").filter(|s| !s.is_empty()) {
+                    installation_id = Some(inst.to_string());
+                }
+                let setup_action = param(&params, "setup_action");
+                let got_state = param(&params, "state").filter(|s| !s.is_empty());
+                match got_state {
+                    Some(st) if !constant_time_eq(st, &oauth_state) => {
+                        github_app::respond(
+                            &mut stream,
+                            "400 Bad Request",
+                            &github_app::result_page(false, "State mismatch", "Please retry from PR Agent Control."),
+                        );
+                        continue;
+                    }
+                    None if setup_action == Some("install") => {
+                        // GitHub omitted state after installation; redirect to an explicit
+                        // OAuth authorization URL correlated with our oauth_state.
+                        oauth_used_explicit_redirect = true;
+                        let auth_url = build_github_authorize_url(&conv.client_id, &oauth_redirect, &oauth_state, true);
+                        github_app::respond_redirect(&mut stream, &auth_url);
+                        continue;
+                    }
+                    None => {
+                        github_app::respond(
+                            &mut stream,
+                            "400 Bad Request",
+                            &github_app::result_page(false, "Missing state", "Please retry from PR Agent Control."),
+                        );
+                        continue;
+                    }
+                    Some(_) => {}
+                }
                 if let Some(err) = param(&params, "error").filter(|e| !e.is_empty()) {
                     let desc = param(&params, "error_description").unwrap_or(err);
                     github_app::respond(
@@ -1059,34 +1143,15 @@ fn github_oauth_blocking(
                     );
                     return Err(format!("GitHub authorization declined: {}", desc));
                 }
-                let setup_action = param(&params, "setup_action");
-                if let Some(got_state) = param(&params, "state").filter(|s| !s.is_empty()) {
-                    if !constant_time_eq(got_state, &oauth_state) {
-                        github_app::respond(
-                            &mut stream,
-                            "400 Bad Request",
-                            &github_app::result_page(false, "State mismatch", "Please retry from PR Agent Control."),
-                        );
-                        continue;
-                    }
-                } else if setup_action != Some("install") {
-                    github_app::respond(
-                        &mut stream,
-                        "400 Bad Request",
-                        &github_app::result_page(false, "Missing state", "Please retry from PR Agent Control."),
-                    );
-                    continue;
-                }
                 if let Some(code) = param(&params, "code").filter(|c| !c.is_empty() && c.len() <= 512) {
-                    installation_id = param(&params, "installation_id").map(str::to_string);
                     oauth_code = Some(code.to_string());
                     github_app::respond(
                         &mut stream,
                         "200 OK",
                         &github_app::result_page(
                             true,
-                            "GitHub connected & configured",
-                            "Your GitHub App is installed and PR Agent Control is signed in.",
+                            "Authorization received",
+                            "Return to PR Agent Control to finish GitHub App setup.",
                         ),
                     );
                     break;
@@ -1107,31 +1172,66 @@ fn github_oauth_blocking(
         }
     }
     drop(listener);
+    ensure_active(&cancelled)?;
 
     let conv = converted.ok_or("Timed out waiting for GitHub App creation.")?;
     let code = oauth_code.ok_or("Timed out waiting for GitHub App installation & OAuth.")?;
-    let access_token = exchange_github_code(&conv.client_id, &conv.client_secret, &code, None)?;
+    let redirect_for_exchange = if oauth_used_explicit_redirect {
+        Some(oauth_redirect.as_str())
+    } else {
+        None
+    };
+    let access_token = exchange_github_code(&conv.client_id, &conv.client_secret, &code, redirect_for_exchange)?;
     let (login, avatar_url) = fetch_github_user(&access_token)?;
+    ensure_active(&cancelled)?;
 
-    let mut cloud_saved = conv.cloud_saved;
-    let mut cloud_error = conv.cloud_error;
-    let mut env_path = conv.env_path;
-    let mut local_error = conv.local_error;
-    if save_to_backend {
-        let tok_save = persist_settings(
-            settings_url.as_deref(),
-            api_token.as_deref(),
-            &[("GITHUB_TOKEN", &access_token)],
-        );
-        cloud_saved = cloud_saved || tok_save.cloud_saved;
-        if cloud_error.is_none() {
-            cloud_error = tok_save.cloud_error;
+    let client_save_error = save_github_oauth_client(
+        &conv.client_id,
+        &conv.client_secret,
+        GitHubOAuthClientMeta {
+            is_app: true,
+            slug: Some(&conv.slug),
+            html_url: Some(&conv.html_url),
+            install_url: Some(&conv.install_url),
+        },
+    )
+    .err();
+
+    let local = (|| -> Result<String, String> {
+        let mut p = crate::save_backend_env_var_blocking("GITHUB_APP_ID".into(), conv.id.to_string())?;
+        if !conv.slug.is_empty() {
+            crate::save_backend_env_var_blocking("GITHUB_APP_SLUG".into(), conv.slug.clone())?;
         }
-        if env_path.is_none() {
-            env_path = tok_save.env_path;
+        crate::save_backend_env_var_blocking("GITHUB_APP_PRIVATE_KEY".into(), github_app::pem_to_env(&conv.pem))?;
+        if let Some(secret) = &conv.webhook_secret {
+            p = crate::save_backend_env_var_blocking("GITHUB_APP_WEBHOOK_SECRET".into(), secret.clone())?;
         }
+        Ok(p)
+    })();
+    let cloud = match settings_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        Some(url) => Some(github_app::push_to_cloud(
+            url,
+            api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()),
+            &github_app::cloud_settings_body(conv.id, &conv.slug, &conv.pem, conv.webhook_secret.as_deref()),
+        )),
+        None => None,
+    };
+    let cloud_saved = matches!(cloud, Some(Ok(())));
+    let mut cloud_error = match &cloud {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+    let (env_path, mut local_error) = match local {
+        Ok(p) => (Some(p), None),
+        Err(e) => (None, Some(e)),
+    };
+    if let Some(ref cerr) = client_save_error {
+        let note = format!("oauth_clients.json not saved: {}", cerr);
         if local_error.is_none() {
-            local_error = tok_save.local_error;
+            local_error = Some(note.clone());
+        }
+        if cloud_error.is_none() && !cloud_saved {
+            cloud_error = Some(note);
         }
     }
 
@@ -1150,6 +1250,7 @@ fn github_oauth_blocking(
         "cloud_error": cloud_error,
         "env_path": env_path,
         "local_error": local_error,
+        "client_save_error": client_save_error,
     }))
 }
 
@@ -1190,7 +1291,7 @@ pub async fn github_import_cli(
 // 3. Vercel OAuth / CLI import + team discovery
 // ---------------------------------------------------------------------------
 
-fn vercel_user_and_teams(token: &str) -> Result<(String, Vec<serde_json::Value>), String> {
+fn vercel_user_and_teams(token: &str) -> Result<(String, Vec<serde_json::Value>, Option<String>), String> {
     let client = crate::gh_client()?;
     let user_res = client
         .get("https://api.vercel.com/v2/user")
@@ -1211,13 +1312,14 @@ fn vercel_user_and_teams(token: &str) -> Result<(String, Vec<serde_json::Value>)
         .to_string();
 
     let mut teams = Vec::new();
-    if let Ok(tres) = client
+    let mut teams_error = None;
+    match client
         .get("https://api.vercel.com/v2/teams")
         .header("Authorization", format!("Bearer {}", token))
         .send()
     {
-        if tres.status().is_success() {
-            if let Ok(tbody) = tres.json::<serde_json::Value>() {
+        Ok(tres) if tres.status().is_success() => match tres.json::<serde_json::Value>() {
+            Ok(tbody) => {
                 if let Some(arr) = tbody.get("teams").and_then(|v| v.as_array()) {
                     for t in arr {
                         if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
@@ -1230,9 +1332,12 @@ fn vercel_user_and_teams(token: &str) -> Result<(String, Vec<serde_json::Value>)
                     }
                 }
             }
-        }
+            Err(e) => teams_error = Some(format!("could not parse Vercel teams: {}", e)),
+        },
+        Ok(tres) => teams_error = Some(format!("Vercel teams lookup returned HTTP {}", tres.status())),
+        Err(e) => teams_error = Some(format!("Vercel teams lookup failed: {}", e)),
     }
-    Ok((username, teams))
+    Ok((username, teams, teams_error))
 }
 
 fn finish_vercel_connect(
@@ -1240,20 +1345,24 @@ fn finish_vercel_connect(
     settings_url: Option<&str>,
     api_token: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let (user, teams) = vercel_user_and_teams(token)?;
+    let (user, teams, teams_error) = vercel_user_and_teams(token)?;
     let team_id = if teams.len() == 1 {
         teams[0].get("id").and_then(|v| v.as_str()).map(str::to_string)
     } else {
         None
     };
     let mut pairs: Vec<(&str, &str)> = vec![("VERCEL_TOKEN", token)];
+    let mut drops: Vec<&str> = Vec::new();
     if let Some(tid) = team_id.as_deref() {
         pairs.push(("VERCEL_TEAM_ID", tid));
+    } else {
+        drops.push("VERCEL_TEAM_ID");
     }
-    let saved = persist_settings(settings_url, api_token, &pairs);
+    let saved = persist_settings_with_drops(settings_url, api_token, &pairs, &drops);
     Ok(serde_json::json!({
         "user": user,
         "teams": teams,
+        "teams_error": teams_error,
         "team_id": team_id,
         "cloud_saved": saved.cloud_saved,
         "cloud_error": saved.cloud_error,
@@ -1269,7 +1378,10 @@ pub async fn vercel_fetch_teams(token: String) -> Result<serde_json::Value, Stri
         if t.is_empty() {
             return Err("Vercel token is required".into());
         }
-        let (user, teams) = vercel_user_and_teams(t)?;
+        let (user, teams, teams_error) = vercel_user_and_teams(t)?;
+        if let Some(err) = teams_error {
+            return Err(err);
+        }
         Ok(serde_json::json!({ "user": user, "teams": teams }))
     })
     .await
@@ -1308,10 +1420,13 @@ pub async fn vercel_oauth_connect(
             .to_string();
         let client_secret = clients.vercel_client_secret.clone();
 
-        let listener = TcpListener::bind(("127.0.0.1", VERCEL_OAUTH_PORT))
-            .or_else(|_| TcpListener::bind("127.0.0.1:0"))
-            .map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let listener = TcpListener::bind(("127.0.0.1", VERCEL_OAUTH_PORT)).map_err(|e| {
+            format!(
+                "Port {} is busy ({}); close any active Vercel sign-in flow and retry.",
+                VERCEL_OAUTH_PORT, e
+            )
+        })?;
+        let port = VERCEL_OAUTH_PORT;
         let redirect_uri = format!("http://127.0.0.1:{}/vercel/callback", port);
         let (verifier, challenge) = pkce_pair()?;
         let oauth_state = github_app::random_state()?;
@@ -1330,12 +1445,14 @@ pub async fn vercel_oauth_connect(
             "/vercel/callback",
             Some(&oauth_state),
             &cancelled,
-            "Vercel connected",
-            "Your Vercel account has been connected to PR Agent Control.",
+            "Authorization received",
+            "Return to PR Agent Control to finish connecting your Vercel account.",
         )?;
         drop(listener);
+        ensure_active(&cancelled)?;
 
         let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "authorization_code"),
             ("client_id", &client_id),
             ("code", &code),
             ("redirect_uri", &redirect_uri),
@@ -1345,7 +1462,7 @@ pub async fn vercel_oauth_connect(
             form.push(("client_secret", sec));
         }
         let res = crate::gh_client()?
-            .post("https://api.vercel.com/v2/oauth/access_token")
+            .post("https://api.vercel.com/login/oauth/token")
             .form(&form)
             .send()
             .map_err(|e| format!("Vercel OAuth exchange failed: {}", e))?;
@@ -1360,6 +1477,7 @@ pub async fn vercel_oauth_connect(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or("Vercel did not return an access_token")?;
+        ensure_active(&cancelled)?;
         finish_vercel_connect(token, settings_url.as_deref(), api_token.as_deref())
     })
     .await
@@ -1380,6 +1498,28 @@ fn validate_openai_compatible_key(models_url: &str, key: &str, label: &str) -> R
         Ok(())
     } else {
         Err(format!("{} rejected the CLI key (HTTP {})", label, res.status()))
+    }
+}
+
+fn validate_opencode_go_key(key: &str) -> Result<(), String> {
+    // OpenCode Go's /models catalog is public, so verify the key against the
+    // authenticated chat completions endpoint with a 1-token probe.
+    let res = crate::gh_client()?
+        .post("https://opencode.ai/inference/go/openai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1
+        }))
+        .send()
+        .map_err(|e| format!("OpenCode Go unreachable: {}", e))?;
+    let status = res.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("OpenCode Go rejected the CLI key (HTTP {})", status))
     }
 }
 
@@ -1421,11 +1561,7 @@ pub async fn opencode_import_cli(
     tauri::async_runtime::spawn_blocking(move || {
         let key = read_opencode_cli_key()
             .ok_or("No OpenCode Go CLI key found in OpenCode auth.json. Generate a key at opencode.ai/go.")?;
-        validate_openai_compatible_key(
-            "https://opencode.ai/inference/go/v1/models",
-            &key,
-            "OpenCode Go",
-        )?;
+        validate_opencode_go_key(&key)?;
         let saved = persist_settings(
             settings_url.as_deref(),
             api_token.as_deref(),
@@ -1510,5 +1646,9 @@ mod tests {
             "opencode": { "key": "oc_fallback" }
         });
         assert_eq!(extract_opencode_key_from_json(&v).as_deref(), Some("oc_sk_123"));
+        let payg_only = serde_json::json!({
+            "opencode": { "key": "oc_payg_only" }
+        });
+        assert_eq!(extract_opencode_key_from_json(&payg_only), None);
     }
 }
