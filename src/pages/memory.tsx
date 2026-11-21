@@ -87,6 +87,7 @@ function kindBadgeVariant(kind: MemoryKind): "default" | "secondary" | "warning"
 export function MemoryPage({ active }: { active: boolean }) {
   const agents = useApp((s) => s.agents);
   const backend = useApp((s) => s.backendUrl);
+  const vaultLoaded = useApp((s) => s.vaultLoaded);
   const githubToken = useApp((s) => s.secrets.github);
   const ghRepos = useGh((s) => s.repos);
 
@@ -105,6 +106,7 @@ export function MemoryPage({ active }: { active: boolean }) {
   const [repoDraft, setRepoDraft] = React.useState("");
   const [items, setItems] = React.useState<MemoryEntry[]>([]);
   const [profile, setProfile] = React.useState<RepoProfile | null>(null);
+  const [loadedScope, setLoadedScope] = React.useState("");
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState("");
 
@@ -135,7 +137,33 @@ export function MemoryPage({ active }: { active: boolean }) {
   // Sync .pr-agent/memory.md dialog
   const [syncOpen, setSyncOpen] = React.useState(false);
   const [syncMarkdown, setSyncMarkdown] = React.useState("");
+  const [syncTargetScope, setSyncTargetScope] = React.useState("");
+  const [syncTargetRepo, setSyncTargetRepo] = React.useState("");
   const [syncLoading, setSyncLoading] = React.useState(false);
+
+  const scopeKey = `${backend}::${repo.trim()}`;
+  const currentScopeRef = React.useRef(scopeKey);
+  currentScopeRef.current = scopeKey;
+  const seq = React.useRef(0);
+  const syncSeq = React.useRef(0);
+
+  // Clear mismatched memory data, dialogs, and Markdown previews whenever backend or repo changes.
+  React.useEffect(() => {
+    seq.current++;
+    syncSeq.current++;
+    setItems([]);
+    setProfile(null);
+    setLoadedScope("");
+    setErr("");
+    setLoading(false);
+    setEditTarget(null);
+    setDeleteTarget(null);
+    setSyncOpen(false);
+    setSyncMarkdown("");
+    setSyncTargetScope("");
+    setSyncTargetRepo("");
+    setSyncLoading(false);
+  }, [scopeKey]);
 
   // Auto-select first known repo if none selected yet
   React.useEffect(() => {
@@ -145,12 +173,17 @@ export function MemoryPage({ active }: { active: boolean }) {
     }
   }, [repo, knownRepos]);
 
-  const seq = React.useRef(0);
-  const loadMemory = React.useCallback(async (targetRepo: string) => {
+  const loadMemory = React.useCallback(async (targetRepo: string, expectedBackend?: string) => {
     const clean = targetRepo.trim();
+    const reqBackend = expectedBackend ?? useApp.getState().backendUrl;
+    const reqScope = `${reqBackend}::${clean}`;
+    if (reqScope !== currentScopeRef.current) return;
     if (!clean || !isValidRepo(clean)) {
+      seq.current++;
       setItems([]);
       setProfile(null);
+      setLoadedScope("");
+      setLoading(false);
       return;
     }
     const mine = ++seq.current;
@@ -158,20 +191,24 @@ export function MemoryPage({ active }: { active: boolean }) {
     setErr("");
     try {
       const res = await listRepoMemory(clean);
-      if (mine !== seq.current) return;
+      if (mine !== seq.current || currentScopeRef.current !== reqScope) return;
       setItems(res.items);
       setProfile(res.profile ?? null);
+      setLoadedScope(reqScope);
     } catch (e) {
-      if (mine !== seq.current) return;
+      if (mine !== seq.current || currentScopeRef.current !== reqScope) return;
+      setItems([]);
+      setProfile(null);
+      setLoadedScope("");
       setErr(errText(e, 260));
     } finally {
-      if (mine === seq.current) setLoading(false);
+      if (mine === seq.current && currentScopeRef.current === reqScope) setLoading(false);
     }
   }, []);
 
   React.useEffect(() => {
-    if (active && repo) void loadMemory(repo);
-  }, [active, repo, backend, loadMemory]);
+    if (active && vaultLoaded && repo) void loadMemory(repo, backend);
+  }, [active, vaultLoaded, repo, backend, loadMemory]);
 
   const selectRepo = (next: string) => {
     const clean = next.trim();
@@ -183,6 +220,9 @@ export function MemoryPage({ active }: { active: boolean }) {
     setRepoDraft(clean);
   };
 
+  const scopedItems = loadedScope === scopeKey ? items : [];
+  const scopedProfile = loadedScope === scopeKey ? profile : null;
+
   // Tab counts
   const counts = React.useMemo(() => {
     let activeCount = 0;
@@ -190,7 +230,7 @@ export function MemoryPage({ active }: { active: boolean }) {
     let dismissedCount = 0;
     let factsCount = 0;
     let archivedCount = 0;
-    for (const m of items) {
+    for (const m of scopedItems) {
       if (m.status === "archived") {
         archivedCount++;
         continue;
@@ -201,11 +241,11 @@ export function MemoryPage({ active }: { active: boolean }) {
       if (m.kind === "repo_fact") factsCount++;
     }
     return { activeCount, pendingCount, dismissedCount, factsCount, archivedCount };
-  }, [items]);
+  }, [scopedItems]);
 
   const visibleItems = React.useMemo(() => {
     const q = search.trim().toLowerCase();
-    return items.filter((m) => {
+    return scopedItems.filter((m) => {
       if (filterTab === "archived") {
         if (m.status !== "archived") return false;
       } else {
@@ -224,27 +264,31 @@ export function MemoryPage({ active }: { active: boolean }) {
         m.scope_globs.some((g) => g.toLowerCase().includes(q))
       );
     });
-  }, [items, filterTab, search]);
+  }, [scopedItems, filterTab, search]);
 
   /* -------------------- Actions -------------------- */
   const handleAdd = async () => {
-    if (!isValidRepo(repo)) return toastErr("Memory", "Select a repository first.");
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!isValidRepo(targetRepo)) return toastErr("Memory", "Select a repository first.");
     const text = addText.trim();
     if (!text) return toastErr("Add learning", "Enter learning text first.");
     try {
-      const created = await createRepoMemory(repo, {
+      const created = await createRepoMemory(targetRepo, {
         kind: addKind,
         text,
         scope_globs: parseGlobs(addGlobs),
         blocking: addBlocking,
         status: "active",
       });
-      toastOk("Learning added", `#${created.id.slice(0, 8)} · ${repo}`);
+      toastOk("Learning added", `#${created.id.slice(0, 8)} · ${targetRepo}`);
+      if (currentScopeRef.current !== targetScope) return;
       setAddText("");
       setAddGlobs("**");
       setAddBlocking(false);
       setAddOpen(false);
-      await loadMemory(repo);
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Create failed", errText(e, 240));
     }
@@ -259,65 +303,89 @@ export function MemoryPage({ active }: { active: boolean }) {
   };
 
   const handleEditSave = async () => {
-    if (!editTarget || !isValidRepo(repo)) return;
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!editTarget || !isValidRepo(targetRepo)) return;
+    const targetId = editTarget.id;
     const text = editText.trim();
     if (!text) return toastErr("Edit learning", "Text cannot be empty.");
     try {
-      await updateRepoMemory(repo, editTarget.id, {
+      await updateRepoMemory(targetRepo, targetId, {
         text,
         scope_globs: parseGlobs(editGlobs),
         blocking: editBlocking,
         status: editStatus,
       });
-      toastOk("Learning updated", `#${editTarget.id.slice(0, 8)}`);
+      toastOk("Learning updated", `#${targetId.slice(0, 8)}`);
+      if (currentScopeRef.current !== targetScope) return;
       setEditTarget(null);
-      await loadMemory(repo);
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Update failed", errText(e, 240));
     }
   };
 
   const handleApprove = async (m: MemoryEntry) => {
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!isValidRepo(targetRepo) || loadedScope !== targetScope) return;
     try {
-      await approveRepoMemory(repo, m.id);
+      await approveRepoMemory(targetRepo, m.id);
       toastOk("Approved learning", `#${m.id.slice(0, 8)} is now active.`);
-      await loadMemory(repo);
+      if (currentScopeRef.current !== targetScope) return;
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Approve failed", errText(e, 220));
     }
   };
 
   const handleArchive = async (m: MemoryEntry) => {
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!isValidRepo(targetRepo) || loadedScope !== targetScope) return;
     try {
-      await updateRepoMemory(repo, m.id, { status: "archived" });
+      await updateRepoMemory(targetRepo, m.id, { status: "archived" });
       toastOk("Archived learning", `#${m.id.slice(0, 8)}`);
-      await loadMemory(repo);
+      if (currentScopeRef.current !== targetScope) return;
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Archive failed", errText(e, 220));
     }
   };
 
   const handleDelete = async () => {
-    if (!deleteTarget) return;
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!deleteTarget || !isValidRepo(targetRepo)) return;
+    const targetId = deleteTarget.id;
     try {
-      await deleteRepoMemory(repo, deleteTarget.id);
-      toastOk("Deleted learning", `#${deleteTarget.id.slice(0, 8)}`);
+      await deleteRepoMemory(targetRepo, targetId);
+      toastOk("Deleted learning", `#${targetId.slice(0, 8)}`);
+      if (currentScopeRef.current !== targetScope) return;
       setDeleteTarget(null);
-      await loadMemory(repo);
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Delete failed", errText(e, 220));
     }
   };
 
   const handleBootstrap = async () => {
-    if (!isValidRepo(repo)) return toastErr("Bootstrap", "Select a valid repository first.");
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!isValidRepo(targetRepo)) return toastErr("Bootstrap", "Select a valid repository first.");
     try {
-      const res = await bootstrapRepoMemory(repo);
+      const res = await bootstrapRepoMemory(targetRepo);
       toastOk(
         "Repo memory bootstrapped",
-        `${repo}: added ${res.created.length} repo fact(s) (${res.skipped} already known).`,
+        `${targetRepo}: added ${res.created.length} repo fact(s) (${res.skipped} already known).`,
       );
-      await loadMemory(repo);
+      if (currentScopeRef.current !== targetScope) return;
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Bootstrap failed", errText(e, 260));
     }
@@ -325,7 +393,7 @@ export function MemoryPage({ active }: { active: boolean }) {
 
   const handleExportJson = async () => {
     if (!isValidRepo(repo)) return toastErr("Export", "Select a repository first.");
-    const payload = JSON.stringify({ repo, exported_at: new Date().toISOString(), items }, null, 2);
+    const payload = JSON.stringify({ repo, exported_at: new Date().toISOString(), items: scopedItems }, null, 2);
     try {
       const blob = new Blob([payload], { type: "application/json" });
       const url = URL.createObjectURL(blob);
@@ -336,10 +404,10 @@ export function MemoryPage({ active }: { active: boolean }) {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      toastOk("Exported JSON", `${items.length} memory entry(ies) downloaded.`);
+      toastOk("Exported JSON", `${scopedItems.length} memory entry(ies) downloaded.`);
     } catch {
       const copied = await copyToClipboard(payload);
-      if (copied) toastOk("Copied JSON", `${items.length} memory entry(ies) copied to clipboard.`);
+      if (copied) toastOk("Copied JSON", `${scopedItems.length} memory entry(ies) copied to clipboard.`);
       else toastErr("Export failed", "Could not download or copy JSON.");
     }
   };
@@ -353,7 +421,10 @@ export function MemoryPage({ active }: { active: boolean }) {
   };
 
   const handleImportSubmit = async () => {
-    if (!isValidRepo(repo)) return toastErr("Import", "Select a repository first.");
+    const targetRepo = repo.trim();
+    const targetBackend = backend;
+    const targetScope = `${targetBackend}::${targetRepo}`;
+    if (!isValidRepo(targetRepo)) return toastErr("Import", "Select a repository first.");
     let parsed: unknown;
     try {
       parsed = JSON.parse(importText);
@@ -367,49 +438,73 @@ export function MemoryPage({ active }: { active: boolean }) {
         : null;
     if (!list) return toastErr("Invalid JSON", "Expected a JSON array or an object with an `items` array.");
     try {
-      const res = await importRepoMemory(repo, list);
+      const res = await importRepoMemory(targetRepo, list);
       toastOk("Memory imported", `Imported ${res.imported}, skipped ${res.skipped}.`);
+      if (currentScopeRef.current !== targetScope) return;
       setImportText("");
       setImportOpen(false);
-      await loadMemory(repo);
+      await loadMemory(targetRepo, targetBackend);
     } catch (e) {
       toastErr("Import failed", errText(e, 240));
     }
   };
 
+  const syncMatchesCurrent = Boolean(
+    syncMarkdown && syncTargetScope && syncTargetScope === scopeKey && syncTargetRepo === repo.trim(),
+  );
+
   const openSyncMarkdown = async () => {
-    if (!isValidRepo(repo)) return toastErr("Sync memory", "Select a repository first.");
+    const targetRepo = repo.trim();
+    if (!isValidRepo(targetRepo)) return toastErr("Sync memory", "Select a repository first.");
+    const targetScope = `${backend}::${targetRepo}`;
+    const mine = ++syncSeq.current;
     setSyncOpen(true);
     setSyncLoading(true);
+    setSyncMarkdown("");
+    setSyncTargetScope("");
+    setSyncTargetRepo(targetRepo);
     try {
-      const res = await getRepoMemoryMarkdown(repo);
+      const res = await getRepoMemoryMarkdown(targetRepo);
+      if (mine !== syncSeq.current || currentScopeRef.current !== targetScope) return;
       setSyncMarkdown(res.markdown || "# PR Agent Memory\n\nNo active learnings yet.\n");
+      setSyncTargetScope(targetScope);
     } catch (e) {
+      if (mine !== syncSeq.current || currentScopeRef.current !== targetScope) return;
       setSyncMarkdown("");
+      setSyncTargetScope("");
       toastErr("Could not render memory.md", errText(e, 240));
     } finally {
-      setSyncLoading(false);
+      if (mine === syncSeq.current && currentScopeRef.current === targetScope) setSyncLoading(false);
     }
   };
 
   const commitMemoryMarkdown = async () => {
-    if (!isValidRepo(repo)) return toastErr("Sync memory", "Select a repository first.");
+    const targetRepo = repo.trim();
+    if (!isValidRepo(targetRepo)) return toastErr("Sync memory", "Select a repository first.");
+    if (!syncMatchesCurrent) {
+      return toastErr(
+        "Preview out of date",
+        "Markdown preview does not match the selected repository. Re-open Sync to refresh.",
+      );
+    }
     if (!githubToken) {
       return toastErr("GitHub token required", "Sign in with GitHub first to commit .pr-agent/memory.md.");
     }
+    const targetScope = syncTargetScope;
+    const markdownToCommit = syncMarkdown;
     try {
       const res = await githubCommitRepoFile(
         githubToken,
-        repo,
+        targetRepo,
         ".pr-agent/memory.md",
-        syncMarkdown,
+        markdownToCommit,
         "chore(pr-agent): sync .pr-agent/memory.md",
       );
       toastOk(
         res.changed ? "Synced .pr-agent/memory.md" : ".pr-agent/memory.md already up to date",
-        `${repo} (${res.sha.slice(0, 8)})`,
+        `${targetRepo} (${res.sha.slice(0, 8)})`,
       );
-      setSyncOpen(false);
+      if (currentScopeRef.current === targetScope) setSyncOpen(false);
     } catch (e) {
       toastErr("Commit failed", errText(e, 260));
     }
@@ -429,7 +524,7 @@ export function MemoryPage({ active }: { active: boolean }) {
         action={
           repo ? (
             <Badge variant="outline" className="font-mono">
-              {items.length} entries
+              {scopedItems.length} entries
             </Badge>
           ) : null
         }
@@ -504,39 +599,39 @@ export function MemoryPage({ active }: { active: boolean }) {
             variant="ghost"
             size="sm"
             disabled={!isValidRepo(repo) || loading}
-            onClick={() => loadMemory(repo)}
+            onClick={() => loadMemory(repo, backend)}
           >
             <RefreshCw className={loading ? "animate-spin" : ""} /> Refresh
           </AsyncButton>
         </ButtonRow>
 
         {/* Detected Repo Profile */}
-        {profile &&
-        (profile.languages?.length ||
-          profile.frameworks?.length ||
-          profile.test_commands?.length ||
-          profile.build_commands?.length) ? (
+        {scopedProfile &&
+        (scopedProfile.languages?.length ||
+          scopedProfile.frameworks?.length ||
+          scopedProfile.test_commands?.length ||
+          scopedProfile.build_commands?.length) ? (
           <div className="bg-muted/25 flex flex-wrap items-center gap-2 rounded-lg border px-3.5 py-2.5 text-xs">
             <BookOpen className="text-primary size-3.5 shrink-0" />
             <span className="font-medium">Repo profile:</span>
-            {profile.languages?.map((l) => (
+            {scopedProfile.languages?.map((l) => (
               <Badge key={`lang-${l}`} variant="secondary" className="text-[10px]">
                 {l}
               </Badge>
             ))}
-            {profile.frameworks?.map((fw) => (
+            {scopedProfile.frameworks?.map((fw) => (
               <Badge key={`fw-${fw}`} variant="outline" className="text-[10px]">
                 {fw}
               </Badge>
             ))}
-            {profile.test_commands?.length ? (
+            {scopedProfile.test_commands?.length ? (
               <span className="text-muted-foreground">
-                test: <code>{profile.test_commands[0]}</code>
+                test: <code>{scopedProfile.test_commands[0]}</code>
               </span>
             ) : null}
-            {profile.build_commands?.length ? (
+            {scopedProfile.build_commands?.length ? (
               <span className="text-muted-foreground">
-                build: <code>{profile.build_commands[0]}</code>
+                build: <code>{scopedProfile.build_commands[0]}</code>
               </span>
             ) : null}
           </div>
@@ -604,7 +699,7 @@ export function MemoryPage({ active }: { active: boolean }) {
           <Hint className="py-6 text-center text-xs">
             Choose a repository above (or type <code>owner/repo</code> and click Load) to view and edit its memory.
           </Hint>
-        ) : loading && items.length === 0 ? (
+        ) : loading && scopedItems.length === 0 ? (
           <div className="grid gap-2.5">
             <Skeleton className="h-24 rounded-lg" />
             <Skeleton className="h-24 rounded-lg" />
@@ -883,19 +978,27 @@ export function MemoryPage({ active }: { active: boolean }) {
               exact same conventions.
             </DialogDescription>
           </DialogHeader>
-          {syncLoading ? <Skeleton className="h-48 rounded-md" /> : <Console tall>{syncMarkdown}</Console>}
+          {syncLoading ? (
+            <Skeleton className="h-48 rounded-md" />
+          ) : syncMatchesCurrent ? (
+            <Console tall>{syncMarkdown}</Console>
+          ) : (
+            <Hint className="py-6 text-center text-xs">
+              Preview unavailable for {repo}. Re-open Sync to render the latest Markdown.
+            </Hint>
+          )}
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
-              disabled={!syncMarkdown}
+              disabled={syncLoading || !syncMatchesCurrent}
               onClick={async () => {
-                if (await copyToClipboard(syncMarkdown)) toastOk("Copied", ".pr-agent/memory.md");
+                if (syncMatchesCurrent && (await copyToClipboard(syncMarkdown))) toastOk("Copied", ".pr-agent/memory.md");
               }}
             >
               <ClipboardCopy /> Copy Markdown
             </Button>
-            <AsyncButton onClick={commitMemoryMarkdown} disabled={syncLoading || !syncMarkdown}>
+            <AsyncButton onClick={commitMemoryMarkdown} disabled={syncLoading || !syncMatchesCurrent}>
               <FileCode2 /> Commit .pr-agent/memory.md
             </AsyncButton>
           </DialogFooter>

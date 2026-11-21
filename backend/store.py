@@ -801,6 +801,28 @@ def eval_delete(eid: str) -> None:
 
 
 @contextlib.contextmanager
+def key_lock(lock_key: str, lease_s: int = 15, wait_s: float = 5.0):
+    """Cross-worker exclusive lease on ``lock_key`` (Redis NX + compare-and-delete).
+
+    Waits up to ``wait_s`` seconds to acquire the lease. Yields the lock token,
+    or raises ``TimeoutError`` if the lock could not be acquired in time.
+    """
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    while not rset(lock_key, token, ex=max(1, int(lease_s)), nx=True):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"could not acquire lock {lock_key}")
+        time.sleep(0.02)
+    try:
+        yield token
+    finally:
+        try:
+            rdelete_if_equal(lock_key, token)
+        except Exception as exc:  # the lease simply expires
+            log.warning("store.key_lock(%s) release failed: %s", lock_key, exc)
+
+
+@contextlib.contextmanager
 def eval_lock(eid: str, lease_s: int = EVAL_LOCK_LEASE_S):
     """Short exclusive lease on one evaluation; yields a token or ``None``.
 

@@ -64,7 +64,7 @@ index 1111111..2222222 100644
 +    return token == expected
  
  def helper():
-@@ -40,3 +42,4 @@ def helper():
+@@ -40,2 +42,3 @@ def helper():
      x = 1
 +    y = x + 1
      return x
@@ -1089,7 +1089,7 @@ def test_run_structured_review_incremental_dedupe_across_two_pushes():
 diff --git a/backend/auth.py b/backend/auth.py
 --- a/backend/auth.py
 +++ b/backend/auth.py
-@@ -10,3 +10,5 @@ def check(token):
+@@ -10,2 +10,4 @@ def check(token):
      if not token:
          return False
 +    db.execute(f"SELECT '{token}'")
@@ -1101,7 +1101,7 @@ diff --git a/backend/auth.py b/backend/auth.py
 diff --git a/backend/auth.py b/backend/auth.py
 --- a/backend/auth.py
 +++ b/backend/auth.py
-@@ -10,5 +10,5 @@ def check(token):
+@@ -10,4 +10,4 @@ def check(token):
      if not token:
          return False
 -    db.execute(f"SELECT '{token}'")
@@ -1116,18 +1116,37 @@ new file mode 100644
 +    assert amount > 0
 +    return amount * 100
 """
+    push2_full_diff = """\
+diff --git a/backend/auth.py b/backend/auth.py
+--- a/backend/auth.py
++++ b/backend/auth.py
+@@ -10,2 +10,4 @@ def check(token):
+     if not token:
+         return False
++    db.execute("SELECT %s", (token,))
++    return token == SECRET
+diff --git a/backend/billing.py b/backend/billing.py
+new file mode 100644
+--- /dev/null
++++ b/backend/billing.py
+@@ -0,0 +1,3 @@
++def charge(amount):
++    assert amount > 0
++    return amount * 100
+"""
     repo_yaml = "profile: assertive\nscore_threshold: 88\n"
     posted_reviews: list[dict] = []
     issue_comments: list[dict] = []
     next_id = {"n": 100}
+    cur_diff = {"text": push1_diff}
 
     def gh_handler(method, url, headers, params, body):
         if method == "GET" and url.endswith("/contents/.pragent.yaml"):
             assert params.get("ref") == "main"
             return _FakeResp(200, {"sha": "cfgsha1", "content": base64.b64encode(repo_yaml.encode()).decode()})
         if method == "GET" and url.endswith("/pulls/42") and headers.get("Accept") == "application/vnd.github.diff":
-            return _FakeResp(200, text=push1_diff)
-        if method == "GET" and "/compare/sha_push_1...sha_push_2" in url:
+            return _FakeResp(200, text=cur_diff["text"])
+        if method == "GET" and "/compare/aaa1111_push1...bbb2222_push2" in url:
             return _FakeResp(200, text=push2_inc_diff)
         if method == "POST" and url.endswith("/pulls/42/reviews"):
             next_id["n"] += 1
@@ -1220,7 +1239,7 @@ new file mode 100644
             {
                 "repo": "acme/app",
                 "pr_number": 42,
-                "sha": "sha_push_1",
+                "sha": "aaa1111_push1",
                 "base_ref": "main",
                 "base_sha": "base000",
                 "title": "Add token verification",
@@ -1237,7 +1256,7 @@ new file mode 100644
     assert res1["cpu_seconds"] == 0.0
     assert res1["review_posted"] is True
     assert res1["pr_comment_posted"] is True
-    assert res1["last_reviewed_sha"] == "sha_push_1"
+    assert res1["last_reviewed_sha"] == "aaa1111_push1"
     assert len(res1["new_findings"]) == 2
     assert len(res1["findings"]) == 2
     assert len(posted_reviews) == 1
@@ -1245,6 +1264,7 @@ new file mode 100644
     assert "_Based on repo learning #rule7_" in posted_reviews[0]["comments"][1]["body"]
 
     # --- Push 2 (incremental) ---
+    cur_diff["text"] = push2_full_diff
     # LLM re-emits the unchanged timing-leak finding on line 13 + a genuinely new finding in billing.py
     p2_replies = iter([
         json.dumps({
@@ -1295,7 +1315,7 @@ new file mode 100644
             {
                 "repo": "acme/app",
                 "pr_number": 42,
-                "sha": "sha_push_2",
+                "sha": "bbb2222_push2",
                 "base_ref": "main",
                 "base_sha": "base000",
                 "title": "Add token verification",
@@ -1308,7 +1328,7 @@ new file mode 100644
         )
     )
     assert res2["status"] == "completed"
-    assert res2["last_reviewed_sha"] == "sha_push_2"
+    assert res2["last_reviewed_sha"] == "bbb2222_push2"
     # Old SQLi finding (line 12) was marked outdated!
     outdated = list_pr_findings("acme/app", 42, state="outdated")
     assert len(outdated) == 1 and outdated[0]["title"] == "SQL injection in check"
@@ -1322,9 +1342,9 @@ new file mode 100644
         "Avoid assert for runtime validation",
         "Timing leak in token compare",
     ]
-    # Sticky summary comment was PATCHed in place (still 1 sticky comment!) with incremental range
+    # Sticky summary comment was PATCHed in place (still 1 sticky comment!) with exact incremental range
     assert len(issue_comments) == 1
-    assert "`sha_pus..sha_pus`" in issue_comments[0]["body"] or "incremental" in issue_comments[0]["body"]
+    assert "`aaa1111..bbb2222`" in issue_comments[0]["body"]
 
 
 def test_publish_review_multiline_422_succeeds_on_single_line_retry():
@@ -1486,4 +1506,107 @@ def test_run_structured_review_draft_skip_force_full_and_validation_errors():
     assert forced["last_reviewed_sha"] == "head222"
     assert not any("/compare/" in u for u in seen_urls)
     assert any(u.endswith("/pulls/3") for u in seen_urls)
+
+
+def test_yaml_escapes_off_boolean_duplicate_keys_and_unset_export():
+    # Single-pass double-quoted escape decoding round-trips literal \n vs real newline
+    y_esc = 'path_instructions:\n  - path: "src/**"\n    instructions: "literal \\\\n and real \\nline"\n'
+    cfg_pure = parse_pragent_yaml(y_esc, use_pyyaml=False)
+    cfg_py = parse_pragent_yaml(y_esc, use_pyyaml=True)
+    assert cfg_pure.path_instructions[0].instructions == "literal \\n and real \nline"
+    assert cfg_py.path_instructions[0].instructions == cfg_pure.path_instructions[0].instructions
+
+    # merge_gate: off stays string "off" while auto_review.enabled: false is bool False in BOTH parsers
+    y_off = "merge_gate: off\nauto_review:\n  enabled: false\n"
+    for use_py in (True, False):
+        cfg = parse_pragent_yaml(y_off, use_pyyaml=use_py)
+        assert cfg.merge_gate == "off"
+        assert cfg.auto_review.enabled is False
+
+    # Duplicate keys are rejected in BOTH parsers (including flow and sequence mappings)
+    dup_block = "profile: chill\nprofile: assertive\n"
+    dup_flow = "memory: {enabled: true, enabled: false}\n"
+    dup_seq = "path_instructions:\n  - path: src/**\n    path: lib/**\n    instructions: hi\n"
+    for sample in (dup_block, dup_flow, dup_seq):
+        for use_py in (True, False):
+            with pytest.raises(ValueError, match="duplicate"):
+                parse_pragent_yaml(sample, use_pyyaml=use_py)
+
+    # Export preserves inherited settings (omits unset fields) while keeping explicit chill
+    partial = parse_pragent_yaml("memory:\n  enabled: false\n", use_pyyaml=True)
+    exported = render_pragent_yaml(partial)
+    assert "profile:" not in exported
+    reimported = parse_pragent_yaml(exported, use_pyyaml=True)
+    merged = merge_agent_and_repo_config({"profile": "assertive"}, reimported)
+    assert merged["profile"] == "assertive"
+    assert merged["memory_enabled"] is False
+
+    explicit_chill = parse_pragent_yaml("profile: chill\n", use_pyyaml=True)
+    assert "profile: chill" in render_pragent_yaml(explicit_chill)
+
+
+def test_diff_canonical_paths_path_filter_fallback_min_slice_and_line_shift():
+    from review.diff import select_budgeted_files
+    # a/foo must NOT overwrite foo
+    diff_a = (
+        "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1,1 +1,2 @@\n root\n+root2\n"
+        "diff --git a/a/foo b/a/foo\n--- a/a/foo\n+++ b/a/foo\n@@ -1,1 +1,2 @@\n nested\n+nested2\n"
+    )
+    parsed = parse_unified_diff(diff_a)
+    assert parsed.get_file("foo").right_code[2] == "root2"
+    assert parsed.get_file("a/foo").right_code[2] == "nested2"
+
+    # Excluded lockfile-only PR must NOT leak into noisy fallback
+    lock_diff = (
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,1 +1,2 @@\n {}\n+{\"a\":1}\n"
+    )
+    sel, _ = select_budgeted_files(
+        parse_unified_diff(lock_diff), 1000, path_filters={"exclude": ["package-lock.json"]}
+    )
+    assert sel == []
+
+    # Complete small chunk fits even when remaining < _MIN_FILE_SLICE (120)
+    big_src = _file_diff("src/big.py", 12)
+    tiny_doc = "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n+x\n"
+    combo = parse_unified_diff(big_src + tiny_doc)
+    budget = len(big_src) + len(tiny_doc) + 5  # remaining after big_src is < 120 but >= len(tiny_doc)
+    sel2, _ = select_budgeted_files(combo, budget)
+    assert any(df.path == "a.md" for df, _ in sel2)
+
+    # Line-shift remapping: inserting 10 lines above line 100 shifts finding to line 110
+    shift_diff = (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -1,1 +1,11 @@\n top\n" + "".join(f"+ins{i}\n" for i in range(10))
+    )
+    df_shift = parse_unified_diff(shift_diff).get_file("app.py")
+    was_mod, new_lo, new_hi = df_shift.span_modified_or_remapped(100, 100, "RIGHT")
+    assert was_mod is False and new_lo == 110 and new_hi == 110
+
+
+def test_pipeline_scoped_dismissal_nan_confidence_suggestion_clear_and_pass_b_error():
+    from review.pipeline import LLMCallError, _coerce_finding, _format_dismissed_hints, _validate_and_align_location
+
+    # Scoped dismissal includes path scope in Pass B prompt
+    hint = _format_dismissed_hints({"dismissed": [{"text": "Avoid assert", "scope_globs": ["tests/**"]}]})
+    assert "tests/**" in hint
+
+    # Non-finite confidence is rejected instead of clamping to 1.0
+    for bad_conf in ("NaN", float("nan"), float("inf"), float("-inf")):
+        assert _coerce_finding({
+            "file": "a.py", "start_line": 1, "end_line": 1, "title": "T", "confidence": bad_conf
+        }) is None
+
+    # Shortening multiline range clears even a 1-line suggestion patch
+    df = parse_unified_diff(SAMPLE_DIFF).get_file("backend/auth.py")
+    aligned = _validate_and_align_location(df, 1, 13, "RIGHT", "    fixed_one_line()")
+    assert aligned is not None and aligned[3] is None
+
+    # Pass B raises LLMCallError when all repair attempts return empty/invalid content
+    async def bad_llm(messages, json_mode):
+        return ""
+
+    with pytest.raises(LLMCallError):
+        asyncio.run(generate_findings(parse_unified_diff(SAMPLE_DIFF), {"repo": "o/r", "pr_number": 1}, llm_call=bad_llm))
+
 

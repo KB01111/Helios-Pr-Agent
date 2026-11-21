@@ -375,7 +375,7 @@ class ReviewOnlyProvider:
 
         raw_repo = str(pr_context.get("repo") or "")
         memories_provider = None
-        if agent_config.get("memory_enabled", True) and raw_repo:
+        if raw_repo:
             def _load_memories(changed_paths: list[str], diff_text: str) -> dict[str, Any]:
                 return retrieve_for_diff(raw_repo, changed_paths, diff_text)
 
@@ -388,9 +388,10 @@ class ReviewOnlyProvider:
             force_full=bool(pr_context.get("force_full")),
         )
 
-        # Best-effort post-review merge readiness recompute
+        # Best-effort post-review merge readiness recompute (skip discarded stale-head reviews)
         if (
             result.get("status") in ("completed", "completed_no_comment")
+            and not result.get("stale_head")
             and not pr_context.get("skip_readiness")
         ):
             try:

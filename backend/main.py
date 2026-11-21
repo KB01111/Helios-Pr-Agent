@@ -222,11 +222,10 @@ class PathInstruction(BaseModel):
 
 _TOOL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
-_MEM_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def _valid_agent_id(value: str) -> bool:
-    return bool(_AGENT_ID_RE.fullmatch(value)) and value not in (".", "..") and ".." not in value
+    return bool(_AGENT_ID_RE.fullmatch(value)) and value not in (".", "..")
 
 # Agent settings added for the review engine, repo memory and merge readiness.
 # Agents stored before they existed read back with these defaults.
@@ -378,12 +377,18 @@ def _allow_unsigned_webhooks() -> bool:
     return os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").strip().lower() in ("1", "true", "yes")
 
 
-def _verify_signature(raw: bytes, signature: str | None) -> bool:
+_APP_ONLY_WEBHOOK_EVENTS = frozenset({"installation", "installation_repositories"})
+
+
+def _verify_signature(raw: bytes, signature: str | None, *, event: str = "") -> bool:
     """Verify X-Hub-Signature-256.
 
     Fails closed whenever a webhook secret is unreadable OR when
     ``BACKEND_API_TOKEN`` is configured in production (unless explicitly opted
     in via ``ALLOW_UNSIGNED_WEBHOOKS=1`` for local development).
+    App-only lifecycle events (``installation``, ``installation_repositories``)
+    require ``GITHUB_APP_WEBHOOK_SECRET`` whenever any webhook secret is set,
+    preventing a repo-secret holder from forging installation cache entries.
     """
     secrets = _webhook_secrets()
     if not secrets and runtime_settings.webhook_secret_locked():
@@ -398,6 +403,12 @@ def _verify_signature(raw: bytes, signature: str | None) -> bool:
         return True
     if not signature:
         return False
+    if event in _APP_ONLY_WEBHOOK_EVENTS:
+        app_secret = (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip()
+        if not app_secret:
+            return False
+        mac = hmac.new(app_secret.encode(), raw, hashlib.sha256).hexdigest()
+        return _constant_time_equal(f"sha256={mac}", signature)
     ok = False
     for secret in secrets:  # check every secret: no early exit on a match
         mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -575,49 +586,105 @@ async def _find_repo_agent(repo: str) -> dict[str, Any] | None:
     return None
 
 
+async def _resolve_pr_base_ref(repo: str, pr_number: int) -> str:
+    """Resolve a PR's target base branch ref via GitHub API (best-effort)."""
+    if not dm.valid_repo(repo) or pr_number <= 0:
+        return ""
+    if github_app.auth_mode() != "none":
+        try:
+            import httpx
+
+            token, _ = await github_app.token_for_repo(repo)
+            if token:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(
+                        f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+                        headers={
+                            "Accept": "application/vnd.github+json",
+                            "Authorization": f"Bearer {token}",
+                            "X-GitHub-Api-Version": "2022-11-28",
+                        },
+                    )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    base = data.get("base") if isinstance(data, dict) else None
+                    if isinstance(base, dict) and isinstance(base.get("ref"), str) and base["ref"].strip():
+                        return base["ref"].strip()
+        except Exception as exc:
+            log.debug("base_ref lookup failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+    return ""
+
+
 async def _effective_readiness_config(
-    repo: str, agent_cfg: dict[str, Any] | None = None, base_ref: str = ""
+    repo: str,
+    agent_cfg: dict[str, Any] | None = None,
+    base_ref: str = "",
+    *,
+    pr_number: int | None = None,
 ) -> dict[str, Any]:
-    """Merge the repo's agent v2 config with cached or base-branch `.pragent.yaml`."""
+    """Merge the repo's agent v2 config with the PR base-branch `.pragent.yaml`.
+
+    Cached repo configuration is only reused when the PR's base branch is known
+    and matches the cached ``ref``; otherwise the base branch's config is loaded
+    so a PR targeting a non-default branch (e.g. ``release``) never inherits
+    ``main``'s policy.
+    """
     base_agent = (
         _agent_v2(agent_cfg)
         if isinstance(agent_cfg, dict)
         else (await _find_repo_agent(repo) or dict(AGENT_V2_DEFAULTS))
     )
+    resolved_base = (base_ref or "").strip()
+    if not resolved_base and pr_number and pr_number > 0:
+        resolved_base = await _resolve_pr_base_ref(repo, int(pr_number))
     repo_cfg: review_mod.RepoConfig | None = None
     try:
         cached = await store.arget_json(dm.repo_config_key(repo))
         if (
-            isinstance(cached, dict)
+            resolved_base
+            and isinstance(cached, dict)
             and isinstance(cached.get("config"), dict)
-            and (not base_ref or cached.get("ref") == base_ref)
+            and cached.get("ref") == resolved_base
         ):
             repo_cfg = review_mod.RepoConfig.model_validate(cached["config"])
-        elif github_app.auth_mode() != "none":
+        elif resolved_base and github_app.auth_mode() != "none":
             token, _ = await github_app.token_for_repo(repo)
             if token:
-                target_ref = base_ref or (cached.get("ref") if isinstance(cached, dict) else "") or "main"
-                repo_cfg = await review_mod.load_repo_config(repo, str(target_ref), token)
+                repo_cfg = await review_mod.load_repo_config(repo, resolved_base, token)
+        elif not pr_number and isinstance(cached, dict) and isinstance(cached.get("config"), dict):
+            # Non-PR caller with no explicit base_ref: use cached repo config as before.
+            repo_cfg = review_mod.RepoConfig.model_validate(cached["config"])
     except Exception as exc:
         log.debug("readiness repo config merge skipped for %s (%s)", repo, type(exc).__name__)
     return review_mod.merge_agent_and_repo_config(base_agent, repo_cfg)
 
 
-async def _bg_recompute_readiness(repo: str, pr_number: int) -> None:
+async def _bg_recompute_readiness(repo: str, pr_number: int, base_ref: str = "") -> None:
     """Best-effort background merge-readiness recomputation for one PR."""
     try:
-        merged_cfg = await _effective_readiness_config(repo)
+        merged_cfg = await _effective_readiness_config(repo, base_ref=base_ref, pr_number=pr_number)
         raw_weights = merged_cfg.get("weights")
         weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
         await merge_mod.recompute_pr_readiness(
             repo, pr_number, agent_config=merged_cfg, weights=weights
         )
+        # If a newer event marked the PR dirty while this recompute was in flight,
+        # publish_readiness preserved the newer dirty marker via compare-and-delete.
+        # Clear the debounce key so the next sweep or event can process it promptly.
+        if await asyncio.to_thread(events.is_dirty, repo, pr_number):
+            debounce_key = f"readinessdebounce:{repo.lower()}:{int(pr_number)}"
+            await store.ardelete(debounce_key)
     except Exception as exc:
         log.warning("readiness recompute failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
 
 
 async def _schedule_readiness_recompute(
-    repo: str, pr_number: int, tasks: BackgroundTasks | None = None
+    repo: str,
+    pr_number: int,
+    tasks: BackgroundTasks | None = None,
+    *,
+    bypass_debounce: bool = False,
+    base_ref: str = "",
 ) -> bool:
     """Schedule a debounced background merge-readiness recompute when GitHub auth is available."""
     if not dm.valid_repo(repo) or pr_number <= 0:
@@ -625,12 +692,14 @@ async def _schedule_readiness_recompute(
     if github_app.auth_mode() == "none":
         return False
     debounce_key = f"readinessdebounce:{repo.lower()}:{int(pr_number)}"
-    if not await store.arset(debounce_key, "1", ex=_READINESS_DEBOUNCE_S, nx=True):
+    if bypass_debounce:
+        await store.arset(debounce_key, "1", ex=_READINESS_DEBOUNCE_S)
+    elif not await store.arset(debounce_key, "1", ex=_READINESS_DEBOUNCE_S, nx=True):
         return False
     if tasks is not None:
-        tasks.add_task(_bg_recompute_readiness, repo, int(pr_number))
+        tasks.add_task(_bg_recompute_readiness, repo, int(pr_number), base_ref)
     else:
-        asyncio.create_task(_bg_recompute_readiness(repo, int(pr_number)))
+        asyncio.create_task(_bg_recompute_readiness(repo, int(pr_number), base_ref))
     return True
 
 
@@ -874,7 +943,7 @@ async def _bg_handle_chat_mention(
         return await _run_manual_review_for_pr(r, pr_n, force_full=True, agent_cfg=agent_cfg)
 
     async def _recompute_readiness(r: str, pr_n: int) -> dict[str, Any] | None:
-        merged_cfg = await _effective_readiness_config(r, agent_cfg)
+        merged_cfg = await _effective_readiness_config(r, agent_cfg, pr_number=pr_n)
         raw_weights = merged_cfg.get("weights")
         weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
         out = await merge_mod.recompute_pr_readiness(r, pr_n, agent_config=merged_cfg, weights=weights)
@@ -900,7 +969,7 @@ async def _bg_handle_chat_mention(
 
 
 async def _handle_chat_mention(
-    event: str, payload: dict[str, Any], res: dict[str, Any], tasks: BackgroundTasks
+    event: str, payload: dict[str, Any], res: dict[str, Any], delivery: str, tasks: BackgroundTasks
 ) -> dict[str, Any]:
     """Route `@pr-agent` / `@<app-slug>` mentions on issue or review comments to `chat.handle_pr_mention`."""
     if not (res.get("recorded") and res.get("action") == "created") or res.get("duplicate"):
@@ -924,8 +993,15 @@ async def _handle_chat_mention(
     if assoc not in _COMMENT_ASSOC_ALLOWED:
         return res
 
-    agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
-    agent_configs = await store.arget_json_many(agent_keys)
+    try:
+        agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
+        agent_configs = await store.arget_json_many(agent_keys)
+    except Exception:
+        try:
+            await asyncio.to_thread(events.release_delivery, delivery)
+        except Exception as exc:
+            log.warning("could not release delivery=%s after chat lookup failure: %s", delivery, exc)
+        raise
     matched = _match_comment_agents(agent_configs, repo)
     if not matched:
         return {**res, "chat_skipped": "no-chat-enabled-agent"}
@@ -1210,7 +1286,9 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     sig = request.headers.get("X-Hub-Signature-256")
     # Webhook secrets and App credentials may live in the cloud settings.
     await asyncio.to_thread(runtime_settings.refresh)
-    if not _verify_signature(raw, sig):
+    event = (request.headers.get("X-GitHub-Event") or "").strip()
+    delivery = (request.headers.get("X-GitHub-Delivery") or "").strip()
+    if not _verify_signature(raw, sig, event=event):
         raise HTTPException(status_code=401, detail="bad webhook signature")
 
     try:
@@ -1220,8 +1298,6 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="invalid payload")
 
-    event = (request.headers.get("X-GitHub-Event") or "").strip()
-    delivery = (request.headers.get("X-GitHub-Delivery") or "").strip()
     if event == "ping":
         return JSONResponse({"pong": True}, status_code=202)
     if event and event != "pull_request":
@@ -1229,19 +1305,29 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         # by the event router (activity log, readiness marker, installations).
         res = await events.route(event, payload, delivery)
         if event == "issue_comment":
-            if res.get("mentions_agent") and res.get("action") == "created" and not res.get("duplicate"):
-                res = await _handle_chat_mention(event, payload, res, tasks)
+            comment_obj = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+            comment_body = str(comment_obj.get("body") or "")
+            if _REVIEW_CMD_RE.match(comment_body):
+                res = await _handle_issue_comment_trigger(payload, res, delivery, tasks)
+            elif res.get("mentions_agent") and res.get("action") == "created" and not res.get("duplicate"):
+                res = await _handle_chat_mention(event, payload, res, delivery, tasks)
             else:
                 res = await _handle_issue_comment_trigger(payload, res, delivery, tasks)
         elif event == "pull_request_review_comment":
             if res.get("mentions_agent") and res.get("action") == "created" and not res.get("duplicate"):
-                res = await _handle_chat_mention(event, payload, res, tasks)
+                res = await _handle_chat_mention(event, payload, res, delivery, tasks)
         elif event in ("check_suite", "check_run", "status", "pull_request_review", "pull_request_review_thread"):
             if res.get("recorded", 0) > 0 and not res.get("duplicate"):
                 repo_obj = payload.get("repository")
                 repo_ev = str(repo_obj.get("full_name") or "") if isinstance(repo_obj, dict) else ""
+                pr_payload_obj = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
+                base_obj = pr_payload_obj.get("base") if isinstance(pr_payload_obj.get("base"), dict) else {}
+                ev_base_ref = str(base_obj.get("ref") or "")
+                bypass = bool(event == "pull_request_review_thread" and res.get("finding_updated"))
                 for pr_num in res.get("prs") or []:
-                    await _schedule_readiness_recompute(repo_ev, int(pr_num), tasks)
+                    await _schedule_readiness_recompute(
+                        repo_ev, int(pr_num), tasks, bypass_debounce=bypass, base_ref=ev_base_ref
+                    )
         return JSONResponse(res, status_code=202)
 
     pr = payload.get("pull_request")
@@ -2236,7 +2322,7 @@ def _require_pr_number(pr_number: int) -> int:
 
 
 def _require_mem_id(mem_id: str) -> str:
-    if not _MEM_ID_RE.fullmatch(mem_id) or mem_id in (".", "..") or ".." in mem_id:
+    if not memory_mod.valid_memory_id(mem_id):
         raise HTTPException(status_code=400, detail="invalid memory id")
     return mem_id
 
@@ -2405,7 +2491,7 @@ async def recompute_pull_readiness(owner: str, name: str, pr_number: int, reques
     repo = _require_repo(owner, name)
     pr_num = _require_pr_number(pr_number)
     await asyncio.to_thread(runtime_settings.refresh)
-    merged_cfg = await _effective_readiness_config(repo)
+    merged_cfg = await _effective_readiness_config(repo, pr_number=pr_num)
     raw_weights = merged_cfg.get("weights")
     weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
     res = await merge_mod.recompute_pr_readiness(repo, pr_num, agent_config=merged_cfg, weights=weights)

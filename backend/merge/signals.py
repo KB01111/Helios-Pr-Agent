@@ -11,6 +11,7 @@ commit status never feed back into the score or trigger a self-blocking loop.
 from __future__ import annotations
 
 import logging
+import re
 import urllib.parse
 from typing import Any
 
@@ -35,12 +36,16 @@ log = logging.getLogger("pr-agent.merge.signals")
 GITHUB_API = "https://api.github.com"
 OWN_CHECK_RUN_NAME = "PR Agent · Merge readiness"
 OWN_STATUS_CONTEXT = "pr-agent/merge-readiness"
+_MAX_SIGNAL_PAGES = 10
+_NEXT_LINK_RE = re.compile(r'<[^>]+>\s*;\s*rel="?next"?', re.IGNORECASE)
 
 FAILING_CHECK_CONCLUSIONS = frozenset({
     "failure",
     "timed_out",
     "action_required",
     "startup_failure",
+    "cancelled",
+    "stale",
 })
 _CODE_EXTS = decider._SRC_EXTS | decider._UI_EXTS
 
@@ -70,6 +75,8 @@ class MergeSignals(BaseModel):
     pr_state: str = "open"
     base_ref: str = ""
     head_ref: str = ""
+    head_verified: bool = True
+    incomplete_signals: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -81,13 +88,26 @@ def is_own_check_run(run: dict[str, Any]) -> bool:
     """True when a GitHub Check Run belongs to this PR Agent."""
     if not isinstance(run, dict):
         return False
-    name = str(run.get("name") or "").strip()
-    if name.lower() == OWN_CHECK_RUN_NAME.lower():
-        return True
-    slug = github_app.app_slug().strip().lower()
     app = run.get("app") if isinstance(run.get("app"), dict) else {}
+    own_slug = github_app.app_slug().strip().lower()
+    own_id = _safe_int(github_app.app_id(), 0)
     run_slug = str(app.get("slug") or "").strip().lower()
-    return bool(slug and run_slug and run_slug == slug)
+    run_id = _safe_int(app.get("id"), 0)
+
+    # 1. Authoritative GitHub App identity check (numeric app id or slug).
+    if own_id > 0 and run_id > 0:
+        return run_id == own_id
+    if own_slug and run_slug:
+        return run_slug == own_slug
+
+    # 2. If our app identity is known AND the check run explicitly identifies an
+    #    external app, never exclude it by name (prevents name spoofing).
+    if (own_id > 0 or own_slug) and (run_id > 0 or run_slug):
+        return False
+
+    # 3. Fallback to check-run name only when app identity cannot be compared.
+    name = str(run.get("name") or "").strip()
+    return name.lower() == OWN_CHECK_RUN_NAME.lower()
 
 
 def is_own_status(status: dict[str, Any]) -> bool:
@@ -192,9 +212,17 @@ def _classify_checks(
     return failing, pending
 
 
-def _tally_reviews(reviews: list[dict[str, Any]]) -> tuple[int, int]:
-    """Count effective human approvals and change requests (latest decisive state per reviewer)."""
-    by_reviewer: dict[str, str] = {}
+def _tally_reviews(
+    reviews: list[dict[str, Any]],
+    *,
+    head_sha: str = "",
+) -> tuple[int, int, int]:
+    """Count effective human approvals, change requests, and approvals for ``head_sha``.
+
+    Returns ``(approvals, changes_requested, head_approvals)`` using each human
+    reviewer's latest decisive review state (and its ``commit_id``).
+    """
+    by_reviewer: dict[str, tuple[str, str]] = {}
     for rev in reviews:
         if not isinstance(rev, dict):
             continue
@@ -206,10 +234,17 @@ def _tally_reviews(reviews: list[dict[str, Any]]) -> tuple[int, int]:
             continue
         state = str(rev.get("state") or "").strip().upper()
         if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-            by_reviewer[login] = state
-    approvals = sum(1 for st in by_reviewer.values() if st == "APPROVED")
-    changes_requested = sum(1 for st in by_reviewer.values() if st == "CHANGES_REQUESTED")
-    return approvals, changes_requested
+            commit_id = str(rev.get("commit_id") or "").strip().lower()
+            by_reviewer[login] = (state, commit_id)
+    approvals = sum(1 for st, _ in by_reviewer.values() if st == "APPROVED")
+    changes_requested = sum(1 for st, _ in by_reviewer.values() if st == "CHANGES_REQUESTED")
+    target_sha = head_sha.strip().lower()
+    head_approvals = (
+        sum(1 for st, cid in by_reviewer.values() if st == "APPROVED" and cid == target_sha)
+        if target_sha
+        else 0
+    )
+    return approvals, changes_requested, head_approvals
 
 
 def _threads_from_activity(activity: list[dict[str, Any]]) -> tuple[int, int]:
@@ -244,7 +279,11 @@ def _threads_from_activity(activity: list[dict[str, Any]]) -> tuple[int, int]:
     return unresolved, resolved
 
 
-def _reviews_from_activity(activity: list[dict[str, Any]]) -> tuple[int, int]:
+def _reviews_from_activity(
+    activity: list[dict[str, Any]],
+    *,
+    head_sha: str = "",
+) -> tuple[int, int, int]:
     """Fallback review tally from PR activity when GitHub reviews API is unavailable."""
     rows: list[dict[str, Any]] = []
     for entry in reversed(activity):
@@ -252,18 +291,9 @@ def _reviews_from_activity(activity: list[dict[str, Any]]) -> tuple[int, int]:
             rows.append({
                 "author": entry.get("author"),
                 "state": entry.get("state"),
+                "commit_id": entry.get("commit_id"),
             })
-    return _tally_reviews(rows)
-
-
-def _latest_sha_from_activity(activity: list[dict[str, Any]]) -> str:
-    for entry in activity:
-        if not isinstance(entry, dict):
-            continue
-        sha = str(entry.get("sha") or entry.get("commit_id") or "").strip()
-        if sha:
-            return sha
-    return ""
+    return _tally_reviews(rows, head_sha=head_sha)
 
 
 def _load_findings_and_blocking_memories(
@@ -355,6 +385,17 @@ def _analyze_diff_files(
     return safety_flagged, (has_source and not has_test)
 
 
+def _has_next_link(resp: Any) -> bool | None:
+    """Return True if ``Link`` has ``rel="next"``, False if ``Link`` lacks it, else None."""
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    link = headers.get("link") or headers.get("Link") or ""
+    if not isinstance(link, str) or not link.strip():
+        return None
+    return bool(_NEXT_LINK_RE.search(link))
+
+
 async def _gh_get_json(
     client: httpx.AsyncClient,
     url: str,
@@ -372,6 +413,101 @@ async def _gh_get_json(
     except Exception as exc:
         log.warning("merge.signals: GET %s failed (%s)", url, type(exc).__name__)
         return None
+
+
+async def _gh_get_paginated_list(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    max_pages: int = _MAX_SIGNAL_PAGES,
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Fetch a paginated GitHub JSON array endpoint.
+
+    Returns ``(items, complete, any_page_ok)``. ``complete`` is False if any
+    page fails or the page cap is reached before exhausting results.
+    """
+    items: list[dict[str, Any]] = []
+    any_ok = False
+    for page in range(1, max(1, int(max_pages)) + 1):
+        try:
+            resp = await client.get(
+                url, headers=headers, params={"per_page": 100, "page": page}
+            )
+        except Exception as exc:
+            log.warning("merge.signals: GET %s page %d failed (%s)", url, page, type(exc).__name__)
+            return items, False, any_ok
+        if resp.status_code != 200:
+            log.debug("merge.signals: GET %s page %d returned HTTP %s", url, page, resp.status_code)
+            return items, False, any_ok
+        try:
+            batch = resp.json()
+        except Exception as exc:
+            log.warning("merge.signals: GET %s page %d invalid JSON (%s)", url, page, type(exc).__name__)
+            return items, False, any_ok
+        if not isinstance(batch, list):
+            return items, False, any_ok
+        any_ok = True
+        items.extend(row for row in batch if isinstance(row, dict))
+        has_next = _has_next_link(resp)
+        if has_next is False:
+            return items, True, any_ok
+        if has_next is None and len(batch) < 100:
+            return items, True, any_ok
+        if page == max_pages:
+            log.warning("merge.signals: pagination cap (%d) reached for %s", max_pages, url)
+            return items, False, any_ok
+    return items, False, any_ok
+
+
+async def _gh_get_paginated_dict_list(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    list_key: str,
+    max_pages: int = _MAX_SIGNAL_PAGES,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch a paginated GitHub object endpoint whose items live under ``list_key``.
+
+    Returns ``(items, complete)``. ``complete`` is False if any page fails or
+    the page cap is reached before exhausting results.
+    """
+    items: list[dict[str, Any]] = []
+    for page in range(1, max(1, int(max_pages)) + 1):
+        try:
+            resp = await client.get(
+                url, headers=headers, params={"per_page": 100, "page": page}
+            )
+        except Exception as exc:
+            log.warning("merge.signals: GET %s page %d failed (%s)", url, page, type(exc).__name__)
+            return items, False
+        if resp.status_code != 200:
+            log.debug("merge.signals: GET %s page %d returned HTTP %s", url, page, resp.status_code)
+            return items, False
+        try:
+            data = resp.json()
+        except Exception as exc:
+            log.warning("merge.signals: GET %s page %d invalid JSON (%s)", url, page, type(exc).__name__)
+            return items, False
+        if not isinstance(data, dict) or not isinstance(data.get(list_key), list):
+            return items, False
+        batch = data[list_key]
+        items.extend(row for row in batch if isinstance(row, dict))
+        has_next = _has_next_link(resp)
+        total_count = _safe_int(data.get("total_count"), -1)
+        if has_next is False:
+            return items, True
+        if has_next is None:
+            if total_count >= 0:
+                if len(items) >= total_count or not batch:
+                    return items, True
+            elif len(batch) < 100:
+                return items, True
+        if page == max_pages:
+            log.warning("merge.signals: pagination cap (%d) reached for %s", max_pages, url)
+            return items, False
+    return items, False
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +529,8 @@ async def collect_signals(
     """Collect deterministic merge-readiness signals for ``repo`` #``pr_number``.
 
     Returns ``(head_sha, MergeSignals)``. Optional GitHub endpoints degrade
-    gracefully on HTTP/network errors so partial signals still score cleanly.
+    gracefully on HTTP/network errors while recording ``incomplete_signals``
+    and ``head_verified`` so required gates cannot pass on partial data.
     """
     if not dm.valid_repo(repo):
         raise ValueError("invalid repository name")
@@ -414,6 +551,11 @@ async def collect_signals(
     commit_statuses: list[dict[str, Any]] = []
     reviews: list[dict[str, Any]] | None = None
     behind_by = 0
+    incomplete_signals: list[str] = []
+
+    def _mark_incomplete(name: str) -> None:
+        if name not in incomplete_signals:
+            incomplete_signals.append(name)
 
     own_client = client is None
     if token:
@@ -426,30 +568,33 @@ async def collect_signals(
                 )
                 if isinstance(fetched_pr, dict):
                     pr = fetched_pr
+                else:
+                    _mark_incomplete("pr_metadata")
 
             head_obj = pr.get("head") if isinstance(pr.get("head"), dict) else {}
             base_obj = pr.get("base") if isinstance(pr.get("base"), dict) else {}
-            head_sha_tmp = str(head_obj.get("sha") or "")
-            base_ref_tmp = str(base_obj.get("ref") or "")
+            head_sha_tmp = str(head_obj.get("sha") or "").strip()
+            base_ref_tmp = str(base_obj.get("ref") or "").strip()
 
             if head_sha_tmp:
                 q_sha = urllib.parse.quote(head_sha_tmp, safe="")
-                runs_data = await _gh_get_json(
+                check_runs, runs_complete = await _gh_get_paginated_dict_list(
                     http,
                     f"{GITHUB_API}/repos/{repo}/commits/{q_sha}/check-runs",
                     headers,
-                    params={"per_page": 100},
+                    list_key="check_runs",
                 )
-                if isinstance(runs_data, dict) and isinstance(runs_data.get("check_runs"), list):
-                    check_runs = runs_data["check_runs"]
+                if not runs_complete:
+                    _mark_incomplete("check_runs")
 
-                status_data = await _gh_get_json(
+                commit_statuses, statuses_complete = await _gh_get_paginated_dict_list(
                     http,
                     f"{GITHUB_API}/repos/{repo}/commits/{q_sha}/status",
                     headers,
+                    list_key="statuses",
                 )
-                if isinstance(status_data, dict) and isinstance(status_data.get("statuses"), list):
-                    commit_statuses = status_data["statuses"]
+                if not statuses_complete:
+                    _mark_incomplete("commit_statuses")
 
                 if base_ref_tmp:
                     q_base = urllib.parse.quote(base_ref_tmp, safe="")
@@ -460,34 +605,50 @@ async def collect_signals(
                     )
                     if isinstance(compare_data, dict):
                         behind_by = max(0, _safe_int(compare_data.get("behind_by"), 0))
+            else:
+                _mark_incomplete("pr_metadata")
+                _mark_incomplete("check_runs")
+                _mark_incomplete("commit_statuses")
 
-            reviews_data = await _gh_get_json(
+            reviews_data, reviews_complete, reviews_any_ok = await _gh_get_paginated_list(
                 http,
                 f"{GITHUB_API}/repos/{repo}/pulls/{pr_num}/reviews",
                 headers,
-                params={"per_page": 100},
             )
-            if isinstance(reviews_data, list):
+            if reviews_any_ok:
                 reviews = reviews_data
+            if not reviews_complete:
+                _mark_incomplete("reviews")
 
             if files is None:
-                files_data = await _gh_get_json(
+                files_data, files_complete, files_any_ok = await _gh_get_paginated_list(
                     http,
                     f"{GITHUB_API}/repos/{repo}/pulls/{pr_num}/files",
                     headers,
-                    params={"per_page": 100},
                 )
-                if isinstance(files_data, list):
+                if files_any_ok:
                     files = files_data
+                if not files_complete:
+                    _mark_incomplete("files")
         finally:
             if own_client:
                 await http.aclose()
+    else:
+        _mark_incomplete("check_runs")
+        _mark_incomplete("commit_statuses")
+        _mark_incomplete("reviews")
+        if files is None:
+            _mark_incomplete("files")
 
     head_obj = pr.get("head") if isinstance(pr.get("head"), dict) else {}
     base_obj = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     user_obj = pr.get("user") if isinstance(pr.get("user"), dict) else {}
 
-    head_sha = str(head_obj.get("sha") or "") or _latest_sha_from_activity(activity)
+    # Never substitute an activity or review commit SHA for the verified PR head.
+    head_sha = str(head_obj.get("sha") or "").strip()
+    head_verified = bool(head_sha)
+    if not head_verified:
+        _mark_incomplete("pr_metadata")
     base_ref = str(base_obj.get("ref") or "")
     head_ref = str(head_obj.get("ref") or "")
     pr_title = str(pr.get("title") or "")
@@ -509,9 +670,11 @@ async def collect_signals(
     failing_checks, pending_checks = _classify_checks(check_runs, commit_statuses)
 
     if reviews is not None:
-        approvals, changes_requested = _tally_reviews(reviews)
+        approvals, changes_requested, head_approvals = _tally_reviews(reviews, head_sha=head_sha)
     else:
-        approvals, changes_requested = _reviews_from_activity(activity)
+        approvals, changes_requested, head_approvals = _reviews_from_activity(
+            activity, head_sha=head_sha
+        )
 
     unresolved_threads, resolved_threads = _threads_from_activity(activity)
 
@@ -530,7 +693,10 @@ async def collect_signals(
             if dec.get("reason_code") == "SAFETY_FLAGGED":
                 safety_flagged = True
 
-    safety_human_approved = bool(safety_flagged and approvals > 0 and changes_requested == 0)
+    # Safety-sensitive changes require a human approval matching the current head revision.
+    safety_human_approved = bool(
+        safety_flagged and head_sha and head_approvals > 0 and changes_requested == 0
+    )
 
     custom_failures: list[dict[str, Any]] = []
     if custom_check_failures:
@@ -567,5 +733,7 @@ async def collect_signals(
         pr_state=pr_state,
         base_ref=base_ref,
         head_ref=head_ref,
+        head_verified=head_verified,
+        incomplete_signals=incomplete_signals,
     )
     return head_sha, signals

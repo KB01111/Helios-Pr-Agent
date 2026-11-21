@@ -212,6 +212,7 @@ function ChecklistGroup({
 export function PrInboxPage({ active }: { active: boolean }) {
   const setTab = useApp((s) => s.setTab);
   const backend = useApp((s) => s.backendUrl);
+  const vaultLoaded = useApp((s) => s.vaultLoaded);
   const setBlockedPrCount = useApp((s) => s.setBlockedPrCount);
   const agents = useApp((s) => s.agents);
 
@@ -226,6 +227,7 @@ export function PrInboxPage({ active }: { active: boolean }) {
 
   const [selectedKey, setSelectedKey] = React.useState<string>("");
   const [detail, setDetail] = React.useState<PullReadinessResponse | null>(null);
+  const [detailTargetKey, setDetailTargetKey] = React.useState<string>("");
   const [detailLoading, setDetailLoading] = React.useState(false);
   const [detailErr, setDetailErr] = React.useState("");
   const [findingFilter, setFindingFilter] = React.useState<FindingFilter>("open");
@@ -242,41 +244,68 @@ export function PrInboxPage({ active }: { active: boolean }) {
   const [teachBlocking, setTeachBlocking] = React.useState(false);
 
   const prKey = (p: Pick<InboxPR, "repo" | "pr_number">) => `${p.repo}#${p.pr_number}`;
+  const prTargetKey = (b: string, p: Pick<InboxPR, "repo" | "pr_number">) => `${b}::${p.repo}#${p.pr_number}`;
+
+  const currentBackendRef = React.useRef(backend);
+  currentBackendRef.current = backend;
 
   const listSeq = React.useRef(0);
-  const loadInbox = React.useCallback(async () => {
-    const mine = ++listSeq.current;
-    setLoading(true);
+  const detailSeq = React.useRef(0);
+
+  // Clear inbox list and detail state whenever backend changes.
+  React.useEffect(() => {
+    listSeq.current++;
+    detailSeq.current++;
+    setItems([]);
+    setSelectedKey("");
     setErr("");
-    try {
-      const res = await listPrInbox({
-        repo: repoFilter !== "__all__" ? repoFilter : undefined,
-        state: stateFilter,
-      });
-      if (mine !== listSeq.current) return;
-      const sorted = [...res.items].sort((a, b) => {
-        if (a.score !== b.score) return a.score - b.score;
-        return (Date.parse(b.updated_at || "") || 0) - (Date.parse(a.updated_at || "") || 0);
-      });
-      setItems(sorted);
-      if (repoFilter === "__all__" && stateFilter === "open") {
-        setBlockedPrCount(sorted.filter((p) => p.band === "blocked").length);
+    setDetail(null);
+    setDetailTargetKey("");
+    setDetailErr("");
+    setDetailLoading(false);
+    setDismissTarget(null);
+    setDismissReason("");
+    setTeachOpen(false);
+  }, [backend]);
+
+  const loadInbox = React.useCallback(
+    async (expectedBackend?: string) => {
+      const reqBackend = expectedBackend ?? useApp.getState().backendUrl;
+      if (reqBackend !== currentBackendRef.current) return;
+      const mine = ++listSeq.current;
+      setLoading(true);
+      setErr("");
+      try {
+        const res = await listPrInbox({
+          repo: repoFilter !== "__all__" ? repoFilter : undefined,
+          state: stateFilter,
+        });
+        if (mine !== listSeq.current || currentBackendRef.current !== reqBackend) return;
+        const sorted = [...res.items].sort((a, b) => {
+          if (a.score !== b.score) return a.score - b.score;
+          return (Date.parse(b.updated_at || "") || 0) - (Date.parse(a.updated_at || "") || 0);
+        });
+        setItems(sorted);
+        if (repoFilter === "__all__" && stateFilter === "open") {
+          setBlockedPrCount(sorted.filter((p) => p.band === "blocked").length);
+        }
+        setSelectedKey((prev) => {
+          if (prev && sorted.some((p) => prKey(p) === prev)) return prev;
+          return sorted.length ? prKey(sorted[0]) : "";
+        });
+      } catch (e) {
+        if (mine !== listSeq.current || currentBackendRef.current !== reqBackend) return;
+        setErr(errText(e, 260));
+      } finally {
+        if (mine === listSeq.current && currentBackendRef.current === reqBackend) setLoading(false);
       }
-      setSelectedKey((prev) => {
-        if (prev && sorted.some((p) => prKey(p) === prev)) return prev;
-        return sorted.length ? prKey(sorted[0]) : "";
-      });
-    } catch (e) {
-      if (mine !== listSeq.current) return;
-      setErr(errText(e, 260));
-    } finally {
-      if (mine === listSeq.current) setLoading(false);
-    }
-  }, [repoFilter, stateFilter, setBlockedPrCount]);
+    },
+    [repoFilter, stateFilter, setBlockedPrCount],
+  );
 
   React.useEffect(() => {
-    if (active) void loadInbox();
-  }, [active, backend, loadInbox]);
+    if (active && vaultLoaded) void loadInbox(backend);
+  }, [active, vaultLoaded, backend, loadInbox]);
 
   const filteredItems = React.useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -307,32 +336,55 @@ export function PrInboxPage({ active }: { active: boolean }) {
     [filteredItems, selectedKey],
   );
 
-  const detailSeq = React.useRef(0);
-  const loadDetail = React.useCallback(async (pr: InboxPR | null) => {
-    const mine = ++detailSeq.current;
+  const currentTargetKey = selectedPr ? prTargetKey(backend, selectedPr) : "";
+  const currentTargetRef = React.useRef(currentTargetKey);
+  currentTargetRef.current = currentTargetKey;
+
+  // Clear detail state and open PR-scoped dialogs whenever the selected target changes.
+  React.useEffect(() => {
+    detailSeq.current++;
+    setDetail(null);
+    setDetailTargetKey("");
+    setDetailErr("");
+    setDetailLoading(false);
+    setDismissTarget(null);
+    setDismissReason("");
+    setTeachOpen(false);
+  }, [currentTargetKey]);
+
+  const loadDetail = React.useCallback(async (pr: InboxPR | null, expectedBackend?: string) => {
+    const reqBackend = expectedBackend ?? useApp.getState().backendUrl;
+    const reqTargetKey = pr ? prTargetKey(reqBackend, pr) : "";
     if (!pr) {
+      detailSeq.current++;
       setDetail(null);
+      setDetailTargetKey("");
       setDetailErr("");
+      setDetailLoading(false);
       return;
     }
+    if (reqTargetKey !== currentTargetRef.current) return;
+    const mine = ++detailSeq.current;
     setDetailLoading(true);
     setDetailErr("");
     try {
       const res = await getPullReadiness(pr.repo, pr.pr_number);
-      if (mine !== detailSeq.current) return;
+      if (mine !== detailSeq.current || currentTargetRef.current !== reqTargetKey) return;
       setDetail(res);
+      setDetailTargetKey(reqTargetKey);
     } catch (e) {
-      if (mine !== detailSeq.current) return;
+      if (mine !== detailSeq.current || currentTargetRef.current !== reqTargetKey) return;
       setDetail(null);
+      setDetailTargetKey("");
       setDetailErr(errText(e, 240));
     } finally {
-      if (mine === detailSeq.current) setDetailLoading(false);
+      if (mine === detailSeq.current && currentTargetRef.current === reqTargetKey) setDetailLoading(false);
     }
   }, []);
 
   React.useEffect(() => {
-    if (active) void loadDetail(selectedPr);
-  }, [active, selectedPr, loadDetail]);
+    if (active && vaultLoaded) void loadDetail(selectedPr, backend);
+  }, [active, vaultLoaded, selectedPr, backend, loadDetail]);
 
   const knownRepos = React.useMemo(() => {
     const s = new Set<string>();
@@ -358,15 +410,23 @@ export function PrInboxPage({ active }: { active: boolean }) {
     return { total: items.length, ready, needsWork, blocked };
   }, [items]);
 
+  const matchedDetail = detail && detailTargetKey === currentTargetKey ? detail : null;
+
   const handleRereview = async () => {
     if (!selectedPr) return;
+    const targetPr = selectedPr;
+    const targetBackend = backend;
+    const targetKey = prTargetKey(targetBackend, targetPr);
     try {
-      const res = await triggerManualReview(selectedPr.repo, selectedPr.pr_number, { force_full: false });
+      const res = await triggerManualReview(targetPr.repo, targetPr.pr_number, { force_full: false });
       toastOk(
         "Re-review completed",
-        `${selectedPr.repo}#${selectedPr.pr_number} · ${res.findings_count ?? 0} finding(s)`,
+        `${targetPr.repo}#${targetPr.pr_number} · ${res.findings_count ?? 0} finding(s)`,
       );
-      await Promise.all([loadInbox(), loadDetail(selectedPr)]);
+      const refreshes: Promise<unknown>[] = [];
+      if (currentBackendRef.current === targetBackend) refreshes.push(loadInbox(targetBackend));
+      if (currentTargetRef.current === targetKey) refreshes.push(loadDetail(targetPr, targetBackend));
+      await Promise.all(refreshes);
     } catch (e) {
       toastErr("Re-review failed", errText(e, 260));
     }
@@ -374,10 +434,16 @@ export function PrInboxPage({ active }: { active: boolean }) {
 
   const handleRecompute = async () => {
     if (!selectedPr) return;
+    const targetPr = selectedPr;
+    const targetBackend = backend;
+    const targetKey = prTargetKey(targetBackend, targetPr);
     try {
-      const res = await recomputePullReadiness(selectedPr.repo, selectedPr.pr_number);
+      const res = await recomputePullReadiness(targetPr.repo, targetPr.pr_number);
       toastOk("Readiness recomputed", `Score ${res.report.score}/100 · ${bandLabel(res.report.band)}`);
-      await Promise.all([loadInbox(), loadDetail(selectedPr)]);
+      const refreshes: Promise<unknown>[] = [];
+      if (currentBackendRef.current === targetBackend) refreshes.push(loadInbox(targetBackend));
+      if (currentTargetRef.current === targetKey) refreshes.push(loadDetail(targetPr, targetBackend));
+      await Promise.all(refreshes);
     } catch (e) {
       toastErr("Recompute failed", errText(e, 260));
     }
@@ -388,9 +454,13 @@ export function PrInboxPage({ active }: { active: boolean }) {
     state: "dismissed" | "resolved" | "open",
     reason?: string,
   ) => {
-    if (!selectedPr) return;
+    if (!selectedPr || !matchedDetail) return;
+    const targetPr = selectedPr;
+    const targetBackend = backend;
+    const targetKey = prTargetKey(targetBackend, targetPr);
+    if (detailTargetKey !== targetKey) return;
     try {
-      const res = await updateFindingState(selectedPr.repo, selectedPr.pr_number, finding.fingerprint, {
+      const res = await updateFindingState(targetPr.repo, targetPr.pr_number, finding.fingerprint, {
         state,
         reason: reason?.trim() || undefined,
       });
@@ -406,9 +476,14 @@ export function PrInboxPage({ active }: { active: boolean }) {
       } else {
         toastOk("Finding reopened", finding.title);
       }
-      setDismissTarget(null);
-      setDismissReason("");
-      await Promise.all([loadInbox(), loadDetail(selectedPr)]);
+      if (currentTargetRef.current === targetKey) {
+        setDismissTarget(null);
+        setDismissReason("");
+      }
+      const refreshes: Promise<unknown>[] = [];
+      if (currentBackendRef.current === targetBackend) refreshes.push(loadInbox(targetBackend));
+      if (currentTargetRef.current === targetKey) refreshes.push(loadDetail(targetPr, targetBackend));
+      await Promise.all(refreshes);
     } catch (e) {
       toastErr("Update failed", errText(e, 240));
     }
@@ -416,6 +491,8 @@ export function PrInboxPage({ active }: { active: boolean }) {
 
   const submitTeachAgent = async () => {
     if (!selectedPr) return;
+    const targetPr = selectedPr;
+    const targetKey = prTargetKey(backend, targetPr);
     const text = teachText.trim();
     if (!text) return toastErr("Teach agent", "Enter a rule or convention first.");
     const globs = teachGlobs
@@ -423,27 +500,29 @@ export function PrInboxPage({ active }: { active: boolean }) {
       .map((s) => s.trim())
       .filter(Boolean);
     try {
-      const created = await createRepoMemory(selectedPr.repo, {
+      const created = await createRepoMemory(targetPr.repo, {
         kind: teachKind,
         text,
         scope_globs: globs.length ? globs : ["**"],
         blocking: teachBlocking,
         status: "active",
       });
-      toastOk("Agent learned new rule", `${selectedPr.repo} · #${created.id.slice(0, 8)}`);
-      setTeachText("");
-      setTeachGlobs("**");
-      setTeachBlocking(false);
-      setTeachOpen(false);
+      toastOk("Agent learned new rule", `${targetPr.repo} · #${created.id.slice(0, 8)}`);
+      if (currentTargetRef.current === targetKey) {
+        setTeachText("");
+        setTeachGlobs("**");
+        setTeachBlocking(false);
+        setTeachOpen(false);
+      }
     } catch (e) {
       toastErr("Could not save learning", errText(e, 240));
     }
   };
 
-  const activeReport = detail?.report;
+  const activeReport = matchedDetail?.report ?? null;
   const activeScore = activeReport?.score ?? selectedPr?.score ?? 0;
   const activeBand = activeReport?.band ?? selectedPr?.band ?? "needs_work";
-  const allFindings = detail?.findings || [];
+  const allFindings = matchedDetail?.findings || [];
   const filteredFindings = React.useMemo(() => {
     if (findingFilter === "all") return allFindings;
     if (findingFilter === "open") return allFindings.filter((f) => f.state === "open");
@@ -551,7 +630,7 @@ export function PrInboxPage({ active }: { active: boolean }) {
           </SelectContent>
         </Select>
 
-        <AsyncButton variant="outline" size="sm" onClick={loadInbox} disabled={loading}>
+        <AsyncButton variant="outline" size="sm" onClick={() => loadInbox(backend)} disabled={loading}>
           <RefreshCw className={loading ? "animate-spin" : ""} /> Refresh
         </AsyncButton>
       </div>
@@ -584,7 +663,7 @@ export function PrInboxPage({ active }: { active: boolean }) {
               <Button type="button" onClick={() => setTab("setup")}>
                 <Sparkles /> Open Cloud Setup
               </Button>
-              <AsyncButton variant="outline" onClick={loadInbox}>
+              <AsyncButton variant="outline" onClick={() => loadInbox(backend)}>
                 <RefreshCw /> Check again
               </AsyncButton>
             </ButtonRow>
@@ -686,7 +765,7 @@ export function PrInboxPage({ active }: { active: boolean }) {
                         gate: {selectedPr.merge_gate}
                       </Badge>
                     ) : null}
-                    {detail?.activity_stale ? (
+                    {matchedDetail?.activity_stale ? (
                       <Badge variant="warning" className="text-[10px]">
                         stale — recompute
                       </Badge>
@@ -775,9 +854,18 @@ export function PrInboxPage({ active }: { active: boolean }) {
                 {/* Before you merge checklist */}
                 <div className="grid gap-3">
                   <div className="text-sm font-semibold">Before you merge</div>
-                  {detailLoading && !detail ? (
+                  {detailLoading && !matchedDetail ? (
                     <Skeleton className="h-24 rounded-md" />
-                  ) : activeReport?.items?.length ? (
+                  ) : !matchedDetail || !activeReport || detailErr ? (
+                    <div className="bg-muted/30 text-muted-foreground flex items-center gap-2 rounded-md border border-dashed px-3 py-2.5 text-xs">
+                      <AlertTriangle className="size-4 shrink-0" />
+                      <span>
+                        {detailErr
+                          ? "Readiness checklist unavailable — failed to load report from the backend."
+                          : "Readiness report not computed yet for this PR head. Click Recompute Score or Re-review PR."}
+                      </span>
+                    </div>
+                  ) : activeReport.items?.length ? (
                     <div className="grid gap-3">
                       <ChecklistGroup title="Blockers" items={checklistBlockers} tone="blocker" />
                       <ChecklistGroup title="Should fix" items={checklistShouldFix} tone="should_fix" />
@@ -825,8 +913,12 @@ export function PrInboxPage({ active }: { active: boolean }) {
                   </div>
                 }
               >
-                {detailLoading && !detail ? (
+                {detailLoading && !matchedDetail ? (
                   <Skeleton className="h-32 rounded-md" />
+                ) : !matchedDetail ? (
+                  <Hint className="py-4 text-center text-xs">
+                    {detailErr ? "Findings unavailable — failed to load PR readiness details." : "No findings loaded for this PR yet."}
+                  </Hint>
                 ) : filteredFindings.length === 0 ? (
                   <Hint className="py-4 text-center text-xs">
                     {findingFilter === "open"
@@ -915,38 +1007,40 @@ export function PrInboxPage({ active }: { active: boolean }) {
                               ) : null}
                             </div>
 
-                            <ButtonRow>
-                              {f.state === "open" ? (
-                                <>
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="xs"
-                                    onClick={() => {
-                                      setDismissTarget(f);
-                                      setDismissReason("");
-                                    }}
-                                  >
-                                    <ThumbsDown /> Dismiss (teach agent)
-                                  </Button>
+                            {matchedDetail ? (
+                              <ButtonRow>
+                                {f.state === "open" ? (
+                                  <>
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="xs"
+                                      onClick={() => {
+                                        setDismissTarget(f);
+                                        setDismissReason("");
+                                      }}
+                                    >
+                                      <ThumbsDown /> Dismiss (teach agent)
+                                    </Button>
+                                    <AsyncButton
+                                      variant="secondary"
+                                      size="xs"
+                                      onClick={() => handleFindingState(f, "resolved")}
+                                    >
+                                      <Check /> Resolve
+                                    </AsyncButton>
+                                  </>
+                                ) : (
                                   <AsyncButton
-                                    variant="secondary"
+                                    variant="ghost"
                                     size="xs"
-                                    onClick={() => handleFindingState(f, "resolved")}
+                                    onClick={() => handleFindingState(f, "open")}
                                   >
-                                    <Check /> Resolve
+                                    <RotateCcw /> Reopen
                                   </AsyncButton>
-                                </>
-                              ) : (
-                                <AsyncButton
-                                  variant="ghost"
-                                  size="xs"
-                                  onClick={() => handleFindingState(f, "open")}
-                                >
-                                  <RotateCcw /> Reopen
-                                </AsyncButton>
-                              )}
-                            </ButtonRow>
+                                )}
+                              </ButtonRow>
+                            ) : null}
                           </div>
                         </div>
                       );

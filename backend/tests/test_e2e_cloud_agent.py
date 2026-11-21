@@ -43,7 +43,7 @@ SAMPLE_DIFF = """\
 diff --git a/backend/service.py b/backend/service.py
 --- a/backend/service.py
 +++ b/backend/service.py
-@@ -10,3 +10,5 @@ def lookup_user(name: str):
+@@ -10,2 +10,4 @@ def lookup_user(name: str):
      if not name:
          return None
 +    db.execute(f"SELECT * FROM users WHERE name = '{name}'")
@@ -125,6 +125,11 @@ class _MockWorld:
                 # GitHub App installation lookup
                 if url.endswith(f"/repos/{REPO}/installation"):
                     return _FakeResp(200, {"id": 555})
+                # Collaborator permission lookup for thread-resolution authorization
+                if f"/repos/{REPO}/collaborators/" in url and url.endswith("/permission"):
+                    actor = url.split("/collaborators/", 1)[1].rsplit("/permission", 1)[0]
+                    perm = "admin" if actor in ("alice", "maintainer") else "read"
+                    return _FakeResp(200, {"permission": perm})
                 # Repo default branch lookup
                 if url.endswith(f"/repos/{REPO}"):
                     return _FakeResp(200, {"default_branch": "main"})
@@ -142,7 +147,14 @@ class _MockWorld:
                 if "/contents/" in url:
                     if url.endswith("/pyproject.toml"):
                         content = '[project]\nname="app"\ndependencies=["fastapi","pytest"]\n'
-                        return _FakeResp(200, {"sha": "py1", "content": base64.b64encode(content.encode()).decode()})
+                        return _FakeResp(
+                            200,
+                            {
+                                "sha": "py1",
+                                "content": base64.b64encode(content.encode()).decode(),
+                                "encoding": "base64",
+                            },
+                        )
                     return _FakeResp(404, {"message": "Not Found"})
                 # Diff vs PR metadata
                 if url.endswith(f"/repos/{REPO}/pulls/42") and h.get("Accept") == "application/vnd.github.diff":
@@ -172,7 +184,7 @@ class _MockWorld:
                                 "status": "modified",
                                 "additions": 2,
                                 "deletions": 0,
-                                "patch": "@@ -10,3 +10,5 @@\n     if not name:\n         return None\n+    db.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n+    return name\n",
+                                "patch": "@@ -10,2 +10,4 @@\n     if not name:\n         return None\n+    db.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n+    return name\n",
                             },
                             {
                                 "filename": "backend/tests/test_service.py",
@@ -413,7 +425,11 @@ def test_full_cloud_agent_e2e_lifecycle(env):
     assert dbody["memory_created"] is not None
     assert dbody["memory_created"]["kind"] == "dismissed_pattern"
 
-    # 5. Re-review (force_full=True): LLM emits the same SQLi finding, Pass C suppresses it via dismissed memory!
+    # 5. Re-review (force_full=True): remove the stored dismissed finding so
+    # fingerprint deduplication cannot mask memory suppression; Pass C must
+    # suppress the re-emitted SQLi finding strictly via the dismissed_pattern memory!
+    store.rdelete(dm.finding_key(REPO, 42, fp))
+    assert review_mod.list_pr_findings(REPO, 42) == []
     manual = client.post(
         f"/repos/{REPO}/pulls/42/review",
         headers=auth,
@@ -589,6 +605,9 @@ def test_rest_api_endpoints_and_memory_id_protection(env):
     # POST /memory/bootstrap
     boot = client.post(f"/repos/{REPO}/memory/bootstrap", headers=auth)
     assert boot.status_code == 200 and "profile" in boot.json()
+    boot_profile = boot.json()["profile"]
+    assert "fastapi" in [fw.lower() for fw in boot_profile.get("frameworks", [])]
+    assert any("pytest" in cmd.lower() for cmd in boot_profile.get("test_commands", []))
 
     # DELETE /memory/{id}
     deleted = client.delete(f"/repos/{REPO}/memory/{mem_id}", headers=auth)
@@ -748,7 +767,8 @@ def test_production_security_and_reliability_hardening(monkeypatch):
     )
     assert res_dr.status_code == 202 and res_dr.json().get("skipped") != "draft"
 
-    # 7. runtime_settings.refresh() only updates _last_refresh after _load_doc() succeeds
+    # 7. runtime_settings.refresh() stamps _last_refresh on failure too so outages
+    # stay rate-limited for non-forced callers, while force=True retries immediately.
     rs.reset_for_tests()
     calls = {"n": 0}
 
@@ -759,9 +779,11 @@ def test_production_security_and_reliability_hardening(monkeypatch):
         return {"values": {"LLM_MODEL": {"v": "openai/recovered-model"}}}
 
     monkeypatch.setattr(rs, "_load_doc", flaky_load)
-    rs.refresh()  # transient failure must NOT start the 10s cooldown
-    assert calls["n"] == 1 and rs._last_refresh == 0.0
-    rs.refresh()  # retries immediately and succeeds!
+    rs.refresh()  # transient failure stamps cooldown for non-forced callers
+    assert calls["n"] == 1 and rs._last_refresh > 0.0
+    rs.refresh()  # suppressed within TTL
+    assert calls["n"] == 1
+    rs.refresh(force=True)  # forced refresh bypasses cooldown and recovers
     assert calls["n"] == 2 and main.os.environ.get("LLM_MODEL") == "openai/recovered-model"
 
     # 8. store.rincr supports optional ex TTL
@@ -975,6 +997,7 @@ def test_merged_pr_learning_extraction_filters_untrusted_and_self_comments(env):
 def test_draft_config_cache_is_branch_aware_and_non_dict_repository_is_safe(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
     monkeypatch.delenv("BACKEND_API_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(main, "BACKEND_API_TOKEN", "")
     monkeypatch.setattr(main, "GITHUB_WEBHOOK_SECRET", "")
     client = TestClient(main.app)

@@ -50,7 +50,18 @@ class DiffFetchError(RuntimeError):
     """Raised when the PR diff cannot be fetched from GitHub."""
 
 
+def _clean_repo_path(path: str) -> str:
+    """Normalize a repository-relative path WITHOUT stripping real `a/` or `b/` directories."""
+    s = (path or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    while s.startswith("./"):
+        s = s[2:]
+    return s.lstrip("/")
+
+
 def _normalize_path(path: str) -> str:
+    """Strip at most one unified-diff `a/` or `b/` prefix plus surrounding quotes."""
     s = (path or "").strip()
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
         s = s[1:-1]
@@ -155,6 +166,72 @@ class DiffFile:
                 best = cand
         return best if best_dist <= max_distance else None
 
+    def remap_old_line(self, old_line: int) -> tuple[bool, int]:
+        """Map a line number from the pre-diff revision to the post-diff revision.
+
+        Returns ``(was_modified, new_line)``:
+        - ``was_modified`` is True when ``old_line`` was deleted or directly edited
+          in this diff.
+        - ``new_line`` is the adjusted line number in the post-diff file when the
+          line survived (accounting for insertions/deletions above it).
+        """
+        if self.status == "deleted":
+            return True, old_line
+        if old_line in self.deleted_lines:
+            return True, old_line
+        # Check if old_line appears as a context line inside a hunk (exact mapping).
+        for h in self.hunks:
+            for dl in h.lines:
+                if dl.kind == "context" and dl.old_line == old_line and dl.new_line is not None:
+                    return False, dl.new_line
+        # Outside hunks: accumulate net line delta from all hunks strictly above old_line.
+        delta = 0
+        for h in self.hunks:
+            hunk_old_end = h.old_start + max(0, h.old_count) - 1
+            if h.old_count == 0:
+                if h.old_start < old_line:
+                    delta += h.new_count
+            elif hunk_old_end < old_line:
+                delta += h.new_count - h.old_count
+        return False, max(1, old_line + delta)
+
+    def span_modified_or_remapped(
+        self, start_line: int, end_line: int, side: str = "RIGHT"
+    ) -> tuple[bool, int, int]:
+        """Evaluate whether a finding span ``[start_line, end_line]`` on ``side``
+        was invalidated by this incremental diff, or else return its remapped
+        ``(False, new_start, new_end)``.
+        """
+        lo, hi = min(int(start_line), int(end_line)), max(int(start_line), int(end_line))
+        if self.is_binary or self.status == "deleted":
+            return True, lo, hi
+        if not self.hunks:
+            # Metadata-only or empty hunk change does not alter lines.
+            return False, lo, hi
+        side_up = (side or "RIGHT").upper()
+        if side_up == "LEFT":
+            # A LEFT finding targets a deleted line from the PR merge base; if the
+            # incremental diff re-adds or modifies lines in that region, treat it as touched.
+            for ln in range(lo, hi + 1):
+                if ln in self.deleted_lines or ln in self.added_lines:
+                    return True, lo, hi
+            return False, lo, hi
+        # RIGHT finding: check every line in [lo, hi] against old-side deletions, plus
+        # any pure insertion strictly inside a multi-line span.
+        for ln in range(lo, hi + 1):
+            if ln in self.deleted_lines:
+                return True, lo, hi
+        if hi > lo:
+            for h in self.hunks:
+                # Pure insertion strictly between lo and hi alters the span.
+                if h.old_count == 0 and lo <= h.old_start < hi:
+                    return True, lo, hi
+        mod_lo, new_lo = self.remap_old_line(lo)
+        mod_hi, new_hi = self.remap_old_line(hi)
+        if mod_lo or mod_hi:
+            return True, lo, hi
+        return False, new_lo, max(new_lo, new_hi)
+
     def render_numbered(self) -> str:
         """Render this file's diff with explicit line numbers for Pass B prompts."""
         header = f"diff --git a/{self.old_path} b/{self.path}\n--- a/{self.old_path}\n+++ b/{self.path}"
@@ -187,6 +264,9 @@ class ParsedDiff:
     def get_file(self, path: str) -> DiffFile | None:
         if path in self.files_by_path:
             return self.files_by_path[path]
+        cleaned = _clean_repo_path(path)
+        if cleaned in self.files_by_path:
+            return self.files_by_path[cleaned]
         norm = _normalize_path(path)
         return self.files_by_path.get(norm)
 
@@ -272,12 +352,14 @@ def _parse_file_chunk(chunk: str) -> DiffFile | None:
         if line.startswith("diff --git "):
             m = _DIFF_GIT_RE.match(line)
             if m:
-                old_path = _normalize_path(m.group(1))
-                new_path = _normalize_path(m.group(2))
+                # _DIFF_GIT_RE already stripped the single a/ and b/ diff prefixes;
+                # do not strip a real top-level directory named a/ or b/.
+                old_path = _clean_repo_path(m.group(1))
+                new_path = _clean_repo_path(m.group(2))
             else:
                 parts = line.rsplit(" b/", 1)
                 if len(parts) == 2:
-                    new_path = _normalize_path(parts[1])
+                    new_path = _clean_repo_path(parts[1])
                     old_part = parts[0][len("diff --git "):]
                     old_path = _normalize_path(old_part)
         elif line.startswith("new file mode"):
@@ -286,10 +368,10 @@ def _parse_file_chunk(chunk: str) -> DiffFile | None:
             status = "deleted"
         elif line.startswith("rename from "):
             status = "renamed"
-            rename_from = _normalize_path(line[len("rename from "):])
+            rename_from = _clean_repo_path(line[len("rename from "):])
         elif line.startswith("rename to "):
             status = "renamed"
-            rename_to = _normalize_path(line[len("rename to "):])
+            rename_to = _clean_repo_path(line[len("rename to "):])
         elif line.startswith("--- "):
             raw_old = line[4:].split("\t", 1)[0].strip()
             if raw_old == "/dev/null":
@@ -430,8 +512,6 @@ def parse_unified_diff(diff_text: str) -> ParsedDiff:
             continue
         parsed.files.append(df)
         parsed.files_by_path[df.path] = df
-        norm = _normalize_path(df.path)
-        parsed.files_by_path[norm] = df
     return parsed
 
 
@@ -593,10 +673,10 @@ def select_budgeted_files(
         pf = path_filters if isinstance(path_filters, PathFilters) else PathFilters.model_validate(path_filters)
 
     kept: list[tuple[int, int, DiffFile, str]] = []
+    noisy_candidates: list[DiffFile] = []
     for orig_idx, df in enumerate(parsed_diff.files):
-        if _is_noisy_file(df):
-            notes.append(f"omitted generated/binary file {df.path}")
-            continue
+        # Enforce path_filters BEFORE noisy-file classification so excluded
+        # lockfiles/binaries never leak into the noisy-file fallback.
         if pf is not None:
             if pf.include and not any(_glob_matches(df.path, pat) for pat in pf.include):
                 notes.append(f"excluded by path_filters.include {df.path}")
@@ -604,17 +684,23 @@ def select_budgeted_files(
             if pf.exclude and any(_glob_matches(df.path, pat) for pat in pf.exclude):
                 notes.append(f"excluded by path_filters.exclude {df.path}")
                 continue
+        if _is_noisy_file(df):
+            notes.append(f"omitted generated/binary file {df.path}")
+            noisy_candidates.append(df)
+            continue
         text = df.render_numbered() if numbered else df.raw
         if text and not text.endswith("\n"):
             text += "\n"
         kept.append((file_risk_score(df), orig_idx, df, text))
 
     if not kept:
-        if pf is not None and any("path_filters" in n for n in notes):
+        if not noisy_candidates:
             return [], notes
-        # Lockfile/binary-only PR: return truncated raw snippet just like prepare_diff
-        first = parsed_diff.files[0]
-        raw_cut = (parsed_diff.raw or first.raw)[:budget]
+        # Lockfile/binary-only PR (among files that passed path_filters): return
+        # truncated raw snippet built strictly from those permitted files.
+        first = noisy_candidates[0]
+        permitted_raw = "".join(df.raw for df in noisy_candidates if df.raw) or first.raw
+        raw_cut = permitted_raw[:budget]
         notes.append(f"diff contains only generated/binary files; truncated to {budget} chars")
         return [(first, raw_cut)], notes
 
@@ -636,26 +722,22 @@ def select_budgeted_files(
 
     for score in sorted(tiers.keys(), reverse=True):
         tier_items = tiers[score]
-        if remaining < _MIN_FILE_SLICE:
-            for _, df, _ in tier_items:
-                notes.append(f"omitted lower-priority file {df.path} (budget exhausted)")
-            continue
-
-        # Fair-share within this risk tier (smallest files first)
+        # Fair-share within this risk tier (smallest files first). Check whether each
+        # complete chunk fits within remaining budget BEFORE applying _MIN_FILE_SLICE.
         tier_by_size = sorted(tier_items, key=lambda it: (len(it[2]), it[0]))
         allocated: dict[int, tuple[DiffFile, str]] = {}
         tier_n = len(tier_by_size)
         for i, (orig_idx, df, text) in enumerate(tier_by_size):
-            if remaining < _MIN_FILE_SLICE:
+            if remaining <= 0:
                 notes.append(f"omitted lower-priority file {df.path} (budget exhausted)")
                 continue
             share = remaining // (tier_n - i)
-            if len(text) <= share:
+            if len(text) <= share or (len(text) <= remaining and (i == tier_n - 1 or remaining < _MIN_FILE_SLICE)):
                 allocated[orig_idx] = (df, text)
                 remaining -= len(text)
-            elif len(text) <= remaining and i == tier_n - 1:
-                allocated[orig_idx] = (df, text)
-                remaining -= len(text)
+            elif remaining < _MIN_FILE_SLICE:
+                notes.append(f"omitted lower-priority file {df.path} (budget exhausted)")
+                continue
             else:
                 cap = max(_MIN_FILE_SLICE, share)
                 cap = min(cap, remaining)

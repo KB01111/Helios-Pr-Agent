@@ -129,9 +129,28 @@ def test_mixed_open_and_resolved_ordering():
 
 def test_self_check_filters(monkeypatch):
     monkeypatch.setenv("GITHUB_APP_SLUG", "my-pr-agent-app")
-    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"slug": "other"}}) is True
+    # External app using our check name MUST NOT be excluded when our app identity is known
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"slug": "other"}}) is False
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"slug": "my-pr-agent-app"}}) is True
     assert is_own_check_run({"name": "Custom check", "app": {"slug": "my-pr-agent-app"}}) is True
     assert is_own_check_run({"name": "pytest", "app": {"slug": "github-actions"}}) is False
+
+    # Numeric GITHUB_APP_ID also distinguishes own vs external check runs
+    monkeypatch.delenv("GITHUB_APP_SLUG")
+    monkeypatch.setenv("GITHUB_APP_ID", "77")
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"id": 77, "slug": "any"}}) is True
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"id": 99, "slug": "other"}}) is False
+
+    # Cached live app slug discovered from GET /app works too
+    monkeypatch.delenv("GITHUB_APP_ID")
+    github_app.remember_app_slug("live-bot-app")
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"slug": "live-bot-app"}}) is True
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {"slug": "spoof-app"}}) is False
+
+    # Fallback by name only when no app identity is known
+    github_app.clear_token_cache()
+    assert is_own_check_run({"name": CHECK_RUN_NAME, "app": {}}) is True
+
     assert is_own_status({"context": STATUS_CONTEXT}) is True
     assert is_own_status({"context": "PR-AGENT/MERGE-READINESS"}) is True
     assert is_own_status({"context": "ci/circleci"}) is False
@@ -158,9 +177,9 @@ def test_collect_signals_filters_own_checks_dedupes_reruns_and_tallies_reviews(m
         if path == f"/repos/{REPO}/commits/{SHA}/check-runs":
             return httpx.Response(200, json={
                 "check_runs": [
-                    # Own check by name (failing!) -> MUST be ignored
+                    # Own readiness check from our app (failing!) -> MUST be ignored
                     {"id": 1, "name": CHECK_RUN_NAME, "status": "completed", "conclusion": "failure",
-                     "app": {"slug": "some-other-slug"}},
+                     "app": {"slug": "acme-review-bot"}},
                     # Own check by app slug (failing!) -> MUST be ignored
                     {"id": 2, "name": "Any Other Name", "status": "completed", "conclusion": "failure",
                      "app": {"slug": "acme-review-bot"}},
@@ -747,4 +766,667 @@ def test_corrupted_cached_check_run_id_is_rejected_and_falls_back_to_post():
     # Must NEVER issue a PATCH to the corrupted id
     assert all(method != "PATCH" for method, _ in calls)
     assert store.rget(cache_key) == "6001"
+
+
+# ---------------------------------------------------------------------------
+# 6. PR #18 hardening tests (bands/gates, pagination, safety SHA, locking, retries)
+# ---------------------------------------------------------------------------
+
+
+def test_threshold_consistent_between_band_and_merge_gate():
+    from merge import band_for_score
+
+    # Non-blocker PR with 4 majors + weak_description -> score 48
+    sig_48 = MergeSignals(
+        open_findings=[
+            {"severity": "major", "category": "bug", "title": f"M{i}", "file": "a.py", "start_line": i}
+            for i in range(1, 5)
+        ],
+        weak_description=True,
+    )
+    # Threshold 40: score 48 -> ready, passes required gate
+    rep_ready = compute_readiness(REPO, 101, SHA, sig_48, score_threshold=40)
+    assert rep_ready.score == 48
+    assert rep_ready.band == "ready"
+    assert band_for_score(48, has_blocker=False, score_threshold=40) == "ready"
+
+    # Threshold 40: score 39 -> blocked
+    assert band_for_score(39, has_blocker=False, score_threshold=40) == "blocked"
+    # Hard blocker with threshold 40 -> STILL blocked (score capped at 49, has_blocker=True)
+    rep_blocked = compute_readiness(
+        REPO, 102, SHA, MergeSignals(failing_checks=[{"name": "ci"}]), score_threshold=40
+    )
+    assert rep_blocked.band == "blocked"
+
+    # Also verify a report banded "blocked" (e.g., computed with threshold 85 -> score 48 blocked)
+    # can NEVER pass the gate even if publish_readiness is called with threshold=40.
+    rep_48_blocked = compute_readiness(REPO, 103, SHA, sig_48, score_threshold=85)
+    assert rep_48_blocked.band == "blocked"
+
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/check-runs":
+            posted.append(json.loads(request.content.decode()))
+            return httpx.Response(201, json={"id": 8000 + len(posted)})
+        if request.method == "GET" and request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path.endswith("/comments"):
+            return httpx.Response(201, json={"id": 8100 + len(posted)})
+        return httpx.Response(404)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            r_ok = await publish_readiness(
+                REPO, 101, rep_ready, merge_gate="required", score_threshold=40,
+                github_token="ghs_app", auth_kind="app", client=client,
+            )
+            r_blk = await publish_readiness(
+                REPO, 102, rep_blocked, merge_gate="required", score_threshold=40,
+                github_token="ghs_app", auth_kind="app", client=client,
+            )
+            r_mismatch = await publish_readiness(
+                REPO, 103, rep_48_blocked, merge_gate="required", score_threshold=40,
+                github_token="ghs_app", auth_kind="app", client=client,
+            )
+            return r_ok, r_blk, r_mismatch
+
+    r_ok, r_blk, r_mismatch = asyncio.run(_run())
+    assert r_ok["check_run"]["conclusion"] == "success"
+    assert r_blk["check_run"]["conclusion"] == "failure"
+    assert r_mismatch["check_run"]["conclusion"] == "failure"
+
+
+def test_cancelled_and_stale_check_conclusions_block_readiness():
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == f"/repos/{REPO}/pulls/104":
+            return httpx.Response(200, json={
+                "number": 104,
+                "title": "feat: test checks",
+                "body": "Detailed PR body describing changes cleanly.",
+                "state": "open",
+                "head": {"sha": SHA, "ref": "feat"},
+                "base": {"sha": "0" * 40, "ref": "main"},
+            })
+        if path == f"/repos/{REPO}/commits/{SHA}/check-runs":
+            return httpx.Response(200, json={
+                "check_runs": [
+                    {"id": 1, "name": "ci/cancelled-job", "status": "completed", "conclusion": "cancelled",
+                     "app": {"slug": "github-actions"}},
+                    {"id": 2, "name": "ci/stale-job", "status": "completed", "conclusion": "stale",
+                     "app": {"slug": "github-actions"}},
+                    {"id": 3, "name": "ci/ok", "status": "completed", "conclusion": "success",
+                     "app": {"slug": "github-actions"}},
+                ]
+            })
+        if path == f"/repos/{REPO}/commits/{SHA}/status":
+            return httpx.Response(200, json={"statuses": []})
+        if path == f"/repos/{REPO}/pulls/104/reviews":
+            return httpx.Response(200, json=[])
+        if path == f"/repos/{REPO}/pulls/104/files":
+            return httpx.Response(200, json=[])
+        if "/compare/" in path:
+            return httpx.Response(200, json={"behind_by": 0})
+        return httpx.Response(404)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await collect_signals(REPO, 104, github_token="ghs_test", client=client)
+
+    _, sig = asyncio.run(_run())
+    assert [c["name"] for c in sig.failing_checks] == ["ci/cancelled-job", "ci/stale-job"]
+    rep = compute_readiness(REPO, 104, SHA, sig)
+    assert rep.band == "blocked"
+    assert rep.score <= 49
+
+
+def test_collect_signals_paginates_check_runs_reviews_and_files():
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        page = int(request.url.params.get("page", "1"))
+        if path == f"/repos/{REPO}/pulls/105":
+            return httpx.Response(200, json={
+                "number": 105,
+                "title": "feat: large PR",
+                "body": "Detailed PR body with sufficient explanation of changes.",
+                "state": "open",
+                "head": {"sha": SHA, "ref": "feat/big"},
+                "base": {"sha": "0" * 40, "ref": "main"},
+            })
+        if path == f"/repos/{REPO}/commits/{SHA}/check-runs":
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    headers={"Link": f'<https://api.github.com{path}?page=2>; rel="next"'},
+                    json={
+                        "total_count": 101,
+                        "check_runs": [
+                            {"id": i, "name": f"job-{i}", "status": "completed", "conclusion": "success",
+                             "app": {"slug": "github-actions"}}
+                            for i in range(1, 101)
+                        ],
+                    },
+                )
+            return httpx.Response(
+                200,
+                headers={"Link": f'<https://api.github.com{path}?page=1>; rel="prev"'},
+                json={
+                    "total_count": 101,
+                    "check_runs": [
+                        {"id": 101, "name": "late-failing-check", "status": "completed", "conclusion": "failure",
+                         "app": {"slug": "github-actions"}},
+                    ],
+                },
+            )
+        if path == f"/repos/{REPO}/commits/{SHA}/status":
+            return httpx.Response(200, json={"statuses": []})
+        if path == f"/repos/{REPO}/pulls/105/reviews":
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    headers={"Link": f'<https://api.github.com{path}?page=2>; rel="next"'},
+                    json=[{"user": {"login": "bob", "type": "User"}, "state": "COMMENTED"}] * 100,
+                )
+            return httpx.Response(
+                200,
+                json=[{"user": {"login": "carol", "type": "User"}, "state": "CHANGES_REQUESTED", "commit_id": SHA}],
+            )
+        if path == f"/repos/{REPO}/pulls/105/files":
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    headers={"Link": f'<https://api.github.com{path}?page=2>; rel="next"'},
+                    json=[{"filename": f"docs/f{i}.md", "additions": 1, "deletions": 0} for i in range(100)],
+                )
+            return httpx.Response(
+                200,
+                json=[{"filename": ".github/workflows/deploy.yml", "additions": 2, "deletions": 0, "patch": "+run: deploy"}],
+            )
+        if "/compare/" in path:
+            return httpx.Response(200, json={"behind_by": 0})
+        return httpx.Response(404)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await collect_signals(REPO, 105, github_token="ghs_test", client=client)
+
+    sha, sig = asyncio.run(_run())
+    assert sha == SHA
+    assert sig.head_verified is True
+    assert sig.incomplete_signals == []
+    assert [c["name"] for c in sig.failing_checks] == ["late-failing-check"]
+    assert sig.changes_requested == 1
+    assert sig.safety_flagged is True
+
+
+def test_incomplete_signals_withhold_required_gate_success_but_allow_advisory():
+    # Simulate /check-runs failing and /files hitting the pagination cap
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == f"/repos/{REPO}/pulls/106":
+            return httpx.Response(200, json={
+                "number": 106,
+                "title": "docs: readme",
+                "body": "Updates documentation with thorough usage examples.",
+                "state": "open",
+                "head": {"sha": SHA, "ref": "docs"},
+                "base": {"sha": "0" * 40, "ref": "main"},
+            })
+        if path == f"/repos/{REPO}/commits/{SHA}/check-runs":
+            return httpx.Response(503, text="service unavailable")
+        if path == f"/repos/{REPO}/commits/{SHA}/status":
+            return httpx.Response(200, json={"statuses": []})
+        if path == f"/repos/{REPO}/pulls/106/reviews":
+            return httpx.Response(200, json=[])
+        if path == f"/repos/{REPO}/pulls/106/files":
+            # Always advertises rel="next" -> hits pagination cap
+            return httpx.Response(
+                200,
+                headers={"Link": f'<https://api.github.com{path}?page=99>; rel="next"'},
+                json=[{"filename": "docs/a.md", "additions": 1, "deletions": 0}] * 100,
+            )
+        if "/compare/" in path:
+            return httpx.Response(200, json={"behind_by": 0})
+        if request.method == "POST" and path == f"/repos/{REPO}/check-runs":
+            return httpx.Response(201, json={"id": 8501})
+        if request.method == "POST" and path == f"/repos/{REPO}/statuses/{SHA}":
+            return httpx.Response(201, json={"id": 8502})
+        if request.method == "GET" and path == f"/repos/{REPO}/issues/106/comments":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and path == f"/repos/{REPO}/issues/106/comments":
+            return httpx.Response(201, json={"id": 8503})
+        return httpx.Response(404)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            res_req = await recompute_pr_readiness(
+                REPO, 106,
+                agent_config={"merge_gate": "required", "score_threshold": 85},
+                github_token="ghs_app", auth_kind="app", client=client,
+            )
+            res_adv = await recompute_pr_readiness(
+                REPO, 106,
+                agent_config={"merge_gate": "advisory", "score_threshold": 85},
+                github_token="ghp_pat", auth_kind="pat", client=client,
+            )
+            return res_req, res_adv
+
+    res_req, res_adv = asyncio.run(_run())
+    assert "check_runs" in res_req["signals"]["incomplete_signals"]
+    assert "files" in res_req["signals"]["incomplete_signals"]
+    # Required gate MUST NOT publish success on incomplete signals
+    assert res_req["check_run"]["conclusion"] == "failure"
+    # Advisory still publishes partial report without blocking
+    assert res_adv["commit_status"]["state"] == "success"
+    assert "Advisory" in res_adv["commit_status"]["description"]
+
+
+def test_unverified_pr_head_does_not_fallback_to_activity_sha_and_preserves_report():
+    # Seed a previously verified report and an older review activity entry with a stale commit_id
+    prev_report = compute_readiness(REPO, 107, SHA, MergeSignals())
+    asyncio.run(publish_readiness(REPO, 107, prev_report, merge_gate="off", pr_meta={"title": "Verified PR"}))
+    events.record_pr_activity(REPO, 107, {"kind": "review", "author": "alice", "state": "approved", "commit_id": "deadbeef" * 5})
+    store.rset(dm.dirty_key(REPO, 107), "tok-107")
+
+    writes: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method in ("POST", "PATCH"):
+            writes.append((request.method, request.url.path))
+        return httpx.Response(500, text="github down")
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await recompute_pr_readiness(
+                REPO, 107,
+                agent_config={"merge_gate": "required", "score_threshold": 85},
+                github_token="ghs_app", auth_kind="app", client=client,
+            )
+
+    res = asyncio.run(_run())
+    assert res["signals"]["head_verified"] is False
+    assert "pr_metadata" in res["signals"]["incomplete_signals"]
+    assert res["skipped"] == "unverified_head"
+    assert res["published"] is False
+    assert writes == []
+    # Previously verified report and dirty flag are preserved
+    stored = get_stored_readiness(REPO, 107)
+    assert stored is not None and stored["head_sha"] == SHA
+    assert store.rget(dm.dirty_key(REPO, 107)) == "tok-107"
+
+
+def test_safety_flagged_requires_approval_for_current_head_sha():
+    old_sha = "f" * 40
+    pr_data = {
+        "number": 108,
+        "title": "ci: update workflow",
+        "body": "Updates GitHub Actions workflow permissions cleanly.",
+        "state": "open",
+        "head": {"sha": SHA, "ref": "ci-update"},
+        "base": {"ref": "main"},
+    }
+    diff_files = [{"filename": ".github/workflows/ci.yml", "additions": 2, "deletions": 1, "patch": "+run: test"}]
+
+    review_batches: list[list[dict[str, Any]]] = [
+        # 1. Approval on an OLDER commit -> MUST NOT satisfy safety approval
+        [{"user": {"login": "alice", "type": "User"}, "state": "APPROVED", "commit_id": old_sha}],
+        # 2. Approval on CURRENT head SHA -> satisfies safety approval
+        [
+            {"user": {"login": "alice", "type": "User"}, "state": "APPROVED", "commit_id": old_sha},
+            {"user": {"login": "bob", "type": "User"}, "state": "APPROVED", "commit_id": SHA},
+        ],
+        # 3. Current head approval superseded by CHANGES_REQUESTED -> NOT approved
+        [
+            {"user": {"login": "bob", "type": "User"}, "state": "APPROVED", "commit_id": SHA},
+            {"user": {"login": "bob", "type": "User"}, "state": "CHANGES_REQUESTED", "commit_id": SHA},
+        ],
+    ]
+
+    results = []
+    for reviews in review_batches:
+        def handler(request: httpx.Request, _reviews=reviews) -> httpx.Response:
+            path = request.url.path
+            if path == f"/repos/{REPO}/commits/{SHA}/check-runs":
+                return httpx.Response(200, json={"check_runs": []})
+            if path == f"/repos/{REPO}/commits/{SHA}/status":
+                return httpx.Response(200, json={"statuses": []})
+            if path == f"/repos/{REPO}/pulls/108/reviews":
+                return httpx.Response(200, json=_reviews)
+            if "/compare/" in path:
+                return httpx.Response(200, json={"behind_by": 0})
+            return httpx.Response(404)
+
+        async def _run(_handler=handler):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+                return await collect_signals(
+                    REPO, 108, github_token="ghs_test", pr_data=pr_data, diff_files=diff_files, client=client
+                )
+
+        _, sig = asyncio.run(_run())
+        results.append(sig)
+
+    assert results[0].safety_flagged is True
+    assert results[0].approvals == 1
+    assert results[0].safety_human_approved is False
+    assert compute_readiness(REPO, 108, SHA, results[0]).band == "blocked"
+
+    assert results[1].safety_flagged is True
+    assert results[1].safety_human_approved is True
+    assert compute_readiness(REPO, 108, SHA, results[1]).band == "ready"
+
+    assert results[2].safety_human_approved is False
+
+
+def test_shared_head_sha_commit_status_aggregates_strictest_open_pr():
+    posted_statuses: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/statuses/{SHA}":
+            posted_statuses.append(json.loads(request.content.decode()))
+            return httpx.Response(201, json={"id": len(posted_statuses)})
+        if request.method == "GET" and request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path.endswith("/comments"):
+            return httpx.Response(201, json={"id": 9100})
+        if request.method == "PATCH" and "/issues/comments/" in request.url.path:
+            return httpx.Response(200, json={"id": 9100})
+        return httpx.Response(404)
+
+    events.remember_head(REPO, 110, SHA)
+    events.remember_head(REPO, 111, SHA)
+    rep_fail = compute_readiness(REPO, 110, SHA, MergeSignals(failing_checks=[{"name": "ci"}]))
+    rep_pass = compute_readiness(REPO, 111, SHA, MergeSignals())
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            r1 = await publish_readiness(
+                REPO, 110, rep_fail, merge_gate="required", github_token="ghp_pat1", auth_kind="pat", client=client
+            )
+            # PR #111 passes, but shares SHA with failing open PR #110 -> MUST NOT overwrite with success!
+            r2 = await publish_readiness(
+                REPO, 111, rep_pass, merge_gate="required", github_token="ghp_pat1", auth_kind="pat", client=client
+            )
+            # Close PR #110 -> now PR #111 is the only open PR on SHA -> publishes success!
+            mark_pr_closed(REPO, 110, merged=False)
+            r3 = await publish_readiness(
+                REPO, 111, rep_pass, merge_gate="required", github_token="ghp_pat1", auth_kind="pat", client=client
+            )
+            return r1, r2, r3
+
+    r1, r2, r3 = asyncio.run(_run())
+    assert r1["commit_status"]["state"] == "failure"
+    assert r2["commit_status"]["state"] == "failure"
+    assert "PR #110" in r2["commit_status"]["description"]
+    assert r3["commit_status"]["state"] == "success"
+    assert [p["state"] for p in posted_statuses] == ["failure", "failure", "success"]
+
+
+def test_pat_commit_status_skips_unchanged_payloads():
+    status_posts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/statuses/{SHA}":
+            status_posts.append(json.loads(request.content.decode()))
+            return httpx.Response(201, json={"id": len(status_posts)})
+        if request.method == "GET" and request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path.endswith("/comments"):
+            return httpx.Response(201, json={"id": 9200})
+        if request.method == "PATCH" and "/issues/comments/" in request.url.path:
+            return httpx.Response(200, json={"id": 9200})
+        return httpx.Response(404)
+
+    rep_ready = compute_readiness(REPO, 112, SHA, MergeSignals())
+    rep_fail = compute_readiness(REPO, 112, SHA, MergeSignals(failing_checks=[{"name": "ci"}]))
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            r1 = await publish_readiness(
+                REPO, 112, rep_ready, merge_gate="required", github_token="ghp_pat2", auth_kind="pat", client=client
+            )
+            r2 = await publish_readiness(
+                REPO, 112, rep_ready, merge_gate="required", github_token="ghp_pat2", auth_kind="pat", client=client
+            )
+            r3 = await publish_readiness(
+                REPO, 112, rep_fail, merge_gate="required", github_token="ghp_pat2", auth_kind="pat", client=client
+            )
+            return r1, r2, r3
+
+    r1, r2, r3 = asyncio.run(_run())
+    assert r1["commit_status"]["action"] == "posted"
+    assert r2["commit_status"]["action"] == "unchanged"
+    assert r2["published"] is True
+    assert r2["gate_published"] is True
+    assert r3["commit_status"]["action"] == "posted"
+    assert len(status_posts) == 2
+
+
+def test_find_readiness_comment_verifies_author_in_app_and_pat_modes(monkeypatch):
+    monkeypatch.setenv("GITHUB_APP_SLUG", "pr-agent")
+    patched_ids: list[int] = []
+
+    def app_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/check-runs":
+            return httpx.Response(201, json={"id": 9301})
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/issues/113/comments":
+            return httpx.Response(200, json=[
+                {"id": 10, "user": {"login": "attacker", "type": "User"}, "body": f"{READINESS_MARKER}\nspoofed"},
+                {"id": 11, "user": {"login": "other-bot[bot]", "type": "Bot"}, "body": f"{READINESS_MARKER}\nother bot"},
+                {"id": 12, "user": {"login": "pr-agent[bot]", "type": "Bot"}, "body": f"{READINESS_MARKER}\nreal"},
+            ])
+        if request.method == "PATCH" and "/issues/comments/" in request.url.path:
+            cid = int(request.url.path.rsplit("/", 1)[-1])
+            patched_ids.append(cid)
+            return httpx.Response(200, json={"id": cid})
+        return httpx.Response(404)
+
+    rep_app = compute_readiness(REPO, 113, SHA, MergeSignals())
+
+    async def _run_app():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(app_handler)) as client:
+            return await publish_readiness(
+                REPO, 113, rep_app, merge_gate="advisory", github_token="ghs_app", auth_kind="app", client=client
+            )
+
+    res_app = asyncio.run(_run_app())
+    assert res_app["comment"] == {"action": "updated", "id": 12, "status_code": 200}
+    assert patched_ids == [12]
+
+    # Now verify PAT mode checks authenticated GET /user login
+    pat_patched: list[int] = []
+
+    def pat_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/user":
+            return httpx.Response(200, json={"login": "ci-pat-bot"})
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/statuses/{SHA}":
+            return httpx.Response(201, json={"id": 9302})
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/issues/114/comments":
+            return httpx.Response(200, json=[
+                {"id": 20, "user": {"login": "attacker", "type": "User"}, "body": f"{READINESS_MARKER}\nspoofed"},
+                {"id": 21, "user": {"login": "ci-pat-bot", "type": "User"}, "body": f"{READINESS_MARKER}\nown"},
+            ])
+        if request.method == "PATCH" and "/issues/comments/" in request.url.path:
+            cid = int(request.url.path.rsplit("/", 1)[-1])
+            pat_patched.append(cid)
+            return httpx.Response(200, json={"id": cid})
+        return httpx.Response(404)
+
+    rep_pat = compute_readiness(REPO, 114, SHA, MergeSignals())
+
+    async def _run_pat():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(pat_handler)) as client:
+            return await publish_readiness(
+                REPO, 114, rep_pat, merge_gate="advisory", github_token="ghp_unique_pat_tok", auth_kind="pat", client=client
+            )
+
+    res_pat = asyncio.run(_run_pat())
+    assert res_pat["comment"] == {"action": "updated", "id": 21, "status_code": 200}
+    assert pat_patched == [21]
+
+
+def test_incomplete_comment_lookup_skips_posting_duplicate_comment():
+    comment_posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/check-runs":
+            return httpx.Response(201, json={"id": 9401})
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/issues/115/comments":
+            return httpx.Response(500, text="temporary error")
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/issues/115/comments":
+            comment_posts.append(request.url.path)
+            return httpx.Response(201, json={"id": 9402})
+        return httpx.Response(404)
+
+    rep = compute_readiness(REPO, 115, SHA, MergeSignals())
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await publish_readiness(
+                REPO, 115, rep, merge_gate="advisory", github_token="ghs_app", auth_kind="app", client=client
+            )
+
+    res = asyncio.run(_run())
+    assert res["comment"] == {"action": "skipped", "reason": "comment_lookup_incomplete"}
+    assert comment_posts == []
+
+
+def test_dirty_flag_uses_atomic_compare_and_delete():
+    dkey = dm.dirty_key(REPO, 116)
+    store.rset(dkey, "tok-before")
+    bumped = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal bumped
+        path = request.url.path
+        if path == f"/repos/{REPO}/pulls/116":
+            if not bumped:
+                # Simulate a new webhook event arriving mid-refresh!
+                store.rset(dkey, "tok-during")
+                bumped = True
+            return httpx.Response(200, json={
+                "number": 116,
+                "title": "fix: concurrency",
+                "body": "Detailed PR body describing concurrency fix cleanly.",
+                "state": "open",
+                "head": {"sha": SHA, "ref": "fix"},
+                "base": {"ref": "main"},
+            })
+        if path == f"/repos/{REPO}/commits/{SHA}/check-runs":
+            return httpx.Response(200, json={"check_runs": []})
+        if path == f"/repos/{REPO}/commits/{SHA}/status":
+            return httpx.Response(200, json={"statuses": []})
+        if path == f"/repos/{REPO}/pulls/116/reviews":
+            return httpx.Response(200, json=[])
+        if path == f"/repos/{REPO}/pulls/116/files":
+            return httpx.Response(200, json=[])
+        if "/compare/" in path:
+            return httpx.Response(200, json={"behind_by": 0})
+        if request.method == "POST" and path == f"/repos/{REPO}/check-runs":
+            return httpx.Response(201, json={"id": 9501})
+        if request.method == "PATCH" and "/check-runs/" in path:
+            return httpx.Response(200, json={"id": 9501})
+        if request.method == "GET" and path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and path.endswith("/comments"):
+            return httpx.Response(201, json={"id": 9502})
+        if request.method == "PATCH" and "/issues/comments/" in path:
+            return httpx.Response(200, json={"id": 9502})
+        return httpx.Response(404)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await recompute_pr_readiness(
+                REPO, 116, agent_config={"merge_gate": "required"}, github_token="ghs_app", auth_kind="app", client=client
+            )
+            after_first = store.rget(dkey)
+            # Second run has no concurrent mutation -> dirty key IS cleared
+            await recompute_pr_readiness(
+                REPO, 116, agent_config={"merge_gate": "required"}, github_token="ghs_app", auth_kind="app", client=client
+            )
+            after_second = store.rget(dkey)
+            return after_first, after_second
+
+    after_first, after_second = asyncio.run(_run())
+    assert after_first == "tok-during"
+    assert after_second is None
+
+
+def test_stale_snapshot_cannot_overwrite_newer_head_or_closed_inbox():
+    sha_old = "1" * 40
+    sha_new = "2" * 40
+
+    rep_new = compute_readiness(REPO, 117, sha_new, MergeSignals())
+    rep_old = compute_readiness(REPO, 117, sha_old, MergeSignals(failing_checks=[{"name": "ci"}]))
+
+    async def _run():
+        # Publish newer snapshot first
+        r_new = await publish_readiness(
+            REPO, 117, rep_new, merge_gate="off",
+            pr_meta={"title": "Newer head", "state": "open"},
+            snapshot_at="2026-11-21T10:00:05+00:00",
+        )
+        # Late-arriving older snapshot for older head MUST be rejected
+        r_stale_head = await publish_readiness(
+            REPO, 117, rep_old, merge_gate="off",
+            pr_meta={"title": "Older head", "state": "open"},
+            snapshot_at="2026-11-21T10:00:01+00:00",
+        )
+        # Mark PR closed as merged, then attempt to overwrite back to open
+        mark_pr_closed(REPO, 117, merged=True)
+        r_stale_merged = await publish_readiness(
+            REPO, 117, rep_new, merge_gate="off",
+            pr_meta={"title": "Stale open", "state": "open"},
+            snapshot_at="2099-01-01T00:00:00+00:00",
+        )
+        return r_new, r_stale_head, r_stale_merged
+
+    r_new, r_stale_head, r_stale_merged = asyncio.run(_run())
+    assert r_new["inbox"]["head_sha"] == sha_new
+    assert r_stale_head["stale"] is True
+    assert get_stored_readiness(REPO, 117)["head_sha"] == sha_new
+    assert r_stale_merged["stale"] is True
+    assert list_inbox_prs(repo=REPO, state="open") == []
+    assert [p["pr_number"] for p in list_inbox_prs(repo=REPO, state="merged")] == [117]
+
+
+def test_required_gate_write_failure_keeps_dirty_flag_and_bounded_retries():
+    from merge import publisher as merge_pub
+
+    dkey = dm.dirty_key(REPO, 118)
+    store.rset(dkey, "tok-118")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/check-runs":
+            return httpx.Response(500, text="check run API error")
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/issues/118/comments":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/issues/118/comments":
+            return httpx.Response(201, json={"id": 9601})
+        if request.method == "PATCH" and "/issues/comments/" in request.url.path:
+            return httpx.Response(200, json={"id": 9601})
+        return httpx.Response(404)
+
+    rep = compute_readiness(REPO, 118, SHA, MergeSignals())
+
+    async def _run_once():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await publish_readiness(
+                REPO, 118, rep, merge_gate="required", github_token="ghs_app", auth_kind="app", client=client
+            )
+
+    # First failure: comment succeeded, check run failed -> published MUST be False and dirty kept!
+    res1 = asyncio.run(_run_once())
+    assert res1["comment"]["action"] == "created"
+    assert res1["check_run"]["action"] == "failed"
+    assert res1["gate_published"] is False
+    assert res1["published"] is False
+    assert store.rget(dkey) == "tok-118"
+
+    # Exhaust retry budget -> dirty flag is eventually cleared so permanent errors don't spin forever
+    for _ in range(merge_pub._MAX_PUBLISH_RETRIES):
+        res_n = asyncio.run(_run_once())
+        assert res_n["published"] is False
+    assert store.rget(dkey) is None
+
 

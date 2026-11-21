@@ -45,7 +45,7 @@ import { fetchAppHealth } from "@/lib/cloud";
 import { listPrInbox } from "@/lib/cloud-agent";
 import { useGh, loadRepos } from "@/lib/github";
 import { refreshOAuthStatus } from "@/lib/oauth";
-import { forgetSecrets, hydrateFromVault } from "@/lib/session";
+import { forgetSecrets, hydrateFromVault, useVaultHydrated } from "@/lib/session";
 import { useApp, type TabId } from "@/lib/store";
 import { tauriInvoke } from "@/lib/tauri";
 import { AgentsPage } from "@/pages/agents";
@@ -349,6 +349,7 @@ export function App() {
   const tab = useApp((s) => s.tab);
   const theme = useApp((s) => s.theme);
   const githubToken = useApp((s) => s.secrets.github);
+  const vaultHydrated = useVaultHydrated();
 
   // Theme: the `dark` class drives shadcn's CSS variables.
   React.useEffect(() => {
@@ -416,18 +417,26 @@ export function App() {
         <SidebarInset className="h-svh min-w-0 overflow-hidden">
           <Topbar />
           <main className="flex-1 overflow-y-auto p-4 sm:p-6">
-            <CloudSetupPage active={tab === "setup"} />
-            <PrInboxPage active={tab === "inbox"} />
-            <MemoryPage active={tab === "memory"} />
-            <AutoReviewPage active={tab === "autoreview"} />
-            <ReviewPage active={tab === "review"} />
-            <AgentsPage active={tab === "agents"} />
-            <RunsPage active={tab === "runs"} />
-            <AutonomyPage active={tab === "autonomy"} />
-            <QuotaPage active={tab === "quota"} />
-            <ProvidersPage active={tab === "providers"} />
-            <IntegrationsPage active={tab === "integrations"} />
-            <SettingsPage active={tab === "settings"} />
+            {vaultHydrated ? (
+              <>
+                <CloudSetupPage active={tab === "setup"} />
+                <PrInboxPage active={tab === "inbox"} />
+                <MemoryPage active={tab === "memory"} />
+                <AutoReviewPage active={tab === "autoreview"} />
+                <ReviewPage active={tab === "review"} />
+                <AgentsPage active={tab === "agents"} />
+                <RunsPage active={tab === "runs"} />
+                <AutonomyPage active={tab === "autonomy"} />
+                <QuotaPage active={tab === "quota"} />
+                <ProvidersPage active={tab === "providers"} />
+                <IntegrationsPage active={tab === "integrations"} />
+                <SettingsPage active={tab === "settings"} />
+              </>
+            ) : (
+              <div className="text-muted-foreground flex h-40 items-center justify-center text-xs">
+                Loading local session…
+              </div>
+            )}
           </main>
         </SidebarInset>
       </SidebarProvider>

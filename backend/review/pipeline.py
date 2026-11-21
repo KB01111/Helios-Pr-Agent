@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from typing import Any, Awaitable, Callable, Sequence
@@ -579,12 +580,27 @@ def _format_dismissed_hints(memories: dict[str, Any] | None) -> str:
     dismissed = memories.get("dismissed") or []
     lines: list[str] = []
     for item in dismissed[:25]:
-        text = str(item.get("text") if isinstance(item, dict) else item or "").strip()
-        if text:
-            lines.append(f"- {text[:240]}")
+        if isinstance(item, dict):
+            text = str(item.get("text") or "").strip()
+            raw_scopes = item.get("scope_globs")
+            scopes = [str(g).strip() for g in raw_scopes if str(g).strip()] if isinstance(raw_scopes, list) else []
+            if text:
+                if scopes and scopes != ["**"]:
+                    scope_str = ", ".join(f"`{g}`" for g in scopes[:6])
+                    lines.append(f"- [ONLY for paths matching {scope_str}] {text[:240]}")
+                else:
+                    lines.append(f"- {text[:240]}")
+        else:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"- {text[:240]}")
     if not lines:
         return ""
-    return "Previously dismissed false-positive patterns (DO NOT report these):\n" + "\n".join(lines)
+    return (
+        "Previously dismissed false-positive patterns (DO NOT report these within their listed path scope; "
+        "scoped dismissals apply ONLY to matching paths):\n"
+        + "\n".join(lines)
+    )
 
 
 def _coerce_finding(raw: Any) -> dm.Finding | None:
@@ -633,10 +649,14 @@ def _coerce_finding(raw: Any) -> dm.Finding | None:
         raw_patch = raw.get("suggestion")
     suggestion_patch = str(raw_patch)[:8000] if isinstance(raw_patch, str) and raw_patch.strip() else None
 
+    raw_conf = raw.get("confidence", 0.75)
     try:
-        confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.75))))
+        parsed_conf = float(raw_conf)
     except (TypeError, ValueError):
-        confidence = 0.75
+        parsed_conf = 0.75
+    if not math.isfinite(parsed_conf):
+        return None
+    confidence = max(0.0, min(1.0, parsed_conf))
 
     source_raw = str(raw.get("source") or "llm").strip().lower()
     source = source_raw if source_raw in ("llm", "tool", "memory") else "llm"
@@ -807,8 +827,8 @@ async def generate_findings(
             ]
 
     if logs is not None:
-        logs.append("review: Pass B JSON retry failed; returning empty findings list.")
-    return []
+        logs.append("review: Pass B JSON retry failed; aborting review generation.")
+    raise LLMCallError("Pass B failed to return valid structured findings after retry")
 
 
 # ---------------------------------------------------------------------------
@@ -894,8 +914,8 @@ def _validate_and_align_location(
     suggestion_patch: str | None,
 ) -> tuple[int, int, str, str | None] | None:
     """Validate `(start_line, end_line, side)` against `df` so GitHub Review API won't 422."""
+    orig_start, orig_end, orig_side = start_line, end_line, side
     valid = df.valid_lines(side)
-    other_side = "LEFT" if side == "RIGHT" else "RIGHT"
 
     if end_line not in valid:
         # Common LLM mistake: flagging a deleted line with side="RIGHT"
@@ -927,9 +947,11 @@ def _validate_and_align_location(
             start_line = in_range[0]
         else:
             start_line = end_line
-        # If the span changed, a multi-line suggestion patch may no longer match lines
-        if suggestion_patch is not None and "\n" in suggestion_patch:
-            suggestion_patch = None
+
+    # Clear any suggestion patch whenever verification altered start, end, or side,
+    # even for single-line patches (a 1-line patch could have been meant to replace a range).
+    if (start_line, end_line, side) != (orig_start, orig_end, orig_side):
+        suggestion_patch = None
 
     # Drop no-op suggestion patches identical to current code
     if suggestion_patch is not None and side == "RIGHT":
@@ -944,6 +966,7 @@ def verify_and_filter_findings(
     raw_findings: Sequence[dm.Finding | dict[str, Any]],
     parsed_diff: ParsedDiff,
     *,
+    anchor_diff: ParsedDiff | None = None,
     profile: str = "chill",
     memories: dict[str, Any] | None = None,
     existing_findings: Sequence[dict[str, Any]] | None = None,
@@ -979,10 +1002,12 @@ def verify_and_filter_findings(
     ):
         counters.setdefault(k, 0)
 
-    # Collect previously stored open or dismissed fingerprints
+    # Collect previously stored open or dismissed fingerprints (skip undelivered ones so retries can publish them)
     prior_fps: set[str] = set(existing_fingerprints or ())
     for item in existing_findings or ():
         if not isinstance(item, dict):
+            continue
+        if item.get("delivered") is False:
             continue
         state = str(item.get("state") or "open").lower()
         if state not in ("open", "dismissed"):
@@ -1039,6 +1064,27 @@ def verify_and_filter_findings(
             continue
 
         start_line, end_line, side, final_patch = aligned
+
+        # When reviewing an incremental diff, validate the final anchor against the
+        # full PR diff (`anchor_diff`) because GitHub interprets review comment
+        # positions against the PR diff (not the incremental compare).
+        if anchor_diff is not None:
+            adf = anchor_diff.get_file(df.path)
+            if adf is None or adf.is_binary:
+                counters["dropped_out_of_diff"] += 1
+                continue
+            pr_hunk = adf.hunk_for_line(end_line, side)
+            if pr_hunk is None or start_line not in pr_hunk.valid_lines(side):
+                counters["dropped_out_of_diff"] += 1
+                continue
+            # For LEFT anchors, also ensure the deleted/old line text matches the PR merge base
+            # (a line added in push 1 and deleted in push 2 never existed in the PR merge base).
+            if side == "LEFT":
+                inc_code = df.code_span(start_line, end_line, "LEFT")
+                pr_code = adf.code_span(start_line, end_line, "LEFT")
+                if not pr_code or (inc_code and inc_code != pr_code):
+                    counters["dropped_out_of_diff"] += 1
+                    continue
 
         if coerced.confidence < min_conf:
             counters["dropped_low_confidence"] += 1

@@ -271,6 +271,15 @@ def _find_mapping_colon(text: str) -> int:
     return -1
 
 
+_DOUBLE_ESCAPE_MAP = {'"': '"', "\\": "\\", "n": "\n", "r": "\r", "t": "\t"}
+_DOUBLE_ESCAPE_RE = re.compile(r'\\(["\\nrt])')
+
+
+def _unescape_double_quoted(inner: str) -> str:
+    """Decode YAML double-quoted escapes in a single pass so `\\\\n` becomes `\\n`."""
+    return _DOUBLE_ESCAPE_RE.sub(lambda m: _DOUBLE_ESCAPE_MAP[m.group(1)], inner)
+
+
 def _parse_scalar(raw: str) -> Any:
     val = raw.strip()
     if not val:
@@ -290,18 +299,13 @@ def _parse_scalar(raw: str) -> Any:
             if cidx == -1:
                 raise ValueError(f"invalid flow mapping entry: {item!r}")
             k = str(_parse_scalar(item[:cidx]))
+            if k in out:
+                raise ValueError(f"duplicate YAML key in flow mapping: {k!r}")
             v = _parse_scalar(item[cidx + 1:])
             out[k] = v
         return out
     if (val.startswith('"') and val.endswith('"') and len(val) >= 2):
-        inner = val[1:-1]
-        # Handle common double-quoted escapes
-        return (
-            inner.replace('\\"', '"')
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace("\\\\", "\\")
-        )
+        return _unescape_double_quoted(val[1:-1])
     if (val.startswith("'") and val.endswith("'") and len(val) >= 2):
         return val[1:-1].replace("''", "'")
 
@@ -443,7 +447,10 @@ def parse_yaml_subset(text: str) -> dict[str, Any]:
                     nxt_stripped = nxt_line[nxt_ind:]
                     if nxt_ind >= item_indent and not (nxt_stripped == "-" or nxt_stripped.startswith("- ")):
                         extra, idx = _parse_mapping(nxt, nxt_ind)
-                        item_dict.update(extra)
+                        for ek, ev in extra.items():
+                            if ek in item_dict:
+                                raise ValueError(f"duplicate YAML key in sequence mapping: {ek!r}")
+                            item_dict[ek] = ev
                 out.append(item_dict)
             else:
                 out.append(_parse_scalar(rest))
@@ -469,6 +476,8 @@ def parse_yaml_subset(text: str) -> dict[str, Any]:
             if cidx == -1:
                 raise ValueError(f"expected `key: value` at line {idx + 1}: {stripped!r}")
             key = str(_parse_scalar(stripped[:cidx]))
+            if key in out:
+                raise ValueError(f"duplicate YAML key at line {idx + 1}: {key!r}")
             val_raw = stripped[cidx + 1:].strip()
             if val_raw in ("|", "|-", ">", ">-"):
                 val, idx = _parse_block_scalar(idx + 1, map_indent, val_raw)
@@ -500,11 +509,52 @@ def parse_yaml_subset(text: str) -> dict[str, Any]:
     return root
 
 
+def _load_with_pyyaml(text: str) -> Any:
+    """Parse YAML using PyYAML with YAML 1.2 boolean resolution (`true`/`false`
+    only, so `merge_gate: off` stays string `'off'`) and strict duplicate-key
+    rejection."""
+    import yaml  # type: ignore
+
+    class _StrictConfigLoader(yaml.SafeLoader):
+        pass
+
+    # Clone resolver table and restrict boolean implicit resolution to YAML 1.2
+    # (`true`/`false` only), matching `parse_yaml_subset`.
+    _StrictConfigLoader.yaml_implicit_resolvers = {
+        ch: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
+        for ch, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    _bool_re = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+    for ch in ("t", "T", "f", "F"):
+        _StrictConfigLoader.yaml_implicit_resolvers.setdefault(ch, []).append(
+            ("tag:yaml.org,2002:bool", _bool_re)
+        )
+
+    def _construct_unique_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                dup = key in mapping
+            except TypeError:
+                dup = False
+            if dup:
+                raise ValueError(f"duplicate YAML key: {key!r}")
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    _StrictConfigLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+    )
+    return yaml.load(text, Loader=_StrictConfigLoader)  # nosec B506 - SafeLoader subclass
+
+
 def parse_pragent_yaml(text: str, *, use_pyyaml: bool = True) -> RepoConfig:
     """Parse `.pragent.yaml` text into a validated `RepoConfig`.
 
-    Uses `yaml.safe_load` when PyYAML is available and `use_pyyaml=True`,
-    falling back to the pure-Python YAML subset parser otherwise.
+    Uses a strict `yaml.SafeLoader` subclass (YAML 1.2 booleans + duplicate-key
+    rejection) when PyYAML is available and `use_pyyaml=True`, falling back to
+    the pure-Python YAML subset parser otherwise.
     """
     if len(text.encode("utf-8", errors="ignore")) > _MAX_CONFIG_BYTES:
         raise ValueError("repo config exceeds maximum allowed size")
@@ -512,9 +562,7 @@ def parse_pragent_yaml(text: str, *, use_pyyaml: bool = True) -> RepoConfig:
     parsed_with_pyyaml = False
     if use_pyyaml:
         try:
-            import yaml  # type: ignore
-
-            data = yaml.safe_load(text)
+            data = _load_with_pyyaml(text)
             parsed_with_pyyaml = True
         except ImportError:
             parsed_with_pyyaml = False
@@ -619,29 +667,35 @@ def _emit_yaml_lines(obj: Any, indent: int = 0) -> list[str]:
 
 
 def render_pragent_yaml(config_dict: dict[str, Any] | RepoConfig) -> str:
-    """Export a clean, deterministic `.pragent.yaml` string."""
-    if isinstance(config_dict, RepoConfig):
-        raw = config_dict.model_dump()
-    else:
-        raw = RepoConfig.model_validate(config_dict or {}).model_dump()
+    """Export a clean, deterministic `.pragent.yaml` string.
 
-    ordered: dict[str, Any] = {
-        "profile": raw["profile"],
-        "merge_gate": raw["merge_gate"],
-        "score_threshold": raw["score_threshold"],
-        "auto_review": raw["auto_review"],
-        "path_filters": raw["path_filters"],
-        "path_instructions": raw["path_instructions"],
-        "memory": raw["memory"],
-        "chat": raw["chat"],
-        "labels": raw["labels"],
-        "pre_merge_checks": raw["pre_merge_checks"],
-    }
-    if raw.get("tools"):
-        ordered["tools"] = raw["tools"]
-    if raw.get("weights"):
-        ordered["weights"] = raw["weights"]
+    Only explicitly configured fields (including nested fields) are emitted so
+    omitted settings continue inheriting from the agent configuration after
+    export and re-import.
+    """
+    if isinstance(config_dict, RepoConfig):
+        raw = config_dict.model_dump(exclude_unset=True)
+    else:
+        raw = RepoConfig.model_validate(config_dict or {}).model_dump(exclude_unset=True)
+
+    field_order = (
+        "profile",
+        "merge_gate",
+        "score_threshold",
+        "auto_review",
+        "path_filters",
+        "path_instructions",
+        "memory",
+        "chat",
+        "labels",
+        "pre_merge_checks",
+        "tools",
+        "weights",
+    )
+    ordered: dict[str, Any] = {k: raw[k] for k in field_order if k in raw}
     header = "# PR Agent repository configuration (read from base branch only)\n"
+    if not ordered:
+        return header + "{}\n"
     return header + "\n".join(_emit_yaml_lines(ordered)) + "\n"
 
 
@@ -727,8 +781,8 @@ async def load_repo_config_with_source(
             ):
                 try:
                     return RepoConfig.model_validate(cached_dict["config"]), "repo"
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("review.config: cached config invalid for %s (%s); reloading", repo, type(exc).__name__)
 
             encoded = payload.get("content")
             if not isinstance(encoded, str):

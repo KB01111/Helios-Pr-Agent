@@ -15,6 +15,7 @@ from .service import (
     render_memory_markdown,
     retrieve_for_diff,
     update_memory,
+    valid_memory_id,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "render_memory_markdown",
     "retrieve_for_diff",
     "update_memory",
+    "valid_memory_id",
 ]

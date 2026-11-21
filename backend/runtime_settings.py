@@ -227,6 +227,8 @@ def refresh(force: bool = False) -> None:
             values, errors, broken = _decode(_load_doc())
         except Exception as exc:
             log.warning("runtime settings: could not load (%s); keeping the last applied values", type(exc).__name__)
+            with _lock:
+                _last_refresh = time.monotonic()
             return
         _apply(values)
         with _lock:

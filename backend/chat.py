@@ -16,6 +16,7 @@ import inspect
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -216,6 +217,106 @@ def _finding_comment_ids(finding: dict[str, Any]) -> set[int]:
     return ids
 
 
+def _resolve_finding_target(
+    repo: str,
+    pr_number: int,
+    *,
+    comment_id: int = 0,
+    in_reply_to: int | None = None,
+    path: str = "",
+    query: str = "",
+) -> tuple[tuple[str, dict[str, Any]] | None, list[tuple[str, dict[str, Any]]]]:
+    """Resolve a target finding for `dismiss` / `resolve`.
+
+    Returns ``(matched, ambiguous_candidates)``:
+    - ``matched`` is ``(fingerprint, finding)`` when uniquely identified.
+    - ``ambiguous_candidates`` is non-empty when multiple open findings could
+      match and the caller should request clarification rather than guess.
+    """
+    findings = _load_pr_findings(repo, pr_number)
+    if not findings:
+        return None, []
+
+    supplied_ids = {int(t) for t in (in_reply_to, comment_id) if t and int(t) > 0}
+
+    # 1. Exact match by thread root (`in_reply_to`) or comment_id.
+    for target_id in (in_reply_to, comment_id):
+        if target_id and int(target_id) > 0:
+            tid = int(target_id)
+            for fp, item in findings:
+                if tid in _finding_comment_ids(item):
+                    return (fp, item), []
+
+    # 2. Exact match by explicit fingerprint in query (takes precedence over file fallback).
+    clean_query = str(query or "").strip().lower()
+    if clean_query:
+        for fp, item in findings:
+            if fp.lower() in clean_query:
+                return (fp, item), []
+
+    # 3. Match by normalized file path (only when unambiguous — never guess by severity alone).
+    norm_path = _norm_rel_path(path)
+    query_tokens = set(re.findall(r"[a-z0-9]{3,}", clean_query))
+    if norm_path:
+        path_matches = [
+            (fp, item)
+            for fp, item in findings
+            if _norm_rel_path(str(item.get("file") or item.get("path") or "")) == norm_path
+        ]
+        if path_matches:
+            open_matches = [pair for pair in path_matches if pair[1].get("state", "open") == "open"]
+            candidates = open_matches or path_matches
+
+            if query_tokens:
+                scored_path: list[tuple[int, str, dict[str, Any]]] = []
+                for fp, item in candidates:
+                    title_tokens = set(re.findall(r"[a-z0-9]{3,}", str(item.get("title") or "").lower()))
+                    overlap = len(query_tokens & title_tokens)
+                    if overlap > 0:
+                        scored_path.append((overlap, fp, item))
+                if scored_path:
+                    scored_path.sort(key=lambda t: t[0], reverse=True)
+                    top_overlap = scored_path[0][0]
+                    top_tied = [(fp, item) for ov, fp, item in scored_path if ov == top_overlap]
+                    if len(top_tied) == 1:
+                        return top_tied[0], []
+                    return None, top_tied
+
+            # If a comment/thread ID was supplied and didn't match step 1, do not fall back
+            # blindly to findings that already belong to a different GitHub comment thread.
+            if supplied_ids:
+                unlinked = [pair for pair in candidates if not _finding_comment_ids(pair[1])]
+                if len(unlinked) == 1 and len(candidates) == 1:
+                    return unlinked[0], []
+                if len(candidates) > 1:
+                    return None, candidates
+                return None, []
+
+            if len(candidates) == 1:
+                return candidates[0], []
+            return None, candidates
+
+    # 4. Match by title tokens in query (for PR-level comments without a file path).
+    if query_tokens:
+        scored: list[tuple[int, str, dict[str, Any]]] = []
+        for fp, item in findings:
+            if item.get("state", "open") != "open":
+                continue
+            title_tokens = set(re.findall(r"[a-z0-9]{3,}", str(item.get("title") or "").lower()))
+            overlap = len(query_tokens & title_tokens)
+            if overlap > 0:
+                scored.append((overlap, fp, item))
+        if scored:
+            scored.sort(key=lambda t: t[0], reverse=True)
+            top_overlap = scored[0][0]
+            top_tied = [(fp, item) for ov, fp, item in scored if ov == top_overlap]
+            if len(top_tied) == 1:
+                return top_tied[0], []
+            return None, top_tied
+
+    return None, []
+
+
 def _find_matching_finding(
     repo: str,
     pr_number: int,
@@ -225,59 +326,15 @@ def _find_matching_finding(
     path: str = "",
     query: str = "",
 ) -> tuple[str, dict[str, Any]] | None:
-    findings = _load_pr_findings(repo, pr_number)
-    if not findings:
-        return None
-
-    # 1. Exact match by thread root (`in_reply_to`) or comment_id.
-    for target_id in (in_reply_to, comment_id):
-        if target_id and int(target_id) > 0:
-            tid = int(target_id)
-            for fp, item in findings:
-                if tid in _finding_comment_ids(item):
-                    return fp, item
-
-    # 2. Match by normalized file path (prefer open findings, then title overlap, then severity).
-    norm_path = _norm_rel_path(path)
-    query_tokens = set(re.findall(r"[a-z0-9]{3,}", str(query or "").lower()))
-    if norm_path:
-        path_matches = [
-            (fp, item)
-            for fp, item in findings
-            if _norm_rel_path(str(item.get("file") or item.get("path") or "")) == norm_path
-        ]
-        if path_matches:
-            def _rank(pair: tuple[str, dict[str, Any]]) -> tuple[int, int, int]:
-                _, item = pair
-                is_open = 1 if item.get("state", "open") == "open" else 0
-                title_tokens = set(re.findall(r"[a-z0-9]{3,}", str(item.get("title") or "").lower()))
-                overlap = len(query_tokens & title_tokens) if query_tokens else 0
-                sev = _SEVERITY_RANK.get(str(item.get("severity") or "").lower(), 0)
-                return (is_open, overlap, sev)
-
-            path_matches.sort(key=_rank, reverse=True)
-            return path_matches[0]
-
-    # 3. Match by explicit fingerprint or title tokens in query (for PR-level comments).
-    clean_query = str(query or "").strip().lower()
-    if clean_query:
-        for fp, item in findings:
-            if fp.lower() in clean_query:
-                return fp, item
-        scored: list[tuple[int, int, str, dict[str, Any]]] = []
-        for fp, item in findings:
-            if item.get("state", "open") != "open":
-                continue
-            title_tokens = set(re.findall(r"[a-z0-9]{3,}", str(item.get("title") or "").lower()))
-            overlap = len(query_tokens & title_tokens)
-            if overlap > 0:
-                sev = _SEVERITY_RANK.get(str(item.get("severity") or "").lower(), 0)
-                scored.append((overlap, sev, fp, item))
-        if scored:
-            scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-            return scored[0][2], scored[0][3]
-
-    return None
+    matched, _ = _resolve_finding_target(
+        repo,
+        pr_number,
+        comment_id=comment_id,
+        in_reply_to=in_reply_to,
+        path=path,
+        query=query,
+    )
+    return matched
 
 
 async def _invoke_callback(fn: Callable[..., Any], repo: str, pr_number: int) -> Any:
@@ -289,13 +346,14 @@ async def _invoke_callback(fn: Callable[..., Any], repo: str, pr_number: int) ->
         ]
         has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
         if has_varargs or len(params) >= 2:
-            res = fn(repo, pr_number)
+            call_args: tuple[Any, ...] = (repo, pr_number)
         elif len(params) == 1:
-            res = fn(pr_number)
+            call_args = (pr_number,)
         else:
-            res = fn()
+            call_args = ()
     except (TypeError, ValueError):
-        res = fn(repo, pr_number)
+        call_args = (repo, pr_number)
+    res = fn(*call_args)
     if inspect.isawaitable(res):
         return await res
     return res
@@ -612,7 +670,7 @@ async def handle_pr_mention(
             result["memory"] = mem
 
     elif cmd == "dismiss":
-        matched = _find_matching_finding(
+        matched, ambiguous = _resolve_finding_target(
             repo,
             pr_num,
             comment_id=comment_id,
@@ -645,6 +703,17 @@ async def handle_pr_mention(
                     f"Recorded dismissal #{dismissal['dismissal_count']} — add a reason or dismiss once more "
                     "to suppress this pattern repo-wide."
                 )
+        elif ambiguous:
+            result["dismissal"] = None
+            result["ambiguous"] = True
+            opts = "\n".join(
+                f"- `{fp[:16]}` — {item.get('title') or '(untitled)'}"
+                for fp, item in ambiguous[:5]
+            )
+            reply_text = (
+                "Multiple findings match here; please reply directly on the finding's thread or "
+                "include its fingerprint:\n\n" + opts
+            )
         elif arg.strip() or path.strip():
             norm_path = _norm_rel_path(path)
             synth_title = arg.strip()[:120] or f"finding on {norm_path}"
@@ -671,7 +740,7 @@ async def handle_pr_mention(
             )
 
     elif cmd == "resolve":
-        matched = _find_matching_finding(
+        matched, ambiguous = _resolve_finding_target(
             repo,
             pr_num,
             comment_id=comment_id,
@@ -688,11 +757,22 @@ async def handle_pr_mention(
                 finding["resolved_by"] = clean_author
             if dm._FINGERPRINT_RE.fullmatch(fp):
                 store.rset_json(dm.finding_key(repo, pr_num, fp), finding, ex=dm.FINDING_TTL_S)
-            store.rset(dm.dirty_key(repo, pr_num), now_iso, ex=dm.DIRTY_TTL_S)
+            store.rset(dm.dirty_key(repo, pr_num), f"{now_iso}:{uuid.uuid4().hex[:8]}", ex=dm.DIRTY_TTL_S)
             result["resolved"] = True
             result["finding"] = finding
             title = str(finding.get("title") or fp)
             reply_text = f"Marked finding **{title}** (`{fp[:12]}`) as resolved."
+        elif ambiguous:
+            result["resolved"] = False
+            result["ambiguous"] = True
+            opts = "\n".join(
+                f"- `{fp[:16]}` — {item.get('title') or '(untitled)'}"
+                for fp, item in ambiguous[:5]
+            )
+            reply_text = (
+                "Multiple findings match here; please reply directly on the finding's thread or "
+                "include its fingerprint to resolve:\n\n" + opts
+            )
         else:
             result["resolved"] = False
             reply_text = "No matching finding was found on this thread to resolve."

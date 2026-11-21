@@ -74,9 +74,10 @@ import {
   copyToClipboard,
   getPullReadiness,
   isValidRepo,
-  renderPragentYaml,
+  mergePragentYaml,
   triggerManualReview,
   type ManualReviewResponse,
+  type PragentYamlInput,
   type ReadinessReport,
 } from "@/lib/cloud-agent";
 import { ghRandomSecret, listPulls, loadRepos, useGh, type PullSummary } from "@/lib/github";
@@ -101,7 +102,7 @@ import {
   type MergeGateMode,
   type ReviewProfile,
 } from "@/lib/store";
-import { errText, githubCommitRepoFile, isTauri, openUrl } from "@/lib/tauri";
+import { errText, githubCommitRepoFile, githubReadRepoFile, isTauri, openUrl } from "@/lib/tauri";
 import { toastErr, toastOk } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -159,6 +160,8 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const allSecrets = useApp((s) => s.secrets);
   const setSecret = useApp((s) => s.setSecret);
   const rememberSecrets = useApp((s) => s.rememberSecrets);
+  const vaultLoaded = useApp((s) => s.vaultLoaded);
+  const vaultSupported = useApp((s) => s.vaultSupported);
   const vaultKeys = useApp((s) => s.vaultKeys);
   const agents = useApp((s) => s.agents);
   const clearNonce = useApp((s) => s.clearNonce);
@@ -215,16 +218,55 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const [deployLog, setDeployLog] = React.useState("");
   const [yamlDialogOpen, setYamlDialogOpen] = React.useState(false);
   const [yamlRepoTarget, setYamlRepoTarget] = React.useState("");
+  const [existingYaml, setExistingYaml] = React.useState<string | null>(null);
+  const [existingYamlFor, setExistingYamlFor] = React.useState("");
+  const [yamlLoading, setYamlLoading] = React.useState(false);
+  const yamlSeqRef = React.useRef(0);
 
   // Step 5 state
   const [verifyRepo, setVerifyRepo] = React.useState("");
   const [pulls, setPulls] = React.useState<PullSummary[]>([]);
+  const [pullsScopeKey, setPullsScopeKey] = React.useState("");
   const [selectedPr, setSelectedPr] = React.useState<string>("");
   const [manualPrNum, setManualPrNum] = React.useState<string>("");
   const [forceFull, setForceFull] = React.useState<boolean>(false);
   const [reviewRes, setReviewRes] = React.useState<ManualReviewResponse | null>(null);
   const [verifiedReadiness, setVerifiedReadiness] = React.useState<ReadinessReport | null>(null);
+  const [reviewResultKey, setReviewResultKey] = React.useState("");
   const [verifyErr, setVerifyErr] = React.useState("");
+  const pullsSeqRef = React.useRef(0);
+  const reviewSeqRef = React.useRef(0);
+
+  const activePrNumberStr = (manualPrNum.trim() || selectedPr).trim();
+  const verifyRepoScopeKey = `${currentBackendUrl}::${verifyRepo.trim()}`;
+  const verifyTargetKey = `${verifyRepoScopeKey}::${activePrNumberStr}`;
+  const verifyRepoScopeRef = React.useRef(verifyRepoScopeKey);
+  verifyRepoScopeRef.current = verifyRepoScopeKey;
+  const verifyTargetRef = React.useRef(verifyTargetKey);
+  verifyTargetRef.current = verifyTargetKey;
+
+  // Invalidate loaded PR list & verification results when backend or repository changes.
+  React.useEffect(() => {
+    pullsSeqRef.current++;
+    reviewSeqRef.current++;
+    setPulls([]);
+    setPullsScopeKey("");
+    setSelectedPr("");
+    setManualPrNum("");
+    setReviewRes(null);
+    setVerifiedReadiness(null);
+    setReviewResultKey("");
+    setVerifyErr("");
+  }, [verifyRepoScopeKey]);
+
+  // Invalidate verification results when the selected PR number changes.
+  React.useEffect(() => {
+    reviewSeqRef.current++;
+    setReviewRes(null);
+    setVerifiedReadiness(null);
+    setReviewResultKey("");
+    setVerifyErr("");
+  }, [verifyTargetKey]);
 
   const refreshDiagnostics = React.useCallback(async () => {
     const mine = ++diagSeq.current;
@@ -255,8 +297,8 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   }, []);
 
   React.useEffect(() => {
-    if (active) void refreshDiagnostics();
-  }, [active, currentBackendUrl, oauthRevision, refreshDiagnostics]);
+    if (active && vaultLoaded) void refreshDiagnostics();
+  }, [active, vaultLoaded, currentBackendUrl, oauthRevision, refreshDiagnostics]);
 
   // Seed step 4 controls from an existing backend agent when loaded (reset on backend switch)
   const hydratedAgentRef = React.useRef(false);
@@ -309,7 +351,7 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const authProtected = Boolean(diag?.auth_required);
   const encryptionReady = Boolean(diag?.settings?.encryption);
   const redisReady = Boolean(diag?.redis?.configured);
-  const step1Done = backendReachable && authProtected && encryptionReady;
+  const step1Done = backendReachable && authProtected && encryptionReady && redisReady;
 
   const activeBackendLlm = toProviderId(String(diag?.llm_provider || llmProvider));
   const llmKeyReady = Boolean(diag?.[LLM_STATUS_KEY[activeBackendLlm]]?.configured);
@@ -326,7 +368,10 @@ export function CloudSetupPage({ active }: { active: boolean }) {
     "";
   const step3Done = Boolean(health?.configured && health?.ok && !webhookMismatch);
   const step4Done = agents.length > 0;
-  const step5Done = Boolean(reviewRes && reviewRes.status && !/error|fail/i.test(reviewRes.status));
+  const matchedPulls = pullsScopeKey === verifyRepoScopeKey ? pulls : [];
+  const matchedReviewRes = reviewRes && reviewResultKey === verifyTargetKey ? reviewRes : null;
+  const matchedVerifiedReadiness = verifiedReadiness && reviewResultKey === verifyTargetKey ? verifiedReadiness : null;
+  const step5Done = Boolean(matchedReviewRes && matchedReviewRes.status && !/error|fail/i.test(matchedReviewRes.status));
 
   const stepDoneMap: Record<number, boolean> = {
     1: step1Done,
@@ -460,19 +505,59 @@ export function CloudSetupPage({ active }: { active: boolean }) {
 
   const effectiveTargetRepos = targetAllRepos ? [] : selectedRepos;
 
-  const yamlPreview = React.useMemo(
-    () =>
-      renderPragentYaml({
-        profile,
-        merge_gate: mergeGate,
-        score_threshold: scoreThreshold,
-        memory_enabled: memoryEnabled,
-        chat_enabled: chatEnabled,
-      }),
+  const yamlInput = React.useMemo<PragentYamlInput>(
+    () => ({
+      profile,
+      merge_gate: mergeGate,
+      score_threshold: scoreThreshold,
+      memory_enabled: memoryEnabled,
+      chat_enabled: chatEnabled,
+    }),
     [profile, mergeGate, scoreThreshold, memoryEnabled, chatEnabled],
   );
 
+  React.useEffect(() => {
+    if (!yamlDialogOpen) return;
+    const repo = yamlRepoTarget.trim();
+    const mine = ++yamlSeqRef.current;
+    if (!isValidRepo(repo) || !githubToken) {
+      setExistingYaml(null);
+      setExistingYamlFor("");
+      setYamlLoading(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setYamlLoading(true);
+      void githubReadRepoFile(githubToken, repo, ".pragent.yaml")
+        .then((content) => {
+          if (mine !== yamlSeqRef.current) return;
+          setExistingYaml(content);
+          setExistingYamlFor(repo);
+        })
+        .catch(() => {
+          if (mine !== yamlSeqRef.current) return;
+          setExistingYaml(null);
+          setExistingYamlFor("");
+        })
+        .finally(() => {
+          if (mine === yamlSeqRef.current) setYamlLoading(false);
+        });
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [yamlDialogOpen, yamlRepoTarget, githubToken]);
+
+  const yamlPreview = React.useMemo(
+    () => mergePragentYaml(existingYamlFor === yamlRepoTarget.trim() ? existingYaml : null, yamlInput),
+    [existingYaml, existingYamlFor, yamlRepoTarget, yamlInput],
+  );
+
   const deployCloudAgent = async () => {
+    if (!targetAllRepos && selectedRepos.length === 0) {
+      const msg = "Select at least one repository or switch Repository scope back to All installed repositories.";
+      setDeployLog(`✗ ${msg}`);
+      toastErr("Repository scope", msg);
+      return;
+    }
     const cleanName = agentName.trim() || "pr-agent-control";
     setDeployLog(`Deploying agent "${cleanName}"…`);
     try {
@@ -515,11 +600,15 @@ export function CloudSetupPage({ active }: { active: boolean }) {
     if (!isValidRepo(repo)) return toastErr("Repository", "Choose or enter a valid owner/repo.");
     if (!githubToken) return toastErr("GitHub token required", "Connect GitHub first so the app can commit .pragent.yaml.");
     try {
+      // Read the latest remote .pragent.yaml so unmanaged sections (path_filters,
+      // pre_merge_checks, labels, tools, weights, path_instructions, etc.) are preserved.
+      const latestRemote = await githubReadRepoFile(githubToken, repo, ".pragent.yaml");
+      const merged = mergePragentYaml(latestRemote, yamlInput);
       const res = await githubCommitRepoFile(
         githubToken,
         repo,
         ".pragent.yaml",
-        yamlPreview,
+        merged,
         "chore: configure PR Agent (.pragent.yaml)",
       );
       toastOk(
@@ -534,6 +623,10 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   };
 
   const bootstrapSelectedMemory = async () => {
+    if (!targetAllRepos && selectedRepos.length === 0) {
+      toastErr("Bootstrap memory", "Select at least one repository or switch Repository scope to All installed repositories.");
+      return;
+    }
     const reposToBootstrap = effectiveTargetRepos.length
       ? effectiveTargetRepos
       : verifyRepo && isValidRepo(verifyRepo)
@@ -563,19 +656,25 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const loadOpenPrsForVerify = async () => {
     const repo = verifyRepo.trim();
     if (!isValidRepo(repo)) return toastErr("Repository", "Enter a valid owner/repo first.");
+    const reqScope = `${currentBackendUrl}::${repo}`;
+    const mine = ++pullsSeqRef.current;
     setVerifyErr("");
     try {
       const list = await listPulls(repo);
+      if (mine !== pullsSeqRef.current || verifyRepoScopeRef.current !== reqScope) return;
       setPulls(list);
+      setPullsScopeKey(reqScope);
       if (list.length > 0) {
         setSelectedPr(String(list[0].number));
         setManualPrNum(String(list[0].number));
         toastOk("Loaded open PRs", `Found ${list.length} open pull request(s) in ${repo}.`);
       } else {
         setSelectedPr("");
+        setManualPrNum("");
         toastOk("No open PRs", `${repo} has no open pull requests right now.`);
       }
     } catch (e) {
+      if (mine !== pullsSeqRef.current || verifyRepoScopeRef.current !== reqScope) return;
       const msg = errText(e, 220);
       setVerifyErr(msg);
       toastErr("Could not load PRs", msg);
@@ -589,31 +688,38 @@ export function CloudSetupPage({ active }: { active: boolean }) {
     if (!Number.isInteger(prNumber) || prNumber <= 0) {
       return toastErr("Verify", "Select an open PR or enter a valid PR number.");
     }
+    const reqTarget = `${currentBackendUrl}::${repo}::${prNumber}`;
+    const mine = ++reviewSeqRef.current;
     setVerifyErr("");
     setReviewRes(null);
     setVerifiedReadiness(null);
+    setReviewResultKey("");
     try {
       const res = await triggerManualReview(repo, prNumber, { force_full: forceFull });
+      if (mine !== reviewSeqRef.current || verifyTargetRef.current !== reqTarget) return;
       setReviewRes(res);
+      setReviewResultKey(reqTarget);
       if (res.readiness) {
         setVerifiedReadiness(res.readiness);
       } else {
         const rd = await getPullReadiness(repo, prNumber).catch(() => null);
+        if (mine !== reviewSeqRef.current || verifyTargetRef.current !== reqTarget) return;
         if (rd?.report) setVerifiedReadiness(rd.report);
       }
       toastOk("Cloud PR review completed", `${repo}#${prNumber} · status=${res.status}`);
     } catch (e) {
+      if (mine !== reviewSeqRef.current || verifyTargetRef.current !== reqTarget) return;
       const msg = errText(e, 280);
       setVerifyErr(msg);
       toastErr("Review failed", msg);
     }
   };
 
-  const activePrObj = pulls.find((p) => String(p.number) === (manualPrNum.trim() || selectedPr));
+  const activePrObj = matchedPulls.find((p) => String(p.number) === activePrNumberStr);
   const prUrl =
     activePrObj?.html_url ||
-    (isValidRepo(verifyRepo) && Number(manualPrNum || selectedPr) > 0
-      ? `https://github.com/${verifyRepo.trim()}/pull/${Number(manualPrNum || selectedPr)}`
+    (isValidRepo(verifyRepo) && Number(activePrNumberStr) > 0
+      ? `https://github.com/${verifyRepo.trim()}/pull/${Number(activePrNumberStr)}`
       : "");
 
   const filteredKnownRepos = React.useMemo(() => {
@@ -743,6 +849,14 @@ export function CloudSetupPage({ active }: { active: boolean }) {
               <AlertTitle>Backend unreachable</AlertTitle>
               <AlertDescription>{diagErr}</AlertDescription>
             </Alert>
+          ) : backendReachable && !redisReady ? (
+            <Alert>
+              <AlertTitle>Redis persistence not configured</AlertTitle>
+              <AlertDescription>
+                Your backend is currently running with in-memory storage only. Connect Redis (<code>REDIS_URL</code>) so
+                agents, PR findings, and repository memory survive restarts.
+              </AlertDescription>
+            </Alert>
           ) : null}
 
           <FieldGrid>
@@ -790,17 +904,20 @@ export function CloudSetupPage({ active }: { active: boolean }) {
                   Save securely on this PC (Windows DPAPI)
                 </Label>
                 <span className="text-muted-foreground text-[11px]">
-                  {isTauri()
+                  {vaultSupported
                     ? vaultKeys.includes("backend_api_token")
                       ? "Encrypted with your Windows user profile — auto-loaded on launch."
                       : "Keep BACKEND_API_TOKEN encrypted on disk so you don't re-paste it on every launch."
-                    : "Available in the Tauri desktop app (web preview keeps tokens in session only)."}
+                    : isTauri()
+                      ? "Encrypted local vault requires Windows DPAPI and is not supported on this OS. Tokens stay in session memory only."
+                      : "Available in the Windows desktop app (Windows DPAPI). Web preview keeps tokens in session only."}
                 </span>
               </div>
             </div>
             <Switch
               id="setup-remember-pc"
-              checked={rememberSecrets}
+              checked={vaultSupported && rememberSecrets}
+              disabled={!vaultSupported}
               onCheckedChange={(v) => void setRememberOnPc(v)}
             />
           </div>
@@ -1489,6 +1606,11 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
                   <Plus /> Add
                 </Button>
               </div>
+              {selectedRepos.length === 0 ? (
+                <Hint className="text-warning text-xs">
+                  Select at least one repository above before deploying, or switch back to All installed repositories.
+                </Hint>
+              ) : null}
             </div>
           ) : null}
 
@@ -1534,11 +1656,7 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
                   id="setup-verify-repo"
                   value={verifyRepo}
                   placeholder="owner/repo"
-                  onChange={(e) => {
-                    setVerifyRepo(e.target.value);
-                    setPulls([]);
-                    setSelectedPr("");
-                  }}
+                  onChange={(e) => setVerifyRepo(e.target.value)}
                   list="setup-known-repos"
                   className="flex-1 font-mono text-xs"
                 />
@@ -1551,9 +1669,9 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
             <Field
               label="Pull request"
               htmlFor="setup-verify-pr"
-              hint={pulls.length ? `${pulls.length} open PR(s) loaded` : "Load open PRs or type a PR number directly."}
+              hint={matchedPulls.length ? `${matchedPulls.length} open PR(s) loaded` : "Load open PRs or type a PR number directly."}
             >
-              {pulls.length > 0 ? (
+              {matchedPulls.length > 0 ? (
                 <Select
                   value={selectedPr}
                   onValueChange={(v) => {
@@ -1565,7 +1683,7 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
                     <SelectValue placeholder="Choose an open PR" />
                   </SelectTrigger>
                   <SelectContent>
-                    {pulls.map((p) => (
+                    {matchedPulls.map((p) => (
                       <SelectItem key={p.number} value={String(p.number)}>
                         #{p.number} — {p.title}
                       </SelectItem>
@@ -1597,30 +1715,30 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
             </Alert>
           ) : null}
 
-          {reviewRes ? (
+          {matchedReviewRes ? (
             <div className="bg-muted/25 grid gap-4 rounded-lg border p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <CheckCircle2 className="text-success size-4" />
                   <span className="text-sm font-semibold">Live Review Result</span>
-                  <Badge variant="success">{reviewRes.status}</Badge>
+                  <Badge variant="success">{matchedReviewRes.status}</Badge>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {reviewRes.review_posted ? <Badge variant="outline">Inline review posted</Badge> : null}
-                  {reviewRes.pr_comment_posted ? <Badge variant="outline">Summary comment posted</Badge> : null}
+                  {matchedReviewRes.review_posted ? <Badge variant="outline">Inline review posted</Badge> : null}
+                  {matchedReviewRes.pr_comment_posted ? <Badge variant="outline">Summary comment posted</Badge> : null}
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-                <KV label="Findings" value={reviewRes.findings_count ?? 0} />
+                <KV label="Findings" value={matchedReviewRes.findings_count ?? 0} />
                 <KV
                   label="Merge Readiness"
                   value={
-                    verifiedReadiness ? (
+                    matchedVerifiedReadiness ? (
                       <span className="flex items-center gap-1.5">
-                        <span>{verifiedReadiness.score}/100</span>
-                        <Badge variant={bandBadgeVariant(verifiedReadiness.band)} className="text-[10px]">
-                          {bandLabel(verifiedReadiness.band)}
+                        <span>{matchedVerifiedReadiness.score}/100</span>
+                        <Badge variant={bandBadgeVariant(matchedVerifiedReadiness.band)} className="text-[10px]">
+                          {bandLabel(matchedVerifiedReadiness.band)}
                         </Badge>
                       </span>
                     ) : (
@@ -1630,24 +1748,28 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
                 />
                 <KV
                   label="Review Effort"
-                  value={reviewRes.walkthrough?.effort ? `${reviewRes.walkthrough.effort} / 5` : reviewRes.run_id?.slice(0, 10) || "—"}
+                  value={
+                    matchedReviewRes.walkthrough?.effort
+                      ? `${matchedReviewRes.walkthrough.effort} / 5`
+                      : matchedReviewRes.run_id?.slice(0, 10) || "—"
+                  }
                 />
               </div>
 
-              {reviewRes.walkthrough?.summary || reviewRes.summary ? (
+              {matchedReviewRes.walkthrough?.summary || matchedReviewRes.summary ? (
                 <div className="grid gap-1.5">
                   <div className="text-xs font-semibold">Walkthrough Summary</div>
                   <p className="text-muted-foreground text-xs leading-relaxed whitespace-pre-wrap">
-                    {reviewRes.walkthrough?.summary || reviewRes.summary}
+                    {matchedReviewRes.walkthrough?.summary || matchedReviewRes.summary}
                   </p>
                 </div>
               ) : null}
 
-              {reviewRes.walkthrough?.file_table?.length ? (
+              {matchedReviewRes.walkthrough?.file_table?.length ? (
                 <div className="grid gap-1.5">
                   <div className="text-xs font-semibold">File Summary</div>
                   <div className="grid gap-1">
-                    {reviewRes.walkthrough.file_table.slice(0, 8).map((row) => (
+                    {matchedReviewRes.walkthrough.file_table.slice(0, 8).map((row) => (
                       <div key={row.file} className="bg-background/60 flex flex-wrap gap-2 rounded border px-2.5 py-1.5 text-xs">
                         <code className="shrink-0">{row.file}</code>
                         <span className="text-muted-foreground min-w-0 flex-1">{row.change_summary}</span>
@@ -1688,7 +1810,16 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
                 className="font-mono text-xs"
               />
             </Field>
-            <Console tall>{yamlPreview}</Console>
+            <div className="grid gap-1">
+              <div className="text-muted-foreground text-xs">
+                {yamlLoading
+                  ? "Loading existing .pragent.yaml to preserve unmanaged sections…"
+                  : existingYaml !== null && existingYamlFor === yamlRepoTarget.trim()
+                    ? "Merged with existing .pragent.yaml — unmanaged sections (path_filters, pre_merge_checks, labels, tools, weights, etc.) are preserved."
+                    : "Preview to commit (.pragent.yaml)"}
+              </div>
+              <Console tall>{yamlPreview}</Console>
+            </div>
           </div>
           <DialogFooter>
             <Button

@@ -556,6 +556,7 @@ defaults.
 | `PORT` / `LOG_LEVEL` | server | `8000` / `INFO` |
 
 Production checklist: set `BACKEND_API_TOKEN` (long random), set `ALLOWED_ORIGINS`
-to your exact origins, set `GITHUB_WEBHOOK_SECRET`, connect the Redis Cloud integration
+to your exact origins, set `GITHUB_WEBHOOK_SECRET` (and `GITHUB_APP_WEBHOOK_SECRET`
+for deployments using a GitHub App), connect the Redis Cloud integration
 (or set `REDIS_URL` / Upstash REST vars), and never commit `.env` (files are git-ignored;
 CI uses Actions secrets instead).

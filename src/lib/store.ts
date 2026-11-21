@@ -193,6 +193,10 @@ interface AppState {
   setRememberSecrets: (v: boolean) => void;
   vaultLoaded: boolean;
   setVaultLoaded: (v: boolean) => void;
+  vaultSupported: boolean;
+  setVaultSupported: (v: boolean) => void;
+  vaultError: string;
+  setVaultError: (e: string) => void;
   vaultKeys: VaultKey[];
   setVaultKeys: (keys: VaultKey[]) => void;
 
@@ -289,6 +293,10 @@ export const useApp = create<AppState>((set, get) => ({
   },
   vaultLoaded: false,
   setVaultLoaded: (vaultLoaded) => set({ vaultLoaded }),
+  vaultSupported: false,
+  setVaultSupported: (vaultSupported) => set({ vaultSupported }),
+  vaultError: "",
+  setVaultError: (vaultError) => set({ vaultError }),
   vaultKeys: [],
   setVaultKeys: (vaultKeys) => set({ vaultKeys }),
 

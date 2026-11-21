@@ -2696,6 +2696,7 @@ const ALLOWED_COMMIT_REPO_FILES: &[&str] = &[
     ".pr-agent/memory.md",
 ];
 const MAX_REPO_FILE_BYTES: usize = 512 * 1024;
+const MAX_READ_REPO_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Validate a repository-relative path for reading via the GitHub Contents API.
 fn validate_read_repo_path(path: &str) -> Result<String, String> {
@@ -2750,8 +2751,60 @@ fn validate_commit_message(path: &str, message: &str) -> Result<String, String> 
     Ok(msg.to_string())
 }
 
-/// Read a UTF-8 file from a repository's default branch via the GitHub Contents API.
-/// Returns `None` on HTTP 404.
+fn read_bounded_utf8<R: std::io::Read>(
+    reader: R,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: failed to read response body: {}", label, e))?;
+    if buf.len() > max_bytes {
+        return Err(format!(
+            "{}: file exceeds maximum allowed size ({} bytes)",
+            label, max_bytes
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| format!("{}: file content was not valid UTF-8", label))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CommitConflictResolution {
+    AlreadyUpToDate { sha: String },
+    RetryUnchangedSha { sha: String },
+    CompetingEdit,
+}
+
+fn resolve_commit_conflict(
+    initial_sha: Option<&str>,
+    fresh_file_json: &serde_json::Value,
+    desired_content: &str,
+    path: &str,
+) -> Result<CommitConflictResolution, String> {
+    if fresh_file_json.get("type").and_then(|t| t.as_str()) != Some("file") {
+        return Err(format!("{}: existing path is not a regular file", path));
+    }
+    let fresh_sha = fresh_file_json
+        .get("sha")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: conflict re-read returned no sha", path))?;
+    if gh_file_text(fresh_file_json).is_ok_and(|current| current == desired_content) {
+        return Ok(CommitConflictResolution::AlreadyUpToDate { sha: fresh_sha });
+    }
+    if initial_sha.is_some_and(|orig| orig == fresh_sha) {
+        return Ok(CommitConflictResolution::RetryUnchangedSha { sha: fresh_sha });
+    }
+    Ok(CommitConflictResolution::CompetingEdit)
+}
+
+/// Read a UTF-8 file from a repository's default branch via the GitHub Contents API
+/// using the raw media type (`application/vnd.github.raw+json`), which supports files
+/// larger than 1 MiB (capped at 2 MiB here). Returns `None` on HTTP 404.
 #[tauri::command]
 async fn github_read_repo_file(
     token: String,
@@ -2781,31 +2834,59 @@ fn github_read_repo_file_blocking(
     let repo_api = format!("https://api.github.com/repos/{}", repo);
     let branch = gh_default_branch(&client, token, &repo_api)?;
     let url = format!("{}/contents/{}", repo_api, rel_path);
-    let (status, body) = gh_request_json(
-        &client,
-        token,
-        reqwest::Method::GET,
-        &url,
-        &[("ref", branch.as_str())],
-        None,
-    )?;
+    let res = client
+        .get(&url)
+        .query(&[("ref", branch.as_str())])
+        .header("Accept", "application/vnd.github.raw+json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|e| format!("GitHub unreachable: {}", e))?;
+    let status = res.status().as_u16();
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_len = res.content_length();
+    let label = format!("read {}", rel_path);
+
     match status {
         404 => Ok(None),
         200 => {
-            let val: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|_| format!("read {}: GitHub response was not JSON", rel_path))?;
-            if val.get("type").and_then(|t| t.as_str()) != Some("file") {
-                return Err(format!("read {}: path is not a regular file", rel_path));
+            if let Some(len) = content_len {
+                if len > MAX_READ_REPO_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "{}: file exceeds maximum allowed size ({} bytes)",
+                        label, MAX_READ_REPO_FILE_BYTES
+                    ));
+                }
             }
-            if val.get("encoding").and_then(|e| e.as_str()) == Some("none")
-                && val.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 0
-            {
-                return Err(format!("read {}: file is too large for GitHub Contents API", rel_path));
+            // GitHub returns pure `application/json` (not `application/vnd.github.raw+json`)
+            // when the requested path is a directory, symlink, or submodule.
+            if content_type.starts_with("application/json") {
+                let body = read_bounded_utf8(res, MAX_READ_REPO_FILE_BYTES, &label)?;
+                let val: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|_| format!("{}: GitHub response was not JSON", label))?;
+                if val.get("type").and_then(|t| t.as_str()) != Some("file") {
+                    return Err(format!("{}: path is not a regular file", label));
+                }
+                if val.get("encoding").and_then(|e| e.as_str()) == Some("none")
+                    && val.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 0
+                {
+                    return Err(format!("{}: file is too large for GitHub Contents API", label));
+                }
+                let text = gh_file_text(&val)?;
+                return Ok(Some(text));
             }
-            let text = gh_file_text(&val)?;
+            let text = read_bounded_utf8(res, MAX_READ_REPO_FILE_BYTES, &label)?;
             Ok(Some(text))
         }
-        _ => Err(format!("read {}: {}", rel_path, gh_error_text(status, &body))),
+        _ => {
+            let err_body = read_bounded_utf8(res, 64 * 1024, &label).unwrap_or_default();
+            Err(format!("{}: {}", label, gh_error_text(status, &err_body)))
+        }
     }
 }
 
@@ -2813,10 +2894,16 @@ fn extract_commit_sha(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
-            v.get("content")
+            v.get("commit")
                 .and_then(|c| c.get("sha"))
                 .and_then(|s| s.as_str())
-                .or_else(|| v.get("commit").and_then(|c| c.get("sha")).and_then(|s| s.as_str()))
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    v.get("content")
+                        .and_then(|c| c.get("sha"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                })
                 .map(str::to_string)
         })
         .unwrap_or_default()
@@ -2927,8 +3014,11 @@ fn github_commit_repo_file_blocking(
             "sha": extract_commit_sha(&put_body),
             "path": allowed_path,
         })),
-        409 => {
-            // Race: re-read the fresh SHA and retry once (or skip if already identical).
+        status if status == 409 || (status == 422 && existing_sha.is_none()) => {
+            // Re-read the remote file to distinguish a benign race from a competing edit:
+            // - 422 without `sha` happens if another writer created the file after our 404 GET.
+            // - 409 happens on a concurrent commit or competing edit to this file.
+            // Never silently overwrite a competing edit with a different SHA/content.
             let (re_status, re_body) = gh_request_json(
                 &client,
                 token,
@@ -2937,6 +3027,13 @@ fn github_commit_repo_file_blocking(
                 &[("ref", branch.as_str())],
                 None,
             )?;
+            if re_status == 404 && status == 422 {
+                return Err(format!(
+                    "commit {}: {}",
+                    allowed_path,
+                    gh_error_text(put_status, &put_body)
+                ));
+            }
             if re_status != 200 {
                 return Err(format!(
                     "{}: conflict and re-read failed: {}",
@@ -2946,38 +3043,44 @@ fn github_commit_repo_file_blocking(
             }
             let fresh_json: serde_json::Value = serde_json::from_str(&re_body)
                 .map_err(|_| format!("{}: conflict re-read was not JSON", allowed_path))?;
-            let fresh_sha = fresh_json
-                .get("sha")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| format!("{}: conflict re-read returned no sha", allowed_path))?;
-            if gh_file_text(&fresh_json).is_ok_and(|current| current == content) {
-                return Ok(serde_json::json!({
+            match resolve_commit_conflict(
+                existing_sha.as_deref(),
+                &fresh_json,
+                &content,
+                allowed_path,
+            )? {
+                CommitConflictResolution::AlreadyUpToDate { sha } => Ok(serde_json::json!({
                     "changed": false,
-                    "sha": fresh_sha,
+                    "sha": sha,
                     "path": allowed_path,
-                }));
-            }
-            let (retry_status, retry_body) = gh_request_json(
-                &client,
-                token,
-                reqwest::Method::PUT,
-                &url,
-                &[],
-                Some(make_payload(Some(&fresh_sha))),
-            )?;
-            if matches!(retry_status, 200 | 201) {
-                Ok(serde_json::json!({
-                    "changed": true,
-                    "sha": extract_commit_sha(&retry_body),
-                    "path": allowed_path,
-                }))
-            } else {
-                Err(format!(
-                    "commit {}: {}",
-                    allowed_path,
-                    gh_error_text(retry_status, &retry_body)
-                ))
+                })),
+                CommitConflictResolution::RetryUnchangedSha { sha } => {
+                    let (retry_status, retry_body) = gh_request_json(
+                        &client,
+                        token,
+                        reqwest::Method::PUT,
+                        &url,
+                        &[],
+                        Some(make_payload(Some(&sha))),
+                    )?;
+                    if matches!(retry_status, 200 | 201) {
+                        Ok(serde_json::json!({
+                            "changed": true,
+                            "sha": extract_commit_sha(&retry_body),
+                            "path": allowed_path,
+                        }))
+                    } else {
+                        Err(format!(
+                            "commit {}: {}",
+                            allowed_path,
+                            gh_error_text(retry_status, &retry_body)
+                        ))
+                    }
+                }
+                CommitConflictResolution::CompetingEdit => Err(format!(
+                    "commit {}: file was modified concurrently on '{}'; reload the latest version before committing again",
+                    allowed_path, branch
+                )),
             }
         }
         _ => Err(format!(
@@ -3162,6 +3265,7 @@ pub fn run() {
             github_pr_command,
             github_read_repo_file,
             github_commit_repo_file,
+            vault::vault_status,
             vault::vault_save_secret,
             vault::vault_load_secrets,
             vault::vault_delete_secret,
@@ -3514,6 +3618,81 @@ mod repo_file_tests {
         assert_eq!(
             validate_commit_message(".pragent.yaml", "   ").unwrap(),
             "chore: update .pragent.yaml (PR Agent Control)"
+        );
+    }
+
+    #[test]
+    fn extract_commit_sha_prefers_commit_sha_over_blob_sha() {
+        let body = r#"{"content":{"sha":"blob_111"},"commit":{"sha":"commit_222"}}"#;
+        assert_eq!(extract_commit_sha(body), "commit_222");
+
+        let fallback = r#"{"content":{"sha":"blob_111"}}"#;
+        assert_eq!(extract_commit_sha(fallback), "blob_111");
+
+        let empty_commit = r#"{"content":{"sha":"blob_111"},"commit":{"sha":""}}"#;
+        assert_eq!(extract_commit_sha(empty_commit), "blob_111");
+
+        assert_eq!(extract_commit_sha("not json"), "");
+    }
+
+    #[test]
+    fn read_bounded_utf8_enforces_size_and_utf8() {
+        let two_mib = "a".repeat(MAX_READ_REPO_FILE_BYTES);
+        assert_eq!(
+            read_bounded_utf8(two_mib.as_bytes(), MAX_READ_REPO_FILE_BYTES, "read test").unwrap().len(),
+            MAX_READ_REPO_FILE_BYTES
+        );
+        let too_big = "a".repeat(MAX_READ_REPO_FILE_BYTES + 1);
+        let err = read_bounded_utf8(too_big.as_bytes(), MAX_READ_REPO_FILE_BYTES, "read test").unwrap_err();
+        assert!(err.contains("exceeds maximum allowed size"), "unexpected err: {}", err);
+
+        let invalid_utf8: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let err = read_bounded_utf8(invalid_utf8, 1024, "read test").unwrap_err();
+        assert!(err.contains("UTF-8"), "unexpected err: {}", err);
+    }
+
+    #[test]
+    fn resolve_commit_conflict_protects_competing_edits() {
+        let same_json = serde_json::json!({
+            "type": "file",
+            "sha": "sha_new",
+            "content": STANDARD.encode("profile: chill\n"),
+        });
+        // Concurrent edit/create with identical content -> safe no-op (covers both 409 and 422).
+        assert_eq!(
+            resolve_commit_conflict(Some("sha_old"), &same_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::AlreadyUpToDate { sha: "sha_new".into() }
+        );
+        assert_eq!(
+            resolve_commit_conflict(None, &same_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::AlreadyUpToDate { sha: "sha_new".into() }
+        );
+
+        let unchanged_sha_json = serde_json::json!({
+            "type": "file",
+            "sha": "sha_old",
+            "content": STANDARD.encode("profile: assertive\n"),
+        });
+        // File blob SHA did not change (e.g. concurrent commit on another file) -> safe to retry once.
+        assert_eq!(
+            resolve_commit_conflict(Some("sha_old"), &unchanged_sha_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::RetryUnchangedSha { sha: "sha_old".into() }
+        );
+
+        let competing_json = serde_json::json!({
+            "type": "file",
+            "sha": "sha_other",
+            "content": STANDARD.encode("profile: assertive\n"),
+        });
+        // Different SHA and different content -> competing edit, refuse to overwrite.
+        assert_eq!(
+            resolve_commit_conflict(Some("sha_old"), &competing_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::CompetingEdit
+        );
+        // File was missing on initial GET (422) and concurrently created with different content -> competing edit.
+        assert_eq!(
+            resolve_commit_conflict(None, &competing_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::CompetingEdit
         );
     }
 }

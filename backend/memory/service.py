@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 
 try:  # Python 3.11+
     import tomllib
@@ -52,7 +53,11 @@ BOOTSTRAP_FILES: tuple[str, ...] = (
     "Cargo.toml",
 )
 
+_MANIFEST_FILES = frozenset({"package.json", "pyproject.toml", "Cargo.toml"})
 _MEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_GLOB_META_RE = re.compile(r"([\[\*\?])")
+_EDITORCONFIG_INT_RANGE_RE = re.compile(r"^([+-]?\d+)\.\.([+-]?\d+)$")
+_MAX_EDITORCONFIG_GLOBS = 20
 _TOKEN_RE = re.compile(r"[a-z0-9_]{3,}")
 _STOPWORDS = frozenset({
     "the", "and", "for", "with", "this", "that", "from", "into", "when", "where",
@@ -124,14 +129,26 @@ def _norm_dedupe_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip()).lower()
 
 
-def _valid_mem_id(mem_id: Any) -> bool:
+def _escape_glob_literal(path: str) -> str:
+    """Escape glob metacharacters so a repo file path matches only itself."""
+    return _GLOB_META_RE.sub(r"[\1]", path)
+
+
+def valid_memory_id(mem_id: Any) -> bool:
+    """Return True when ``mem_id`` is a valid memory entry identifier."""
     return isinstance(mem_id, str) and bool(_MEM_ID_RE.fullmatch(mem_id))
 
 
-def _generate_mem_id(repo: str) -> str:
+_valid_mem_id = valid_memory_id
+
+
+def _generate_mem_id(repo: str, *, existing_ids: set[str] | None = None) -> str:
     for _ in range(8):
         candidate = uuid.uuid4().hex[:10]
-        if store.rget(dm.memory_key(repo, candidate)) is None:
+        if existing_ids is not None:
+            if candidate not in existing_ids:
+                return candidate
+        elif store.rget(dm.memory_key(repo, candidate)) is None:
             return candidate
     return uuid.uuid4().hex[:16]
 
@@ -164,21 +181,86 @@ def _eviction_key(item: dict[str, Any]) -> tuple[Any, ...]:
     return (is_blocking, status_rank, used, last_used, hits, created, str(item.get("id") or ""))
 
 
-def _prune_to_cap(repo: str, *, protect_id: str | None = None) -> int:
-    """Enforce ``MEMORY_MAX_ENTRIES_PER_REPO`` by LRU-pruning oldest unused non-blocking entries."""
+def _prune_entries_to_cap(
+    repo: str,
+    entries: list[dict[str, Any]],
+    *,
+    protect_ids: set[str] | None = None,
+    collect_errors: list[str] | None = None,
+) -> int:
+    """Enforce ``MEMORY_MAX_ENTRIES_PER_REPO`` over ``entries`` in a single pass."""
     cap = max(1, int(dm.MEMORY_MAX_ENTRIES_PER_REPO))
-    entries = _load_all_raw(repo)
     excess = len(entries) - cap
     if excess <= 0:
         return 0
-    candidates = [e for e in entries if e.get("id") != protect_id]
-    candidates.sort(key=_eviction_key)
+    protected = protect_ids or set()
+    unprotected = [e for e in entries if str(e.get("id") or "") not in protected]
+    unprotected.sort(key=_eviction_key)
+    victims = unprotected[:excess]
+    if len(victims) < excess:
+        protected_entries = [e for e in entries if str(e.get("id") or "") in protected]
+        protected_entries.sort(key=_eviction_key)
+        victims.extend(protected_entries[: excess - len(victims)])
     removed = 0
-    for victim in candidates[:excess]:
+    for victim in victims:
         vid = str(victim.get("id") or "")
-        if vid and store.rdelete(dm.memory_key(repo, vid)) > 0:
-            removed += 1
+        if not vid:
+            continue
+        try:
+            if store.rdelete(dm.memory_key(repo, vid)) > 0:
+                removed += 1
+        except Exception as exc:
+            if collect_errors is None:
+                raise
+            log.warning("memory.prune: delete %s/%s failed (%s)", repo, vid, type(exc).__name__)
+            collect_errors.append(f"prune {vid}: {type(exc).__name__}")
     return removed
+
+
+def _prune_to_cap(repo: str, *, protect_id: str | None = None) -> int:
+    """Enforce ``MEMORY_MAX_ENTRIES_PER_REPO`` by LRU-pruning oldest unused non-blocking entries."""
+    entries = _load_all_raw(repo)
+    protect_ids = {protect_id} if protect_id else None
+    return _prune_entries_to_cap(repo, entries, protect_ids=protect_ids)
+
+
+def _prepare_memory_entry(
+    repo: str,
+    entry: dm.MemoryEntry | dict[str, Any],
+    *,
+    existing_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize and validate a memory entry without writing it to storage."""
+    dm.memory_prefix(repo)
+    if isinstance(entry, dm.MemoryEntry):
+        data = entry.model_dump()
+    elif isinstance(entry, dict):
+        data = dict(entry)
+    else:
+        raise TypeError("entry must be a MemoryEntry or dict")
+
+    if isinstance(data.get("text"), str):
+        data["text"] = data["text"].strip()
+    if "scope_globs" in data:
+        data["scope_globs"] = _norm_globs(data["scope_globs"])
+    else:
+        data["scope_globs"] = ["**"]
+
+    supplied_id = str(data.get("id") or "").strip()
+    if supplied_id:
+        if not valid_memory_id(supplied_id):
+            raise ValueError("invalid memory id")
+        mem_id = supplied_id
+    else:
+        mem_id = _generate_mem_id(repo, existing_ids=existing_ids)
+    data["id"] = mem_id
+
+    if not data.get("created_at"):
+        data["created_at"] = _now_iso()
+
+    validated = dm.MemoryEntry.model_validate(data).model_dump()
+    validated["scope_globs"] = _norm_globs(validated["scope_globs"])
+    return validated
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +288,7 @@ def get_memory(repo: str, mem_id: str) -> dict[str, Any] | None:
     """Fetch a single memory entry by id, or ``None`` if absent."""
     # Always validate repo first.
     dm.memory_prefix(repo)
-    if not _valid_mem_id(mem_id):
+    if not valid_memory_id(mem_id):
         return None
     raw = store.rget_json(dm.memory_key(repo, mem_id))
     return raw if isinstance(raw, dict) else None
@@ -214,35 +296,8 @@ def get_memory(repo: str, mem_id: str) -> dict[str, Any] | None:
 
 def add_memory(repo: str, entry: dm.MemoryEntry | dict[str, Any]) -> dict[str, Any]:
     """Create and persist a memory entry, enforcing the per-repo entry cap."""
-    dm.memory_prefix(repo)
-    if isinstance(entry, dm.MemoryEntry):
-        data = entry.model_dump()
-    elif isinstance(entry, dict):
-        data = dict(entry)
-    else:
-        raise TypeError("entry must be a MemoryEntry or dict")
-
-    if isinstance(data.get("text"), str):
-        data["text"] = data["text"].strip()
-    if "scope_globs" in data:
-        data["scope_globs"] = _norm_globs(data["scope_globs"])
-    else:
-        data["scope_globs"] = ["**"]
-
-    supplied_id = str(data.get("id") or "").strip()
-    if supplied_id:
-        if not _valid_mem_id(supplied_id):
-            raise ValueError("invalid memory id")
-        mem_id = supplied_id
-    else:
-        mem_id = _generate_mem_id(repo)
-    data["id"] = mem_id
-
-    if not data.get("created_at"):
-        data["created_at"] = _now_iso()
-
-    validated = dm.MemoryEntry.model_validate(data).model_dump()
-    validated["scope_globs"] = _norm_globs(validated["scope_globs"])
+    validated = _prepare_memory_entry(repo, entry)
+    mem_id = validated["id"]
     store.rset_json(dm.memory_key(repo, mem_id), validated)
     _prune_to_cap(repo, protect_id=mem_id)
     return validated
@@ -250,33 +305,39 @@ def add_memory(repo: str, entry: dm.MemoryEntry | dict[str, Any]) -> dict[str, A
 
 def update_memory(repo: str, mem_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
     """Safely update mutable fields (text, scope_globs, blocking, status, confidence, kind)."""
-    existing = get_memory(repo, mem_id)
-    if existing is None:
+    dm.memory_prefix(repo)
+    if not valid_memory_id(mem_id):
         return None
     if not isinstance(patch, dict):
         raise TypeError("patch must be a dict")
-    merged = dict(existing)
-    for key, value in patch.items():
-        if key not in _UPDATABLE_FIELDS:
-            continue
-        if key == "text" and isinstance(value, str):
-            merged[key] = value.strip()
-        elif key == "scope_globs":
-            merged[key] = _norm_globs(value)
-        else:
-            merged[key] = value
-    validated = dm.MemoryEntry.model_validate(merged).model_dump()
-    validated["scope_globs"] = _norm_globs(validated["scope_globs"])
-    store.rset_json(dm.memory_key(repo, mem_id), validated)
-    return validated
+    key = dm.memory_key(repo, mem_id)
+    with store.key_lock(f"memlock:{repo.lower()}:{mem_id}"):
+        existing = store.rget_json(key)
+        if not isinstance(existing, dict):
+            return None
+        merged = dict(existing)
+        for field_key, value in patch.items():
+            if field_key not in _UPDATABLE_FIELDS:
+                continue
+            if field_key == "text" and isinstance(value, str):
+                merged[field_key] = value.strip()
+            elif field_key == "scope_globs":
+                merged[field_key] = _norm_globs(value)
+            else:
+                merged[field_key] = value
+        validated = dm.MemoryEntry.model_validate(merged).model_dump()
+        validated["scope_globs"] = _norm_globs(validated["scope_globs"])
+        store.rset_json(key, validated)
+        return validated
 
 
 def delete_memory(repo: str, mem_id: str) -> bool:
     """Delete one memory entry. Returns ``True`` if a record was removed."""
     dm.memory_prefix(repo)
-    if not _valid_mem_id(mem_id):
+    if not valid_memory_id(mem_id):
         return False
-    return store.rdelete(dm.memory_key(repo, mem_id)) > 0
+    with store.key_lock(f"memlock:{repo.lower()}:{mem_id}"):
+        return store.rdelete(dm.memory_key(repo, mem_id)) > 0
 
 
 def approve_memory(repo: str, mem_id: str) -> dict[str, Any] | None:
@@ -289,45 +350,78 @@ def export_memories(repo: str) -> list[dict[str, Any]]:
     return list_memories(repo)
 
 
-def import_memories(repo: str, items: list[dict[str, Any]]) -> dict[str, int]:
-    """Import memory entries for ``repo``, skipping duplicates and invalid items."""
+def import_memories(repo: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Import memory entries for ``repo``, skipping duplicates/invalid items and
+    reporting storage/pruning failures separately."""
     dm.memory_prefix(repo)
-    existing = _load_all_raw(repo)
-    seen_ids = {str(e.get("id") or "") for e in existing}
-    seen_sigs = {
-        (
-            str(e.get("kind") or "learning"),
-            _norm_dedupe_text(str(e.get("text") or "")),
-            tuple(sorted(_norm_globs(e.get("scope_globs")))),
-        )
-        for e in existing
-    }
-    imported = 0
-    skipped = 0
-    for raw in items or []:
-        if not isinstance(raw, dict):
-            skipped += 1
-            continue
-        raw_id = str(raw.get("id") or "").strip()
-        if raw_id and raw_id in seen_ids:
-            skipped += 1
-            continue
-        text = str(raw.get("text") or "").strip()
-        kind = str(raw.get("kind") or "learning")
-        globs = _norm_globs(raw.get("scope_globs"))
-        sig = (kind, _norm_dedupe_text(text), tuple(sorted(globs)))
-        if not text or sig in seen_sigs:
-            skipped += 1
-            continue
-        try:
-            created = add_memory(repo, {**raw, "text": text, "scope_globs": globs})
-        except Exception:
-            skipped += 1
-            continue
-        seen_ids.add(created["id"])
-        seen_sigs.add(sig)
-        imported += 1
-    return {"imported": imported, "skipped": skipped}
+    with store.key_lock(f"memrepolock:{repo.lower()}"):
+        existing = _load_all_raw(repo)
+        all_entries = list(existing)
+        seen_ids = {str(e.get("id") or "") for e in existing}
+        seen_sigs = {
+            (
+                str(e.get("kind") or "learning"),
+                _norm_dedupe_text(str(e.get("text") or "")),
+                tuple(sorted(_norm_globs(e.get("scope_globs")))),
+            )
+            for e in existing
+        }
+        imported = 0
+        skipped = 0
+        failed = 0
+        errors: list[str] = []
+        imported_ids: set[str] = set()
+
+        for idx, raw in enumerate(items or []):
+            if not isinstance(raw, dict):
+                skipped += 1
+                continue
+            raw_id = str(raw.get("id") or "").strip()
+            if raw_id and raw_id in seen_ids:
+                skipped += 1
+                continue
+            text = str(raw.get("text") or "").strip()
+            kind = str(raw.get("kind") or "learning")
+            globs = _norm_globs(raw.get("scope_globs"))
+            sig = (kind, _norm_dedupe_text(text), tuple(sorted(globs)))
+            if not text or sig in seen_sigs:
+                skipped += 1
+                continue
+            try:
+                prepared = _prepare_memory_entry(
+                    repo,
+                    {**raw, "text": text, "scope_globs": globs},
+                    existing_ids=seen_ids,
+                )
+            except (ValueError, TypeError, ValidationError):
+                skipped += 1
+                continue
+            try:
+                store.rset_json(dm.memory_key(repo, prepared["id"]), prepared)
+            except Exception as exc:
+                log.warning("memory.import: write %s item %d failed (%s)", repo, idx, type(exc).__name__)
+                failed += 1
+                errors.append(f"item {idx}: {type(exc).__name__}")
+                continue
+            seen_ids.add(prepared["id"])
+            seen_sigs.add(sig)
+            all_entries.append(prepared)
+            imported_ids.add(prepared["id"])
+            imported += 1
+
+        if imported > 0:
+            prune_errors: list[str] = []
+            _prune_entries_to_cap(
+                repo,
+                all_entries,
+                protect_ids=imported_ids,
+                collect_errors=prune_errors,
+            )
+            if prune_errors:
+                failed += len(prune_errors)
+                errors.extend(prune_errors)
+
+    return {"imported": imported, "skipped": skipped, "failed": failed, "errors": errors}
 
 
 def get_repo_profile(repo: str) -> dict[str, Any] | None:
@@ -544,18 +638,40 @@ def retrieve_for_diff(
 
     now_iso = _now_iso()
     used_ids: list[str] = []
-    for bucket in (selected_rules, selected_dismissed):
-        for entry in bucket:
-            entry["hits"] = int(entry.get("hits") or 0) + 1
-            entry["last_used"] = now_iso
-            store.rset_json(dm.memory_key(repo, entry["id"]), entry)
-            used_ids.append(entry["id"])
+    persisted_rules = _record_retrieval_hits(repo, selected_rules, now_iso, used_ids)
+    persisted_dismissed = _record_retrieval_hits(repo, selected_dismissed, now_iso, used_ids)
 
     return {
-        "rules": selected_rules,
-        "dismissed": selected_dismissed,
+        "rules": persisted_rules,
+        "dismissed": persisted_dismissed,
         "used_ids": used_ids,
     }
+
+
+def _record_retrieval_hits(
+    repo: str,
+    entries: list[dict[str, Any]],
+    now_iso: str,
+    used_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Persist ``hits`` + ``last_used`` on the latest active stored records only."""
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        mem_id = str(entry.get("id") or "")
+        if not valid_memory_id(mem_id):
+            continue
+        key = dm.memory_key(repo, mem_id)
+        with store.key_lock(f"memlock:{repo.lower()}:{mem_id}"):
+            latest = store.rget_json(key)
+            if not isinstance(latest, dict) or latest.get("status") != "active":
+                continue
+            updated = dict(latest)
+            updated["hits"] = int(updated.get("hits") or 0) + 1
+            updated["last_used"] = now_iso
+            store.rset_json(key, updated)
+            kept.append(updated)
+            used_ids.append(mem_id)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +698,28 @@ def _read_dismiss_count(counter_key: str) -> int:
             return 0
     if isinstance(raw, int) and not isinstance(raw, bool):
         return max(0, raw)
+    if isinstance(raw, str):
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
     return 0
+
+
+def _increment_dismiss_count(counter_key: str) -> int:
+    """Atomically increment the dismissal counter with TTL.
+
+    Migrates legacy JSON-object counter values (``{"count": N, ...}``) to
+    integer strings before incrementing.
+    """
+    raw = store.rget(counter_key)
+    if raw is not None and raw.lstrip().startswith("{"):
+        with store.key_lock(f"memdismissmig:{counter_key}"):
+            rechecked = store.rget(counter_key)
+            if rechecked is not None and rechecked.lstrip().startswith("{"):
+                legacy_count = _read_dismiss_count(counter_key)
+                store.rset(counter_key, str(legacy_count), ex=_DISMISS_COUNTER_TTL_S)
+    return store.rincr(counter_key, 1, ex=_DISMISS_COUNTER_TTL_S)
 
 
 def record_finding_dismissal(
@@ -594,10 +731,10 @@ def record_finding_dismissal(
     reason: str = "",
     author: str = "",
 ) -> dict[str, Any]:
-    """Mark a finding dismissed in Redis, increment its stem counter (with TTL,
-    idempotent on already-dismissed findings), and create/boost a
-    ``dismissed_pattern`` memory (immediately with an explicit ``reason``, or
-    on the 2nd dismissal of the same stem)."""
+    """Mark a finding dismissed in Redis, atomically increment its stem counter
+    (with TTL, idempotent per finding, retryable after partial failure), and
+    create/boost a ``dismissed_pattern`` memory (immediately with an explicit
+    ``reason``, or on the 2nd dismissal of the same stem)."""
     if not dm.valid_repo(repo):
         raise ValueError("invalid repository name")
     pr_num = int(pr_number)
@@ -607,106 +744,153 @@ def record_finding_dismissal(
     now_iso = _now_iso()
     clean_reason = str(reason or "").strip()
     clean_author = str(author or "").strip()
-    finding_updated = False
-    already_dismissed = False
-    stored_finding: dict[str, Any] = {}
+    has_valid_fp = bool(fingerprint and dm._FINGERPRINT_RE.fullmatch(fingerprint))
 
-    if fingerprint and dm._FINGERPRINT_RE.fullmatch(fingerprint):
-        fkey = dm.finding_key(repo, pr_num, fingerprint)
-        raw = store.rget_json(fkey)
-        if isinstance(raw, dict):
-            already_dismissed = raw.get("state") == "dismissed"
-            stored_finding = dict(raw)
-            stored_finding["state"] = "dismissed"
-            if not already_dismissed or not stored_finding.get("dismissed_at"):
-                stored_finding["dismissed_at"] = now_iso
-            if clean_reason:
-                stored_finding["dismissed_reason"] = clean_reason
-            if clean_author:
-                stored_finding["dismissed_by"] = clean_author
-            store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
-            if not already_dismissed:
-                store.rset(dm.dirty_key(repo, pr_num), now_iso, ex=dm.DIRTY_TTL_S)
-            finding_updated = True
+    claim_cm = (
+        store.key_lock(f"memdismissclaim:{repo.lower()}:{pr_num}:{fingerprint}")
+        if has_valid_fp
+        else contextlib.nullcontext()
+    )
 
-    merged_finding: dict[str, Any] = {**stored_finding, **(finding if isinstance(finding, dict) else {})}
-    category = str(merged_finding.get("category") or "").strip().lower()
-    title = str(merged_finding.get("title") or "").strip()
-    file_path = str(merged_finding.get("file") or merged_finding.get("path") or "").strip()
+    with claim_cm:
+        finding_updated = False
+        already_dismissed = False
+        stored_finding: dict[str, Any] = {}
+        fkey = ""
 
-    title_stem = dm._title_stem(title) if title else ""
-    if category and title_stem:
-        stem = f"{category}:{title_stem}"
-    elif title_stem:
-        stem = title_stem
-    elif category:
-        stem = f"{category}:{fingerprint or dm._title_stem(clean_reason)}"
-    else:
-        stem = str(fingerprint or dm._title_stem(clean_reason) or "unknown")
+        if has_valid_fp:
+            fkey = dm.finding_key(repo, pr_num, fingerprint)
+            raw = store.rget_json(fkey)
+            if isinstance(raw, dict):
+                already_dismissed = raw.get("state") == "dismissed"
+                stored_finding = dict(raw)
+                stored_finding["state"] = "dismissed"
+                if not already_dismissed or not stored_finding.get("dismissed_at"):
+                    stored_finding["dismissed_at"] = now_iso
+                if clean_reason:
+                    stored_finding["dismissed_reason"] = clean_reason
+                if clean_author:
+                    stored_finding["dismissed_by"] = clean_author
+                store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
+                if not already_dismissed:
+                    store.rset(dm.dirty_key(repo, pr_num), now_iso, ex=dm.DIRTY_TTL_S)
+                finding_updated = True
 
-    stem_hash = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:16]
-    counter_key = f"memdismiss:{repo.lower()}:{stem_hash}"
-    cur_count = _read_dismiss_count(counter_key)
-    if already_dismissed:
-        count = cur_count
-    else:
-        count = cur_count + 1
-        store.rset_json(
-            counter_key,
-            {"count": count, "updated_at": now_iso},
-            ex=_DISMISS_COUNTER_TTL_S,
+        merged_finding: dict[str, Any] = {**stored_finding, **(finding if isinstance(finding, dict) else {})}
+        category = str(merged_finding.get("category") or "").strip().lower()
+        title = str(merged_finding.get("title") or "").strip()
+        file_path = str(merged_finding.get("file") or merged_finding.get("path") or "").strip()
+
+        title_stem = dm._title_stem(title) if title else ""
+        if category and title_stem:
+            stem = f"{category}:{title_stem}"
+        elif title_stem:
+            stem = title_stem
+        elif category:
+            stem = f"{category}:{fingerprint or dm._title_stem(clean_reason)}"
+        else:
+            stem = str(fingerprint or dm._title_stem(clean_reason) or "unknown")
+
+        stem_hash = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:16]
+        counter_key = f"memdismiss:{repo.lower()}:{stem_hash}"
+        counted_key = (
+            f"memdismisscounted:{repo.lower()}:{pr_num}:{fingerprint}:{stem_hash}"
+            if has_valid_fp
+            else ""
+        )
+        done_key = (
+            f"memdismissdone:{repo.lower()}:{pr_num}:{fingerprint}:{stem_hash}"
+            if has_valid_fp
+            else ""
         )
 
-    mem_id = f"dp_{stem_hash[:12]}"
-    existing = get_memory(repo, mem_id)
-    pattern_created = False
-    pattern_boosted = False
-    memory_entry: dict[str, Any] | None = existing
+        if has_valid_fp:
+            if stored_finding.get("dismissal_counted"):
+                count = _read_dismiss_count(counter_key)
+            else:
+                claimed = store.rset(counted_key, "1", ex=_DISMISS_COUNTER_TTL_S, nx=True)
+                if claimed:
+                    try:
+                        count = _increment_dismiss_count(counter_key)
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            store.rdelete(counted_key)
+                        raise
+                    if finding_updated:
+                        stored_finding["dismissal_counted"] = True
+                        with contextlib.suppress(Exception):
+                            store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
+                else:
+                    count = _read_dismiss_count(counter_key)
+            already_completed = bool(stored_finding.get("dismissal_completed") or store.rget(done_key))
+            needs_pattern_step = not already_completed
+        else:
+            count = _increment_dismiss_count(counter_key)
+            needs_pattern_step = True
 
-    if existing is not None:
-        new_text = str(existing.get("text") or "")
-        has_new_reason = bool(clean_reason and clean_reason.lower() not in new_text.lower())
-        if not already_dismissed or has_new_reason:
-            new_conf = min(1.0, round(float(existing.get("confidence", 0.7)) + 0.1, 3))
-            if has_new_reason:
-                candidate = f"{new_text}; {clean_reason}"
-                if len(candidate) <= dm.MEMORY_TEXT_MAX:
-                    new_text = candidate
-            merged_globs = _norm_globs(list(existing.get("scope_globs") or []) + _dismissal_scope_globs(file_path))
-            memory_entry = update_memory(
-                repo,
-                mem_id,
-                {"text": new_text, "scope_globs": merged_globs, "confidence": new_conf, "status": "active"},
-            )
-            pattern_boosted = True
-    elif clean_reason or (not already_dismissed and count >= 2):
-        if category and title:
-            base_text = f"Do not flag [{category}]: {title}"
-        elif title:
-            base_text = f"Do not flag: {title}"
-        else:
-            base_text = f"Do not flag finding pattern ({stem})"
-        if clean_reason:
-            full_text = f"{base_text} — Reason: {clean_reason}"
-        else:
-            full_text = f"{base_text} (dismissed {count} times)"
-        full_text = full_text[:dm.MEMORY_TEXT_MAX]
-        conf = 0.8 if clean_reason else min(1.0, round(0.7 + 0.1 * max(0, count - 2), 3))
-        memory_entry = add_memory(
-            repo,
-            {
-                "id": mem_id,
-                "kind": "dismissed_pattern",
-                "text": full_text,
-                "scope_globs": _dismissal_scope_globs(file_path),
-                "source": "dismissal",
-                "author": clean_author[:80] or None,
-                "confidence": conf,
-                "blocking": False,
-                "status": "active",
-            },
-        )
-        pattern_created = True
+        mem_id = f"dp_{stem_hash[:12]}"
+        pattern_created = False
+        pattern_boosted = False
+        memory_entry: dict[str, Any] | None = None
+
+        with store.key_lock(f"memdismisspattern:{repo.lower()}:{stem_hash}"):
+            existing = get_memory(repo, mem_id)
+            memory_entry = existing
+
+            if existing is not None:
+                new_text = str(existing.get("text") or "")
+                has_new_reason = bool(clean_reason and clean_reason.lower() not in new_text.lower())
+                if needs_pattern_step or has_new_reason:
+                    new_conf = min(1.0, round(float(existing.get("confidence", 0.7)) + 0.1, 3))
+                    if has_new_reason:
+                        candidate = f"{new_text}; {clean_reason}"
+                        if len(candidate) <= dm.MEMORY_TEXT_MAX:
+                            new_text = candidate
+                    merged_globs = _norm_globs(
+                        list(existing.get("scope_globs") or []) + _dismissal_scope_globs(file_path)
+                    )
+                    # Preserve existing status (e.g. keep archived patterns archived until explicitly approved).
+                    memory_entry = update_memory(
+                        repo,
+                        mem_id,
+                        {"text": new_text, "scope_globs": merged_globs, "confidence": new_conf},
+                    )
+                    pattern_boosted = True
+            elif clean_reason or (needs_pattern_step and count >= 2):
+                if category and title:
+                    base_text = f"Do not flag [{category}]: {title}"
+                elif title:
+                    base_text = f"Do not flag: {title}"
+                else:
+                    base_text = f"Do not flag finding pattern ({stem})"
+                if clean_reason:
+                    full_text = f"{base_text} — Reason: {clean_reason}"
+                else:
+                    full_text = f"{base_text} (dismissed {count} times)"
+                full_text = full_text[:dm.MEMORY_TEXT_MAX]
+                conf = 0.8 if clean_reason else min(1.0, round(0.7 + 0.1 * max(0, count - 2), 3))
+                memory_entry = add_memory(
+                    repo,
+                    {
+                        "id": mem_id,
+                        "kind": "dismissed_pattern",
+                        "text": full_text,
+                        "scope_globs": _dismissal_scope_globs(file_path),
+                        "source": "dismissal",
+                        "author": clean_author[:80] or None,
+                        "confidence": conf,
+                        "blocking": False,
+                        "status": "active",
+                    },
+                )
+                pattern_created = True
+
+        if has_valid_fp:
+            store.rset(done_key, now_iso, ex=_DISMISS_COUNTER_TTL_S)
+            if finding_updated:
+                stored_finding["dismissal_counted"] = True
+                stored_finding["dismissal_completed"] = True
+                store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
 
     return {
         "repo": repo.lower(),
@@ -928,20 +1112,72 @@ def _parse_cargo_toml(
     _add_unique(lint_cmds, "cargo clippy")
 
 
+def _expand_editorconfig_brace_inner(inner: str) -> list[str] | None:
+    """Expand an EditorConfig ``{...}`` body into literal alternatives.
+
+    Supports comma-separated alternatives and bounded integer ranges
+    (e.g. ``{1..3}``). Returns ``None`` for invalid, reversed, or overly large
+    ranges so callers skip unsupported sections instead of emitting broken globs.
+    """
+    stripped = inner.strip()
+    if not stripped:
+        return None
+    if "," not in stripped and ".." in stripped:
+        m = _EDITORCONFIG_INT_RANGE_RE.fullmatch(stripped)
+        if not m:
+            return None
+        start, end = int(m.group(1)), int(m.group(2))
+        if start > end or (end - start + 1) > _MAX_EDITORCONFIG_GLOBS:
+            return None
+        return [str(n) for n in range(start, end + 1)]
+
+    out: list[str] = []
+    for raw_part in stripped.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if ".." in part:
+            m = _EDITORCONFIG_INT_RANGE_RE.fullmatch(part)
+            if not m:
+                return None
+            start, end = int(m.group(1)), int(m.group(2))
+            if start > end or (len(out) + (end - start + 1)) > _MAX_EDITORCONFIG_GLOBS:
+                return None
+            out.extend(str(n) for n in range(start, end + 1))
+        else:
+            out.append(part)
+    return out or None
+
+
 def _editorconfig_section_to_globs(section: str) -> list[str]:
     s = section.strip()
+    if not s:
+        return []
     if s in ("*", "**"):
         return ["**"]
-    brace = re.match(r"^(.*)\{([^}]+)\}(.*)$", s)
-    if brace:
-        pre, inner, post = brace.groups()
-        parts = [p.strip() for p in inner.split(",") if p.strip()]
-        out: list[str] = []
-        for p in parts:
-            g = f"{pre}{p}{post}"
-            out.append(g if "/" in g else f"**/{g}")
-        return out or ["**"]
-    return [s if "/" in s else f"**/{s}"]
+    expanded = [s]
+    while True:
+        next_expanded: list[str] = []
+        changed = False
+        for pat in expanded:
+            brace = re.search(r"\{([^{}]+)\}", pat)
+            if not brace:
+                next_expanded.append(pat)
+                continue
+            changed = True
+            alts = _expand_editorconfig_brace_inner(brace.group(1))
+            if not alts:
+                return []
+            pre = pat[:brace.start()]
+            post = pat[brace.end():]
+            for alt in alts:
+                next_expanded.append(f"{pre}{alt}{post}")
+                if len(next_expanded) > _MAX_EDITORCONFIG_GLOBS:
+                    return []
+        expanded = next_expanded
+        if not changed:
+            break
+    return [g if "/" in g else f"**/{g}" for g in expanded]
 
 
 def _extract_editorconfig_facts(text: str) -> list[tuple[str, list[str]]]:
@@ -956,6 +1192,8 @@ def _extract_editorconfig_facts(text: str) -> list[tuple[str, list[str]]]:
     def _flush() -> None:
         if cur_section and cur_props:
             globs = _editorconfig_section_to_globs(cur_section)
+            if not globs:
+                return
             fact = f"EditorConfig [{cur_section}]: {', '.join(cur_props)}"
             facts.append((fact, globs))
 
@@ -1005,6 +1243,24 @@ def _extract_doc_facts(filename: str, text: str) -> list[tuple[str, list[str]]]:
     return facts
 
 
+def _bootstrap_fact_origin(entry: dict[str, Any]) -> str | None:
+    """Return the bootstrap source identifier for a bootstrap-owned ``repo_fact``."""
+    if entry.get("source") != "bootstrap" or entry.get("kind") != "repo_fact":
+        return None
+    author = str(entry.get("author") or "").strip()
+    if author.startswith("bootstrap:") and len(author) > len("bootstrap:"):
+        return author.split(":", 1)[1]
+    text = str(entry.get("text") or "").strip()
+    for doc_name in ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"):
+        if text.startswith(f"[{doc_name}] "):
+            return doc_name
+    if text.startswith("EditorConfig ["):
+        return ".editorconfig"
+    if text.startswith("Repository tech stack — ") or text.startswith("Repository commands — "):
+        return "manifests"
+    return None
+
+
 async def bootstrap_repo(
     repo: str,
     github_token: str | None = None,
@@ -1012,7 +1268,14 @@ async def bootstrap_repo(
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Bootstrap repo profile and deduplicated ``repo_fact`` memories from
-    standard repository docs & manifests via the GitHub Contents API."""
+    standard repository docs & manifests via the GitHub Contents API.
+
+    Distinguishes verified file absence (HTTP 404) from fetch failures so a
+    transient GitHub outage never wipes the last valid profile or stale-prunes
+    facts from unreadable sources. For sources that were read (or verified
+    absent), stale bootstrap-owned facts no longer produced by that source are
+    removed while manual memories are preserved.
+    """
     if not dm.valid_repo(repo):
         raise ValueError("invalid repository name")
 
@@ -1029,6 +1292,8 @@ async def bootstrap_repo(
         headers["Authorization"] = f"Bearer {token}"
 
     fetched: dict[str, str] = {}
+    absent: set[str] = set()
+    fetch_errors: dict[str, str] = {}
     client_cm = contextlib.nullcontext(client) if client is not None else httpx.AsyncClient(timeout=20.0)
     async with client_cm as http:
         for path in BOOTSTRAP_FILES:
@@ -1039,22 +1304,33 @@ async def bootstrap_repo(
                 )
             except Exception as exc:
                 log.warning("memory.bootstrap: fetch %s/%s failed (%s)", repo, path, type(exc).__name__)
+                fetch_errors[path] = type(exc).__name__
+                continue
+            if resp.status_code == 404:
+                absent.add(path)
                 continue
             if resp.status_code != 200:
+                log.warning("memory.bootstrap: fetch %s/%s returned HTTP %s", repo, path, resp.status_code)
+                fetch_errors[path] = f"http_{resp.status_code}"
                 continue
             try:
                 decoded = _decode_github_content(resp.json())
-            except Exception:
-                decoded = None
-            if decoded:
-                fetched[path] = decoded
+            except Exception as exc:
+                log.warning("memory.bootstrap: decode %s/%s failed (%s)", repo, path, type(exc).__name__)
+                fetch_errors[path] = "decode_error"
+                continue
+            if decoded is None:
+                fetch_errors[path] = "decode_error"
+                continue
+            fetched[path] = decoded
 
     languages: list[str] = []
     frameworks: list[str] = []
     test_cmds: list[str] = []
     build_cmds: list[str] = []
     lint_cmds: list[str] = []
-    candidate_facts: list[tuple[str, list[str]]] = []
+    # (origin, text, scope_globs)
+    candidate_facts: list[tuple[str, str, list[str]]] = []
 
     if "package.json" in fetched:
         _parse_package_json(fetched["package.json"], languages, frameworks, test_cmds, build_cmds, lint_cmds)
@@ -1063,61 +1339,126 @@ async def bootstrap_repo(
     if "Cargo.toml" in fetched:
         _parse_cargo_toml(fetched["Cargo.toml"], languages, frameworks, test_cmds, build_cmds, lint_cmds)
     if ".editorconfig" in fetched:
-        candidate_facts.extend(_extract_editorconfig_facts(fetched[".editorconfig"]))
+        for fact_text, globs in _extract_editorconfig_facts(fetched[".editorconfig"]):
+            candidate_facts.append((".editorconfig", fact_text, globs))
     for doc_name in ("AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"):
         if doc_name in fetched:
-            candidate_facts.extend(_extract_doc_facts(doc_name, fetched[doc_name]))
+            for fact_text, globs in _extract_doc_facts(doc_name, fetched[doc_name]):
+                candidate_facts.append((doc_name, fact_text, globs))
 
-    profile: dict[str, Any] = {
-        "repo": repo.lower(),
-        "languages": languages,
-        "frameworks": frameworks,
-        "test_commands": test_cmds,
-        "build_commands": build_cmds,
-        "lint_commands": lint_cmds,
-        "files_indexed": sorted(fetched),
-        "bootstrapped_at": _now_iso(),
-    }
-    store.rset_json(dm.repo_profile_key(repo), profile)
+    existing_profile = get_repo_profile(repo)
+    manifest_errors = [p for p in _MANIFEST_FILES if p in fetch_errors]
+    profile_preserved = False
+    profile: dict[str, Any] | None
 
-    if languages or frameworks:
-        stack_parts: list[str] = []
-        if languages:
-            stack_parts.append("Languages: " + ", ".join(languages))
-        if frameworks:
-            stack_parts.append("Frameworks: " + ", ".join(frameworks))
-        candidate_facts.insert(0, ("Repository tech stack — " + "; ".join(stack_parts), ["**"]))
+    if manifest_errors:
+        if existing_profile is not None:
+            profile = existing_profile
+            profile_preserved = True
+        elif any(p in fetched for p in _MANIFEST_FILES):
+            profile = {
+                "repo": repo.lower(),
+                "languages": languages,
+                "frameworks": frameworks,
+                "test_commands": test_cmds,
+                "build_commands": build_cmds,
+                "lint_commands": lint_cmds,
+                "files_indexed": sorted(fetched),
+                "bootstrapped_at": _now_iso(),
+            }
+            store.rset_json(dm.repo_profile_key(repo), profile)
+        else:
+            profile = None
+    else:
+        profile = {
+            "repo": repo.lower(),
+            "languages": languages,
+            "frameworks": frameworks,
+            "test_commands": test_cmds,
+            "build_commands": build_cmds,
+            "lint_commands": lint_cmds,
+            "files_indexed": sorted(fetched),
+            "bootstrapped_at": _now_iso(),
+        }
+        store.rset_json(dm.repo_profile_key(repo), profile)
 
-    if test_cmds or build_cmds or lint_cmds:
-        cmd_parts: list[str] = []
-        if test_cmds:
-            cmd_parts.append("test: " + ", ".join(test_cmds))
-        if build_cmds:
-            cmd_parts.append("build: " + ", ".join(build_cmds))
-        if lint_cmds:
-            cmd_parts.append("lint: " + ", ".join(lint_cmds))
-        candidate_facts.insert(
-            1 if (languages or frameworks) else 0,
-            ("Repository commands — " + "; ".join(cmd_parts), ["**"]),
-        )
+    # Derive manifest summary facts only when manifests are authoritative or no prior profile existed.
+    if not profile_preserved:
+        if languages or frameworks:
+            stack_parts: list[str] = []
+            if languages:
+                stack_parts.append("Languages: " + ", ".join(languages))
+            if frameworks:
+                stack_parts.append("Frameworks: " + ", ".join(frameworks))
+            candidate_facts.insert(0, ("manifests", "Repository tech stack — " + "; ".join(stack_parts), ["**"]))
 
-    existing_texts = {_norm_dedupe_text(str(e.get("text") or "")) for e in _load_all_raw(repo)}
+        if test_cmds or build_cmds or lint_cmds:
+            cmd_parts: list[str] = []
+            if test_cmds:
+                cmd_parts.append("test: " + ", ".join(test_cmds))
+            if build_cmds:
+                cmd_parts.append("build: " + ", ".join(build_cmds))
+            if lint_cmds:
+                cmd_parts.append("lint: " + ", ".join(lint_cmds))
+            candidate_facts.insert(
+                1 if (languages or frameworks) else 0,
+                ("manifests", "Repository commands — " + "; ".join(cmd_parts), ["**"]),
+            )
+
+    # Sources that were read (200) or verified absent (404) are authoritative:
+    # obsolete bootstrap-owned facts from those sources should be removed.
+    authoritative_sources: set[str] = set()
+    for src_file in (".editorconfig", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"):
+        if src_file in fetched or src_file in absent:
+            authoritative_sources.add(src_file)
+    if not manifest_errors:
+        authoritative_sources.add("manifests")
+
+    desired_by_origin: dict[str, set[tuple[str, tuple[str, ...]]]] = {}
+    normalized_candidates: list[tuple[str, str, list[str], str]] = []
+    for origin, raw_text, raw_globs in candidate_facts:
+        bounded_text = raw_text[:dm.MEMORY_TEXT_MAX]
+        norm_text = _norm_dedupe_text(bounded_text)
+        norm_globs = _norm_globs(raw_globs)
+        if not norm_text:
+            continue
+        desired_by_origin.setdefault(origin, set()).add((norm_text, tuple(sorted(norm_globs))))
+        normalized_candidates.append((origin, bounded_text, norm_globs, norm_text))
+
+    existing_entries = _load_all_raw(repo)
+    removed = 0
+    surviving_entries: list[dict[str, Any]] = []
+    for entry in existing_entries:
+        origin = _bootstrap_fact_origin(entry)
+        if origin is not None and origin in authoritative_sources:
+            sig = (
+                _norm_dedupe_text(str(entry.get("text") or "")),
+                tuple(sorted(_norm_globs(entry.get("scope_globs")))),
+            )
+            if sig not in desired_by_origin.get(origin, set()):
+                eid = str(entry.get("id") or "")
+                if eid and delete_memory(repo, eid):
+                    removed += 1
+                    continue
+        surviving_entries.append(entry)
+
+    existing_texts = {_norm_dedupe_text(str(e.get("text") or "")) for e in surviving_entries}
     created: list[dict[str, Any]] = []
     skipped = 0
 
-    for text, globs in candidate_facts:
-        norm = _norm_dedupe_text(text)
-        if not norm or norm in existing_texts:
+    for origin, bounded_text, norm_globs, norm_text in normalized_candidates:
+        if norm_text in existing_texts:
             skipped += 1
             continue
-        existing_texts.add(norm)
+        existing_texts.add(norm_text)
         mem = add_memory(
             repo,
             {
                 "kind": "repo_fact",
-                "text": text[:dm.MEMORY_TEXT_MAX],
-                "scope_globs": globs,
+                "text": bounded_text,
+                "scope_globs": norm_globs,
                 "source": "bootstrap",
+                "author": f"bootstrap:{origin}"[:80],
                 "confidence": 0.85,
                 "blocking": False,
                 "status": "active",
@@ -1125,7 +1466,16 @@ async def bootstrap_repo(
         )
         created.append(mem)
 
-    return {"profile": profile, "created": created, "skipped": skipped}
+    return {
+        "profile": profile,
+        "created": created,
+        "skipped": skipped,
+        "removed": removed,
+        "fetch_errors": fetch_errors,
+        "partial": bool(fetch_errors),
+        "ok": not bool(fetch_errors),
+        "profile_preserved": profile_preserved,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1212,7 +1562,7 @@ def extract_learnings_from_merged_pr(
         user = item.get("user") if isinstance(item.get("user"), dict) else {}
         author = (str(item.get("author") or user.get("login") or item.get("by") or "").strip()[:80]) or None
         path = _norm_path(str(item.get("path") or item.get("file") or ""))
-        scope_globs = [path] if path else ["**"]
+        scope_globs = [_escape_glob_literal(path)] if path else ["**"]
 
         mem = add_memory(
             repo,

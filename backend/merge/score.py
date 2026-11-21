@@ -75,6 +75,15 @@ def _loc(finding: dict[str, Any]) -> str:
     return file_path
 
 
+def effective_score_threshold(score_threshold: int) -> int:
+    """Normalize a configured merge-readiness threshold into ``[0, 100]``.
+
+    Shared by both band calculation (``band_for_score``) and merge-gate
+    publishing so the displayed band and the merge gate never disagree.
+    """
+    return max(0, min(100, int(score_threshold)))
+
+
 def band_for_score(
     score: int,
     *,
@@ -82,9 +91,10 @@ def band_for_score(
     score_threshold: int = 85,
 ) -> dm.ReadinessBand:
     """Map numeric score + blocker state into one of the four readiness bands."""
-    if has_blocker or score < 50:
+    ready_min = effective_score_threshold(score_threshold)
+    blocked_floor = min(50, ready_min)
+    if has_blocker or score < blocked_floor:
         return "blocked"
-    ready_min = max(50, min(100, int(score_threshold)))
     if score >= ready_min:
         return "ready"
     if score >= 70:

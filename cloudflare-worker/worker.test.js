@@ -459,3 +459,25 @@ test("bot review comments and non-completed check_runs are skipped cleanly", asy
     f.restore();
   }
 });
+
+test("installation events require GITHUB_APP_WEBHOOK_SECRET and reject repo-secret signatures", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    const instBody = JSON.stringify({ action: "created", installation: { id: 99 }, repositories: [{ full_name: "victim/repo" }] });
+    const repoSig = await sign(instBody, SECRET);
+    const appSecret = "app-secret-only";
+    const dualEnv = { ...baseEnv, GITHUB_APP_WEBHOOK_SECRET: appSecret };
+    // Signed with repo secret -> rejected even when app secret is configured
+    assert.equal((await post(instBody, { event: "installation", signature: repoSig, env: dualEnv })).status, 401);
+    assert.equal((await post(instBody, { event: "installation_repositories", signature: repoSig, env: dualEnv })).status, 401);
+    // Signed with repo secret when app secret is absent -> rejected
+    assert.equal((await post(instBody, { event: "installation", signature: repoSig, env: baseEnv })).status, 401);
+    assert.equal(f.calls.length, 0);
+    // Signed with app secret -> accepted
+    const appSig = await sign(instBody, appSecret);
+    assert.equal((await post(instBody, { event: "installation", signature: appSig, env: dualEnv })).status, 202);
+    assert.equal(f.calls.length, 1);
+  } finally {
+    f.restore();
+  }
+});

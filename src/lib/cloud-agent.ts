@@ -376,7 +376,18 @@ export interface PragentYamlInput {
   path_instructions?: PathInstruction[];
 }
 
-export function renderPragentYaml(cfg: PragentYamlInput): string {
+function renderPathInstructionsLines(rules: PathInstruction[]): string[] {
+  const cleaned = rules.filter((r) => r.path.trim() && r.instructions.trim());
+  if (cleaned.length === 0) return ["path_instructions: []"];
+  const out = ["path_instructions:"];
+  for (const r of cleaned) {
+    out.push(`  - path: ${yamlString(r.path.trim())}`);
+    out.push(`    instructions: ${yamlString(r.instructions.trim())}`);
+  }
+  return out;
+}
+
+function renderFreshPragentYaml(cfg: PragentYamlInput): string {
   const lines: string[] = [
     "# PR Agent repository configuration (.pragent.yaml)",
     "# Loaded from the PR base branch by the PR Agent cloud backend.",
@@ -390,20 +401,272 @@ export function renderPragentYaml(cfg: PragentYamlInput): string {
     `  enabled: ${cfg.chat_enabled ? "true" : "false"}`,
     "auto_review:",
     `  drafts: ${cfg.drafts ? "true" : "false"}`,
+    ...renderPathInstructionsLines(cfg.path_instructions || []),
+    "",
   ];
-
-  const rules = (cfg.path_instructions || []).filter((r) => r.path.trim() && r.instructions.trim());
-  if (rules.length > 0) {
-    lines.push("path_instructions:");
-    for (const r of rules) {
-      lines.push(`  - path: ${yamlString(r.path.trim())}`);
-      lines.push(`    instructions: ${yamlString(r.instructions.trim())}`);
-    }
-  } else {
-    lines.push("path_instructions: []");
-  }
-  lines.push("");
   return lines.join("\n");
+}
+
+function parseSimpleFlowMapping(inline: string): [string, string][] | null {
+  const trimmed = inline.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
+  const inner = trimmed.slice(1, -1).trim();
+  if (!inner) return [];
+  const entries: [string, string][] = [];
+  let cur = "";
+  let quote: string | null = null;
+  let depth = 0;
+  const parts: string[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (quote) {
+      cur += ch;
+      if (ch === "\\" && quote === '"' && i + 1 < inner.length) {
+        cur += inner[++i];
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === "{" || ch === "[") {
+      depth++;
+      cur += ch;
+    } else if (ch === "}" || ch === "]") {
+      depth--;
+      cur += ch;
+    } else if (ch === "," && depth === 0) {
+      parts.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim()) parts.push(cur);
+  for (const part of parts) {
+    const colon = part.indexOf(":");
+    if (colon <= 0) return null;
+    const k = part.slice(0, colon).trim();
+    const v = part.slice(colon + 1).trim();
+    if (!/^[A-Za-z0-9_-]+$/.test(k)) return null;
+    entries.push([k, v]);
+  }
+  return entries;
+}
+
+function mergeMappingBlock(
+  blockLines: string[],
+  keyName: string,
+  updates: Record<string, string>,
+): string[] {
+  const header = blockLines[0] || `${keyName}:`;
+  const colonIdx = header.indexOf(":");
+  const inlineRest = colonIdx >= 0 ? header.slice(colonIdx + 1).trim() : "";
+
+  // Convert simple flow mappings like `memory: { enabled: false, max_items: 25 }` to block form
+  // while preserving all unmanaged keys.
+  let bodyLines = blockLines.slice(1);
+  if (inlineRest && !inlineRest.startsWith("#")) {
+    const flow = parseSimpleFlowMapping(inlineRest);
+    if (flow !== null) {
+      bodyLines = flow.map(([k, v]) => `  ${k}: ${v}`);
+    } else {
+      // Non-mapping scalar value (e.g. `memory: null`): replace with clean block mapping.
+      bodyLines = [];
+    }
+  }
+
+  let childIndent = "  ";
+  for (const line of bodyLines) {
+    const m = /^(\s+)[A-Za-z0-9_-]+\s*:/.exec(line);
+    if (m) {
+      childIndent = m[1];
+      break;
+    }
+  }
+
+  const remaining = new Map(Object.entries(updates));
+  const mergedBody: string[] = [];
+  let i = 0;
+  while (i < bodyLines.length) {
+    const line = bodyLines[i];
+    if (line.startsWith(childIndent)) {
+      const rest = line.slice(childIndent.length);
+      const m = /^([A-Za-z0-9_-]+)\s*:/.exec(rest);
+      if (m && remaining.has(m[1])) {
+        const subKey = m[1];
+        const nextVal = remaining.get(subKey)!;
+        remaining.delete(subKey);
+        mergedBody.push(`${childIndent}${subKey}: ${nextVal}`);
+        i++;
+        // Skip any indented continuation lines of the replaced scalar subkey.
+        while (i < bodyLines.length) {
+          const next = bodyLines[i];
+          if (next.trim() === "") break;
+          const nextIndent = /^(\s*)/.exec(next)?.[1].length ?? 0;
+          if (nextIndent > childIndent.length) {
+            i++;
+          } else {
+            break;
+          }
+        }
+        continue;
+      }
+    }
+    mergedBody.push(line);
+    i++;
+  }
+
+  for (const [subKey, val] of remaining.entries()) {
+    mergedBody.push(`${childIndent}${subKey}: ${val}`);
+  }
+
+  const headerComment = inlineRest.startsWith("#") ? ` ${inlineRest}` : "";
+  return [`${keyName}:${headerComment}`, ...mergedBody];
+}
+
+/**
+ * Merge desktop-managed settings into an existing `.pragent.yaml` while preserving
+ * all unmanaged top-level sections (`path_filters`, `pre_merge_checks`, `labels`,
+ * `tools`, `weights`, custom keys, comments) and unmanaged nested keys.
+ */
+export function mergePragentYaml(existingYaml: string | null | undefined, cfg: PragentYamlInput): string {
+  if (!existingYaml || !existingYaml.trim()) {
+    return renderFreshPragentYaml(cfg);
+  }
+
+  const rawLines = existingYaml.replace(/\r\n/g, "\n").split("\n");
+  while (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
+    rawLines.pop();
+  }
+
+  // Locate top-level key blocks (column 0 `key: ...`).
+  interface BlockSpan {
+    key: string;
+    start: number;
+    end: number; // exclusive, excluding trailing blank/comment lines before next key
+  }
+  const spans: BlockSpan[] = [];
+  const docEndIdx = rawLines.findIndex((l) => l === "...");
+  const scanLimit = docEndIdx >= 0 ? docEndIdx : rawLines.length;
+
+  const keyStarts: { key: string; idx: number }[] = [];
+  for (let i = 0; i < scanLimit; i++) {
+    const line = rawLines[i];
+    if (line === "---" || line.startsWith("#") || line.trim() === "" || /^\s/.test(line)) {
+      continue;
+    }
+    const m = /^([A-Za-z0-9_-]+)\s*:/.exec(line);
+    if (m) {
+      keyStarts.push({ key: m[1], idx: i });
+    }
+  }
+
+  for (let k = 0; k < keyStarts.length; k++) {
+    const start = keyStarts[k].idx;
+    const nextBoundary = k + 1 < keyStarts.length ? keyStarts[k + 1].idx : scanLimit;
+    let end = nextBoundary;
+    while (end > start + 1 && (rawLines[end - 1].trim() === "" || rawLines[end - 1].startsWith("#"))) {
+      end--;
+    }
+    spans.push({ key: keyStarts[k].key, start, end });
+  }
+
+  const clampedThreshold = Math.max(0, Math.min(100, Math.round(cfg.score_threshold)));
+  const memoryUpdates: Record<string, string> = {
+    enabled: cfg.memory_enabled ? "true" : "false",
+    ...(cfg.memory_auto_approve !== undefined
+      ? { auto_approve: cfg.memory_auto_approve ? "true" : "false" }
+      : {}),
+  };
+  const chatUpdates: Record<string, string> = {
+    enabled: cfg.chat_enabled ? "true" : "false",
+  };
+  const autoReviewUpdates: Record<string, string> | null =
+    cfg.drafts !== undefined ? { drafts: cfg.drafts ? "true" : "false" } : null;
+
+  const handled = new Set<string>();
+  const out: string[] = [];
+  let cursor = 0;
+
+  for (const span of spans) {
+    if (span.start > cursor) {
+      out.push(...rawLines.slice(cursor, span.start));
+    }
+    const block = rawLines.slice(span.start, span.end);
+    switch (span.key) {
+      case "profile":
+        out.push(`profile: ${cfg.profile}`);
+        handled.add("profile");
+        break;
+      case "merge_gate":
+        out.push(`merge_gate: ${cfg.merge_gate}`);
+        handled.add("merge_gate");
+        break;
+      case "score_threshold":
+        out.push(`score_threshold: ${clampedThreshold}`);
+        handled.add("score_threshold");
+        break;
+      case "memory":
+        out.push(...mergeMappingBlock(block, "memory", memoryUpdates));
+        handled.add("memory");
+        break;
+      case "chat":
+        out.push(...mergeMappingBlock(block, "chat", chatUpdates));
+        handled.add("chat");
+        break;
+      case "auto_review":
+        if (autoReviewUpdates) {
+          out.push(...mergeMappingBlock(block, "auto_review", autoReviewUpdates));
+        } else {
+          out.push(...block);
+        }
+        handled.add("auto_review");
+        break;
+      case "path_instructions":
+        if (cfg.path_instructions !== undefined) {
+          out.push(...renderPathInstructionsLines(cfg.path_instructions));
+        } else {
+          out.push(...block);
+        }
+        handled.add("path_instructions");
+        break;
+      default:
+        // Preserve path_filters, pre_merge_checks, labels, tools, weights, and any custom keys verbatim.
+        out.push(...block);
+        break;
+    }
+    cursor = span.end;
+  }
+
+  if (cursor < scanLimit) {
+    out.push(...rawLines.slice(cursor, scanLimit));
+  }
+
+  // Append any managed keys that did not already exist in the file.
+  if (!handled.has("profile")) out.push(`profile: ${cfg.profile}`);
+  if (!handled.has("merge_gate")) out.push(`merge_gate: ${cfg.merge_gate}`);
+  if (!handled.has("score_threshold")) out.push(`score_threshold: ${clampedThreshold}`);
+  if (!handled.has("memory")) out.push(...mergeMappingBlock(["memory:"], "memory", memoryUpdates));
+  if (!handled.has("chat")) out.push(...mergeMappingBlock(["chat:"], "chat", chatUpdates));
+  if (autoReviewUpdates && !handled.has("auto_review")) {
+    out.push(...mergeMappingBlock(["auto_review:"], "auto_review", autoReviewUpdates));
+  }
+  if (cfg.path_instructions !== undefined && !handled.has("path_instructions")) {
+    out.push(...renderPathInstructionsLines(cfg.path_instructions));
+  }
+
+  if (docEndIdx >= 0) {
+    out.push(...rawLines.slice(docEndIdx));
+  }
+
+  return out.join("\n") + "\n";
+}
+
+export function renderPragentYaml(cfg: PragentYamlInput, existingYaml?: string | null): string {
+  return mergePragentYaml(existingYaml, cfg);
 }
 
 /* ------------------------------------------------------------------ */

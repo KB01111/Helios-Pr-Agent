@@ -31,7 +31,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { apiGet, apiMut, backendUrl } from "@/lib/api";
 import { refreshAgents } from "@/lib/actions";
-import { copyToClipboard, getRepoConfig, isValidRepo, renderPragentYaml } from "@/lib/cloud-agent";
+import { copyToClipboard, getRepoConfig, isValidRepo, mergePragentYaml, type PragentYamlInput } from "@/lib/cloud-agent";
 import {
   useApp,
   type AutofixMode,
@@ -118,7 +118,10 @@ export function AgentsPage({ active }: { active: boolean }) {
   const [yamlOpen, setYamlOpen] = React.useState(false);
   const [yamlRepo, setYamlRepo] = React.useState("");
   const [existingRepoYaml, setExistingRepoYaml] = React.useState<string | null>(null);
+  const [existingRepoYamlFor, setExistingRepoYamlFor] = React.useState<string>("");
   const [existingSource, setExistingSource] = React.useState<string>("");
+  const [yamlLoading, setYamlLoading] = React.useState(false);
+  const yamlSeqRef = React.useRef(0);
 
   // Selecting/saving/deleting is serialized: the selected id only changes together with its form.
   const [busy, setBusy] = React.useState(false);
@@ -319,43 +322,114 @@ export function AgentsPage({ active }: { active: boolean }) {
     patch({ pathInstructions: form.pathInstructions.filter((_, i) => i !== idx) });
   };
 
-  const yamlPreview = React.useMemo(
-    () =>
-      renderPragentYaml({
-        profile: form.profile,
-        merge_gate: form.mergeGate,
-        score_threshold: form.scoreThreshold,
-        memory_enabled: form.memoryEnabled,
-        chat_enabled: form.chatEnabled,
-        path_instructions: form.pathInstructions,
-      }),
+  const yamlInput = React.useMemo<PragentYamlInput>(
+    () => ({
+      profile: form.profile,
+      merge_gate: form.mergeGate,
+      score_threshold: form.scoreThreshold,
+      memory_enabled: form.memoryEnabled,
+      chat_enabled: form.chatEnabled,
+      path_instructions: form.pathInstructions,
+    }),
     [form.profile, form.mergeGate, form.scoreThreshold, form.memoryEnabled, form.chatEnabled, form.pathInstructions],
   );
 
+  const matchedExistingYaml =
+    existingRepoYaml !== null &&
+    existingRepoYamlFor === yamlRepo.trim() &&
+    existingSource.startsWith("Read directly")
+      ? existingRepoYaml
+      : null;
+
+  const yamlPreview = React.useMemo(
+    () => mergePragentYaml(matchedExistingYaml, yamlInput),
+    [matchedExistingYaml, yamlInput],
+  );
+
+  const loadExistingRepoYaml = React.useCallback(
+    async (targetRepo: string, showToastOnError = false) => {
+      const repo = targetRepo.trim();
+      const mine = ++yamlSeqRef.current;
+      if (!isValidRepo(repo) || !github) {
+        setExistingRepoYaml(null);
+        setExistingRepoYamlFor("");
+        setExistingSource("");
+        setYamlLoading(false);
+        return;
+      }
+      setYamlLoading(true);
+      try {
+        const content = await githubReadRepoFile(github, repo, ".pragent.yaml");
+        if (mine !== yamlSeqRef.current) return;
+        setExistingRepoYaml(content);
+        setExistingRepoYamlFor(repo);
+        setExistingSource(
+          content !== null
+            ? "Read directly from default branch (.pragent.yaml) — unmanaged sections preserved on commit"
+            : "No existing .pragent.yaml on default branch — will create a new file",
+        );
+      } catch (e) {
+        if (mine !== yamlSeqRef.current) return;
+        setExistingRepoYaml(null);
+        setExistingRepoYamlFor("");
+        setExistingSource("");
+        if (showToastOnError) toastErr("Could not read repo config", errText(e, 220));
+      } finally {
+        if (mine === yamlSeqRef.current) setYamlLoading(false);
+      }
+    },
+    [github],
+  );
+
   const openYamlDialog = () => {
-    setYamlRepo((prev) => prev || picked[0] || allRepos[0] || "");
+    const target = yamlRepo || picked[0] || allRepos[0] || "";
+    setYamlRepo(target);
     setExistingRepoYaml(null);
+    setExistingRepoYamlFor("");
     setExistingSource("");
     setYamlOpen(true);
+    if (isValidRepo(target) && github) {
+      void loadExistingRepoYaml(target, false);
+    }
   };
+
+  React.useEffect(() => {
+    if (!yamlOpen) return;
+    const clean = yamlRepo.trim();
+    if (!isValidRepo(clean) || !github) {
+      yamlSeqRef.current++;
+      setExistingRepoYaml(null);
+      setExistingRepoYamlFor("");
+      setExistingSource("");
+      setYamlLoading(false);
+      return;
+    }
+    const timer = setTimeout(() => void loadExistingRepoYaml(clean, false), 250);
+    return () => clearTimeout(timer);
+  }, [yamlOpen, yamlRepo, github, loadExistingRepoYaml]);
 
   const inspectExistingYaml = async () => {
     const repo = yamlRepo.trim();
     if (!isValidRepo(repo)) return toastErr("Repository", "Enter a valid owner/repo first.");
+    const mine = ++yamlSeqRef.current;
     try {
       if (github) {
         const content = await githubReadRepoFile(github, repo, ".pragent.yaml");
+        if (mine !== yamlSeqRef.current) return;
         if (content !== null) {
           setExistingRepoYaml(content);
-          setExistingSource("Read directly from default branch (.pragent.yaml)");
+          setExistingRepoYamlFor(repo);
+          setExistingSource("Read directly from default branch (.pragent.yaml) — unmanaged sections preserved on commit");
           return;
         }
       }
       const res = await getRepoConfig(repo);
+      if (mine !== yamlSeqRef.current) return;
       setExistingRepoYaml(JSON.stringify(res.config, null, 2));
+      setExistingRepoYamlFor(repo);
       setExistingSource(`Backend effective config (source: ${res.source})`);
     } catch (e) {
-      toastErr("Could not read repo config", errText(e, 220));
+      if (mine === yamlSeqRef.current) toastErr("Could not read repo config", errText(e, 220));
     }
   };
 
@@ -364,11 +438,15 @@ export function AgentsPage({ active }: { active: boolean }) {
     if (!isValidRepo(repo)) return toastErr("Repository", "Enter a valid owner/repo first.");
     if (!github) return toastErr("GitHub token required", "Connect GitHub first to commit .pragent.yaml.");
     try {
+      // Always merge against the latest remote .pragent.yaml so path_filters,
+      // pre_merge_checks, labels, tools, weights, and custom sections are preserved.
+      const latestRemote = await githubReadRepoFile(github, repo, ".pragent.yaml");
+      const merged = mergePragentYaml(latestRemote, yamlInput);
       const res = await githubCommitRepoFile(
         github,
         repo,
         ".pragent.yaml",
-        yamlPreview,
+        merged,
         "chore: configure PR Agent (.pragent.yaml)",
       );
       toastOk(
@@ -758,7 +836,9 @@ export function AgentsPage({ active }: { active: boolean }) {
               </div>
             </Field>
             <div className="grid gap-1.5">
-              <div className="text-xs font-medium">Preview to commit (.pragent.yaml)</div>
+              <div className="text-xs font-medium">
+                Preview to commit (.pragent.yaml){yamlLoading ? " — loading existing file…" : ""}
+              </div>
               <Console tall>{yamlPreview}</Console>
             </div>
             {existingRepoYaml !== null ? (

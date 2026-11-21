@@ -11,7 +11,7 @@ from sandboxes import providers_review as pr
 KEY_ENVS = (
     "LLM_PROVIDER", "LLM_MODEL", "OPENROUTER_API_KEY", "COMMANDCODE_API_KEY",
     "CMD_API_KEY", "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "GITHUB_TOKEN",
-    "BACKEND_API_TOKEN",
+    "BACKEND_API_TOKEN", "REVIEW_ENGINE_MODE",
 )
 FAKE_KEY = "test-key-1234567890"
 DIFF = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -0,0 +1 @@\n+print(1)\n"
@@ -405,7 +405,18 @@ def test_review_falls_back_to_pr_files_on_406_large_diff(monkeypatch):
         async def post(self, url, headers=None, json=None):
             calls.append(("POST", url, json))
             if url.endswith("/chat/completions"):
-                return _Resp(200, data={"choices": [{"message": {"content": "Reviewed files"}}]})
+                return _Resp(
+                    200,
+                    data={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"summary":"Reviewed files","effort":1,"file_table":[],"sequence_diagram":null,"findings":[]}'
+                                }
+                            }
+                        ]
+                    },
+                )
             return _Resp(201, data={})
 
     import httpx

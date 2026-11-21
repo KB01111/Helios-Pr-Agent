@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -100,13 +103,23 @@ def _int(obj: Any, *path: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def mark_dirty(repo: str, pr_number: int) -> str | None:
+    """Stamp `prdirty:{repo}:{pr}` with a unique token so compare-and-delete
+    after recomputation never clears a newer invalidation."""
+    if not dm.valid_repo(repo) or pr_number <= 0:
+        return None
+    token = f"{_now()}:{uuid.uuid4().hex[:8]}"
+    store.rset(dm.dirty_key(repo, pr_number), token, ex=dm.DIRTY_TTL_S)
+    return token
+
+
 def record_pr_activity(repo: str, pr_number: int, entry: dict[str, Any], *, dirty: bool = True) -> None:
     if not dm.valid_repo(repo) or pr_number <= 0:
         return
     entry = {"at": _now(), **entry}
     store.rlpush_json_capped(dm.activity_key(repo, pr_number), entry, dm.ACTIVITY_CAP, ex=dm.ACTIVITY_TTL_S)
     if dirty:
-        store.rset(dm.dirty_key(repo, pr_number), entry["at"], ex=dm.DIRTY_TTL_S)
+        mark_dirty(repo, pr_number)
 
 
 def pr_activity(repo: str, pr_number: int, limit: int = 50) -> list[dict[str, Any]]:
@@ -336,8 +349,55 @@ async def _pull_request_review_comment(ctx: EventContext) -> dict[str, Any]:
     return {"recorded": 1, "prs": [number], "mentions_agent": entry["mentions_agent"]}
 
 
+_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+_GITHUB_API = "https://api.github.com"
+
+
+async def _actor_has_write_permission(repo: str, actor: str) -> bool:
+    """Verify ``actor`` holds write/maintain/admin permission on ``repo`` via GitHub API.
+
+    Fails closed when no GitHub token is configured, the actor is empty/bot,
+    or the permission lookup fails.
+    """
+    clean_actor = str(actor or "").strip()
+    if not clean_actor or clean_actor.lower().endswith("[bot]") or not dm.valid_repo(repo):
+        return False
+    try:
+        token, _ = await github_app.token_for_repo(repo)
+    except Exception:
+        return False
+    if not token:
+        return False
+    try:
+        import httpx
+
+        url = f"{_GITHUB_API}/repos/{repo}/collaborators/{urllib.parse.quote(clean_actor, safe='')}/permission"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+        perm = str(data.get("permission") or "").strip().lower() if isinstance(data, dict) else ""
+        return perm in _WRITE_PERMISSIONS
+    except Exception as exc:
+        log.warning("events: collaborator permission check failed for %s on %s (%s)", clean_actor, repo, type(exc).__name__)
+        return False
+
+
 def _sync_thread_finding_state(repo: str, pr_number: int, comment_id: int, action: str, actor: str) -> dict[str, Any] | None:
-    """Keep stored finding lifecycle in sync when a PR review thread is resolved/unresolved."""
+    """Keep stored finding lifecycle in sync when a PR review thread is resolved/unresolved.
+
+    Only transitions ``open -> resolved`` on resolve and ``resolved -> open`` on
+    unresolve using an atomic expected-state check so ``outdated`` and
+    ``dismissed`` findings stay out of the active lifecycle.
+    """
     if comment_id <= 0 or action not in ("resolved", "unresolved"):
         return None
     try:
@@ -351,12 +411,15 @@ def _sync_thread_finding_state(repo: str, pr_number: int, comment_id: int, actio
         fp = str(found.get("fingerprint") or "").strip()
         if not fp:
             return None
-        cur_state = str(found.get("state") or "open").lower()
-        if action == "resolved" and cur_state != "dismissed":
-            updated = set_finding_state(repo, pr_number, fp, "resolved", by=actor or None)
+        if action == "resolved":
+            updated = set_finding_state(
+                repo, pr_number, fp, "resolved", by=actor or None, expected_states=("open",)
+            )
             return {"fingerprint": fp, "state": "resolved"} if updated else None
-        if action == "unresolved" and cur_state == "resolved":
-            updated = set_finding_state(repo, pr_number, fp, "open", by=actor or None)
+        if action == "unresolved":
+            updated = set_finding_state(
+                repo, pr_number, fp, "open", by=actor or None, expected_states=("resolved",)
+            )
             return {"fingerprint": fp, "state": "open"} if updated else None
     except Exception as exc:
         log.warning("events: thread finding sync failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
@@ -382,10 +445,21 @@ async def _pull_request_review_thread(ctx: EventContext) -> dict[str, Any]:
         "first_comment_id": first_comment_id,
         "by": actor,
     }
-    await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry)
-    finding_updated = await asyncio.to_thread(
-        _sync_thread_finding_state, ctx.repo, number, first_comment_id, ctx.action, actor
-    )
+    # Record activity first without marking dirty yet so a concurrent dirty sweep
+    # cannot read pre-update finding state and clear the only dirty marker.
+    await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=False)
+    finding_updated: dict[str, Any] | None = None
+    if ctx.action == "resolved":
+        if not ctx.sender_is_bot and await _actor_has_write_permission(ctx.repo, actor):
+            finding_updated = await asyncio.to_thread(
+                _sync_thread_finding_state, ctx.repo, number, first_comment_id, ctx.action, actor
+            )
+    elif ctx.action == "unresolved":
+        finding_updated = await asyncio.to_thread(
+            _sync_thread_finding_state, ctx.repo, number, first_comment_id, ctx.action, actor
+        )
+    # Mark dirty AFTER the finding update completes so subsequent recomputes observe it.
+    await asyncio.to_thread(mark_dirty, ctx.repo, number)
     out: dict[str, Any] = {"recorded": 1, "prs": [number]}
     if finding_updated:
         out["finding_updated"] = finding_updated
@@ -398,11 +472,23 @@ def _check_prs(obj: dict[str, Any]) -> list[int]:
 
 
 def _is_own_check(obj: dict[str, Any]) -> bool:
-    """Our own merge-readiness check must not mark the PR dirty again (loop)."""
-    if _str(obj, "name") == OWN_CHECK_RUN_NAME:
-        return True
+    """Our own merge-readiness check must not mark the PR dirty again (loop).
+
+    When our GitHub App identity (slug or id) is known, require the check's
+    publishing app to match so an external app reusing OWN_CHECK_RUN_NAME is
+    never dropped.
+    """
     slug = github_app.app_slug()
-    return bool(slug) and _str(obj, "app", "slug") == slug
+    app_id = (os.getenv("GITHUB_APP_ID") or "").strip()
+    run_slug = _str(obj, "app", "slug")
+    run_app_id = _int(obj, "app", "id")
+    if slug:
+        if run_slug:
+            return run_slug == slug
+        return _str(obj, "name") == OWN_CHECK_RUN_NAME
+    if app_id.isdigit() and run_app_id > 0:
+        return str(run_app_id) == app_id
+    return _str(obj, "name") == OWN_CHECK_RUN_NAME
 
 
 @on("check_suite")

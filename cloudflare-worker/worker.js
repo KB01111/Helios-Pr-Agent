@@ -41,6 +41,10 @@ export const FORWARDED_EVENTS = new Set([
   "installation",
   "installation_repositories",
 ]);
+// App-level lifecycle events are only ever signed by the GitHub App secret.
+// Never accept a repository webhook secret for them so a repo-secret holder
+// cannot forge installation events for another repository.
+const APP_ONLY_EVENTS = new Set(["installation", "installation_repositories"]);
 // Conversational events from bots are dropped (no reply loops); CI results are not,
 // because check suites and statuses are usually reported by bots.
 const BOT_SKIPPED_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]);
@@ -219,12 +223,16 @@ export async function handleWebhook(request, env, _ctx) {
   const raw = await readBounded(request, MAX_BODY_BYTES);
   if (raw === null) return json({ error: "payload too large" }, 413);
 
+  const event = request.headers.get("x-github-event") || "";
   const signature = request.headers.get("x-hub-signature-256") || "";
-  // A GitHub App signs with GITHUB_APP_WEBHOOK_SECRET; repo webhooks with GITHUB_WEBHOOK_SECRET.
-  if (!(await verifyAnySignature(env, raw, signature))) {
+  // App-only lifecycle events must be signed with GITHUB_APP_WEBHOOK_SECRET.
+  // Other events may come from either the GitHub App or a repo webhook.
+  const sigValid = APP_ONLY_EVENTS.has(event)
+    ? await verifySignature(env.GITHUB_APP_WEBHOOK_SECRET, raw, signature)
+    : await verifyAnySignature(env, raw, signature);
+  if (!sigValid) {
     return json({ error: "bad signature" }, 401);
   }
-  const event = request.headers.get("x-github-event") || "";
   if (event === "ping") return json({ pong: true });
   if (!FORWARDED_EVENTS.has(event)) return json({ skipped: event || "no-event" }, 202);
 

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the rendered template changes in a way existing repos should pick up.
-pub const TEMPLATE_VERSION: u32 = 7;
+pub const TEMPLATE_VERSION: u32 = 8;
 /// First-line marker of a workflow this app manages.
 pub const MANAGED_MARKER: &str = "# pr-agent-control: ";
 /// Pinned so a compromised upstream branch cannot receive repository secrets.
@@ -216,26 +216,48 @@ jobs:
         env:
           GH_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
           REPO: ${{{{ github.repository }}}}
-          BASE_REF: ${{{{ github.event.pull_request.base.ref || github.event.repository.default_branch }}}}
+          EVENT_NAME: ${{{{ github.event_name }}}}
+          PR_NUMBER: ${{{{ github.event.pull_request.number || github.event.issue.number }}}}
+          BASE_REF: ${{{{ github.event.pull_request.base.ref }}}}
+          DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
 {base_instructions_env}        run: |
           python3 - <<'PY'
-          import os, secrets, urllib.error, urllib.parse, urllib.request
+          import json, os, secrets, urllib.error, urllib.parse, urllib.request
           base = os.environ.get("BASE_EXTRA_INSTRUCTIONS", "").strip()
           repo = os.environ.get("REPO", "").strip()
+          event_name = os.environ.get("EVENT_NAME", "").strip()
+          pr_number = os.environ.get("PR_NUMBER", "").strip()
           ref = os.environ.get("BASE_REF", "").strip()
+          default_branch = os.environ.get("DEFAULT_BRANCH", "").strip()
           token = os.environ.get("GH_TOKEN", "")
+          api_headers = {{
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "pr-agent-control-workflow",
+          }}
+          if token:
+              api_headers["Authorization"] = f"Bearer {{token}}"
+          if not ref and event_name == "issue_comment" and repo and pr_number.isdigit():
+              pr_url = f"https://api.github.com/repos/{{repo}}/pulls/{{pr_number}}"
+              pr_req = urllib.request.Request(
+                  pr_url,
+                  headers={{**api_headers, "Accept": "application/vnd.github+json"}},
+              )
+              try:
+                  with urllib.request.urlopen(pr_req, timeout=10) as resp:
+                      pr_data = json.loads(resp.read(262144).decode("utf-8", errors="replace"))
+                      ref = str((pr_data.get("base") or {{}}).get("ref") or "").strip()
+              except Exception as e:
+                  print(f"::warning::Could not resolve PR #{{pr_number}} base branch ({{type(e).__name__}}); falling back to default branch.")
+          if not ref:
+              ref = default_branch
           mem = ""
           if repo and ref:
               qs = urllib.parse.urlencode({{"ref": ref}})
               url = f"https://api.github.com/repos/{{repo}}/contents/.pr-agent/memory.md?{{qs}}"
-              headers = {{
-                  "Accept": "application/vnd.github.raw+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-                  "User-Agent": "pr-agent-control-workflow",
-              }}
-              if token:
-                  headers["Authorization"] = f"Bearer {{token}}"
-              req = urllib.request.Request(url, headers=headers)
+              req = urllib.request.Request(
+                  url,
+                  headers={{**api_headers, "Accept": "application/vnd.github.raw+json"}},
+              )
               try:
                   with urllib.request.urlopen(req, timeout=10) as resp:
                       raw = resp.read(65536).decode("utf-8", errors="replace")
@@ -371,10 +393,15 @@ mod tests {
         assert!(yaml.contains(r#"group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ') || startsWith(github.event.comment.body, fromJSON('"/review\n"')) || startsWith(github.event.comment.body, fromJSON('"/review\r"')) || startsWith(github.event.comment.body, fromJSON('"/review\t"'))) && format('pr-{0}', github.event.issue.number))"#));
         assert!(yaml.contains("queue: max"));
         assert!(yaml.contains("cancel-in-progress: false"));
-        // Memory bridge loads .pr-agent/memory.md from base/default branch and caps to 6000 chars.
+        // Memory bridge loads .pr-agent/memory.md from the PR's base branch (resolving via API on issue_comment) and caps to 6000 chars.
         assert!(yaml.contains("name: Load repo memory"));
         assert!(yaml.contains("contents/.pr-agent/memory.md"));
-        assert!(yaml.contains("github.event.pull_request.base.ref || github.event.repository.default_branch"));
+        assert!(yaml.contains("EVENT_NAME: ${{ github.event_name }}"));
+        assert!(yaml.contains("PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}"));
+        assert!(yaml.contains("BASE_REF: ${{ github.event.pull_request.base.ref }}"));
+        assert!(yaml.contains("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"));
+        assert!(yaml.contains("pr_url = f\"https://api.github.com/repos/{repo}/pulls/{pr_number}\""));
+        assert!(yaml.contains("if not ref and event_name == \"issue_comment\""));
         assert!(yaml.contains("[:6000]"));
         assert!(yaml.contains("PR_REVIEWER__EXTRA_INSTRUCTIONS"));
         assert!(!yaml.contains("BASE_EXTRA_INSTRUCTIONS:"));

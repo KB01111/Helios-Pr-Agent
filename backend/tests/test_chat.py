@@ -546,3 +546,65 @@ def test_pat_mode_self_reply_loop_empty_ask_and_sender_is_bot(monkeypatch):
     assert chat.CHAT_REPLY_MARKER in ask_calls[-1]["json"]["body"]  # nosec B101
 
 
+def test_finding_selection_prefers_fingerprint_and_requests_clarification_on_ambiguity(monkeypatch):
+    calls: list[dict] = []
+    _install_fake_httpx(monkeypatch, calls)
+
+    fp_crit = dm.finding_fingerprint("backend/auth.py", "line1", "security", "Critical SQLi")
+    fp_minor = dm.finding_fingerprint("backend/auth.py", "line2", "bug", "Minor edge case")
+    for fp, sev, title, cid in (
+        (fp_crit, "critical", "Critical SQLi", 101),
+        (fp_minor, "minor", "Minor edge case", 102),
+    ):
+        store.rset_json(
+            dm.finding_key(REPO, 7, fp),
+            {
+                "fingerprint": fp,
+                "file": "backend/auth.py",
+                "start_line": 2,
+                "end_line": 2,
+                "severity": sev,
+                "category": "bug",
+                "title": title,
+                "state": "open",
+                "comment_id": cid,
+            },
+            ex=dm.FINDING_TTL_S,
+        )
+
+    # Ambiguous resolve on same file with unmatched comment_id must NOT pick critical by severity alone
+    amb = asyncio.run(
+        chat.handle_pr_mention(
+            REPO, 7, body="@pr-agent resolve", author="alice", association="OWNER",
+            comment_id=999, path="backend/auth.py",
+        )
+    )
+    assert amb["resolved"] is False and amb.get("ambiguous") is True  # nosec B101
+    assert store.rget_json(dm.finding_key(REPO, 7, fp_crit))["state"] == "open"  # nosec B101
+    assert store.rget_json(dm.finding_key(REPO, 7, fp_minor))["state"] == "open"  # nosec B101
+
+    # Explicit fingerprint in query must select fp_minor even though fp_crit is more severe
+    exact = asyncio.run(
+        chat.handle_pr_mention(
+            REPO, 7, body=f"@pr-agent resolve {fp_minor}", author="alice", association="OWNER",
+            comment_id=999, path="backend/auth.py",
+        )
+    )
+    assert exact["resolved"] is True and exact["finding"]["fingerprint"] == fp_minor  # nosec B101
+    assert store.rget_json(dm.finding_key(REPO, 7, fp_minor))["state"] == "resolved"  # nosec B101
+    assert store.rget_json(dm.finding_key(REPO, 7, fp_crit))["state"] == "open"  # nosec B101
+
+
+def test_invoke_callback_does_not_retry_when_body_raises_type_error():
+    invocations = {"n": 0}
+
+    def bad_cb(repo: str, pr_number: int) -> None:
+        invocations["n"] += 1
+        raise TypeError("internal body error")
+
+    with pytest.raises(TypeError, match="internal body error"):
+        asyncio.run(chat._invoke_callback(bad_cb, REPO, 7))
+    assert invocations["n"] == 1  # nosec B101
+
+
+

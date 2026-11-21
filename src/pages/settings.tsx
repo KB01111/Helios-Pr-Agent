@@ -26,8 +26,8 @@ import {
   wipeLocalVault,
 } from "@/lib/session";
 import { useApp } from "@/lib/store";
-import { isTauri } from "@/lib/tauri";
-import { toastOk } from "@/lib/toast";
+import { errText, isTauri } from "@/lib/tauri";
+import { toastErr, toastOk } from "@/lib/toast";
 
 export function SettingsPage({ active }: { active: boolean }) {
   const backendUrl = useApp((s) => s.backendUrl);
@@ -39,6 +39,8 @@ export function SettingsPage({ active }: { active: boolean }) {
   const opencodeGo = useApp((s) => s.secrets.opencodeGo);
   const setSecret = useApp((s) => s.setSecret);
   const rememberSecrets = useApp((s) => s.rememberSecrets);
+  const vaultSupported = useApp((s) => s.vaultSupported);
+  const vaultError = useApp((s) => s.vaultError);
   const vaultKeys = useApp((s) => s.vaultKeys);
   const activeFlow = useOAuth((s) => s.activeFlow);
 
@@ -118,20 +120,29 @@ export function SettingsPage({ active }: { active: boolean }) {
                   Remember securely on this PC (Windows DPAPI)
                 </Label>
                 <p className="text-muted-foreground text-xs leading-relaxed">
-                  {isTauri()
+                  {vaultSupported
                     ? "Encrypts your Backend API token and provider keys with your Windows user profile so you don't have to re-paste them after restarting the app. Never touches localStorage."
-                    : "Available in the PR Agent desktop app (Windows DPAPI). Browser preview keeps tokens in sessionStorage only."}
+                    : isTauri()
+                      ? "Encrypted local vault requires Windows DPAPI and is not supported on this OS. Tokens stay in memory + sessionStorage only."
+                      : "Available in the Windows desktop app (Windows DPAPI). Browser preview keeps tokens in sessionStorage only."}
                 </p>
               </div>
             </div>
             <Switch
               id="settings-remember-pc"
-              checked={rememberSecrets}
+              checked={vaultSupported && rememberSecrets}
+              disabled={!vaultSupported}
               onCheckedChange={(v) => void setRememberOnPc(v)}
             />
           </div>
 
-          {isTauri() ? (
+          {vaultError ? (
+            <div className="border-destructive/40 bg-destructive/10 text-destructive rounded-md border px-3 py-2 text-xs">
+              Local vault could not be loaded: {vaultError}. Click <b>Wipe local vault</b> below to clear and recreate it.
+            </div>
+          ) : null}
+
+          {vaultSupported || vaultError ? (
             <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="text-muted-foreground text-xs">Stored in local vault:</span>
@@ -142,25 +153,29 @@ export function SettingsPage({ active }: { active: boolean }) {
                     </Badge>
                   ))
                 ) : (
-                  <Badge variant="outline" className="text-[10px]">
-                    none
+                  <Badge variant={vaultError ? "danger" : "outline"} className="text-[10px]">
+                    {vaultError ? "unreadable" : "none"}
                   </Badge>
                 )}
               </div>
               <ButtonRow>
-                {rememberSecrets ? (
+                {vaultSupported && rememberSecrets ? (
                   <AsyncButton
                     variant="outline"
                     size="xs"
                     onClick={async () => {
-                      const n = await syncAllSecretsToVault();
-                      toastOk("Vault synced", `Saved ${n} active secret(s) to Windows DPAPI vault.`);
+                      try {
+                        const n = await syncAllSecretsToVault();
+                        toastOk("Vault synced", `Saved ${n} active secret(s) to Windows DPAPI vault.`);
+                      } catch (e) {
+                        toastErr("Vault sync failed", errText(e, 220));
+                      }
                     }}
                   >
                     Sync current secrets
                   </AsyncButton>
                 ) : null}
-                {vaultKeys.length > 0 ? (
+                {vaultKeys.length > 0 || vaultError ? (
                   <AsyncButton variant="ghost" size="xs" onClick={() => wipeLocalVault(false)}>
                     <Trash2 /> Wipe local vault
                   </AsyncButton>
@@ -201,7 +216,7 @@ export function SettingsPage({ active }: { active: boolean }) {
             <Button
               type="button"
               variant="destructive"
-              onClick={() => (vaultKeys.length > 0 ? setConfirmWipeAll(true) : void forgetSecretsAndVault())}
+              onClick={() => (vaultKeys.length > 0 || vaultError ? setConfirmWipeAll(true) : void forgetSecretsAndVault())}
             >
               <Trash2 /> Forget session &amp; wipe local vault
             </Button>
@@ -255,8 +270,9 @@ export function SettingsPage({ active }: { active: boolean }) {
           <DialogHeader>
             <DialogTitle>Wipe session secrets and local PC vault?</DialogTitle>
             <DialogDescription>
-              This clears all in-memory session tokens and permanently deletes the {vaultKeys.length} encrypted key(s) stored
-              in your Windows DPAPI vault. You will need to re-enter your Backend API token on next launch.
+              {vaultKeys.length > 0
+                ? `This clears all in-memory session tokens and permanently deletes the ${vaultKeys.length} encrypted key(s) stored in your Windows DPAPI vault. You will need to re-enter your Backend API token on next launch.`
+                : "This clears all in-memory session tokens and permanently deletes the local Windows DPAPI vault file on disk."}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

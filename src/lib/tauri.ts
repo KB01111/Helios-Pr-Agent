@@ -76,8 +76,34 @@ export const VAULT_KEYS: readonly VaultKey[] = [
   "opencode_go_api_key",
 ] as const;
 
+export interface VaultStatus {
+  supported: boolean;
+  backend: string;
+}
+
 function isVaultUnsupported(err: unknown): boolean {
-  return tauriUnavailable(err) || /command vault_.* not found|unknown command/i.test(String((err as any)?.message ?? err));
+  const msg = String((err as any)?.message ?? err);
+  return (
+    tauriUnavailable(err) ||
+    /command vault_.* not found|unknown command|encrypted local vault is unsupported/i.test(msg)
+  );
+}
+
+export async function vaultStatus(): Promise<VaultStatus> {
+  try {
+    const raw = await tauriInvoke<VaultStatus>("vault_status");
+    const obj = jsonObj(raw);
+    if (obj && typeof obj === "object") {
+      return {
+        supported: Boolean(obj.supported),
+        backend: String(obj.backend || (obj.supported ? "windows-dpapi" : "unsupported")),
+      };
+    }
+    return { supported: false, backend: "unsupported" };
+  } catch (e) {
+    if (isVaultUnsupported(e)) return { supported: false, backend: "unsupported" };
+    return { supported: false, backend: "unsupported" };
+  }
 }
 
 export async function vaultSaveSecret(key: VaultKey, value: string): Promise<boolean> {
