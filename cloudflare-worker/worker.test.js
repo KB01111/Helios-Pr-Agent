@@ -1,7 +1,14 @@
 // Run with: node --test cloudflare-worker/
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { runCron, verifySignature, deliver, replayParked } from "./worker.js";
+import worker, {
+  FORWARDED_EVENTS,
+  runCron,
+  verifySignature,
+  verifyAnySignature,
+  deliver,
+  replayParked,
+} from "./worker.js";
 
 const SECRET = "whsec_test";
 const baseEnv = { GITHUB_WEBHOOK_SECRET: SECRET, BACKEND_URL: "https://backend.example.com", RETRY_DELAYS_MS: "0,0,0" };
@@ -344,8 +351,110 @@ test("deliveries signed with the GitHub App secret are accepted when configured"
     const env = { ...baseEnv, GITHUB_APP_WEBHOOK_SECRET: "app-secret" };
     assert.equal((await post(body, { signature: appSigned, env })).status, 202);
     assert.equal((await post(body, { env })).status, 202); // repo secret still works
+    assert.equal((await post(body, { signature: await sign(body, "wrong-secret"), env })).status, 401);
     const appOnlyEnv = { GITHUB_APP_WEBHOOK_SECRET: "app-secret", BACKEND_URL: baseEnv.BACKEND_URL };
     assert.equal((await post(body, { signature: appSigned, env: appOnlyEnv })).status, 202);
+    assert.equal((await post(body, { signature: await sign(body, SECRET), env: appOnlyEnv })).status, 401);
+    // Whitespace-only secrets count as unconfigured (500).
+    assert.equal(
+      (await post(body, { env: { GITHUB_WEBHOOK_SECRET: "   ", GITHUB_APP_WEBHOOK_SECRET: "", BACKEND_URL: baseEnv.BACKEND_URL } })).status,
+      500
+    );
+  } finally {
+    f.restore();
+  }
+});
+
+test("verifyAnySignature validates both secrets and rejects malformed/short digests", async () => {
+  const raw = new TextEncoder().encode("payload");
+  const repoSig = await sign("payload", "repo-sec");
+  const appSig = await sign("payload", "app-sec");
+  const otherSig = await sign("payload", "other-sec");
+  const dualEnv = { GITHUB_WEBHOOK_SECRET: "repo-sec", GITHUB_APP_WEBHOOK_SECRET: "app-sec" };
+
+  assert.equal(await verifyAnySignature(dualEnv, raw, repoSig), true);
+  assert.equal(await verifyAnySignature(dualEnv, raw, appSig), true);
+  assert.equal(await verifyAnySignature(dualEnv, raw, otherSig), false);
+  assert.equal(await verifyAnySignature(dualEnv, raw, "sha256=abcd"), false);
+  assert.equal(await verifySignature("   ", raw, repoSig), false);
+});
+
+test("all 11 GitHub App events are forwarded with x-github-event and x-github-delivery preserved", async () => {
+  const expectedEvents = [
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_review_thread",
+    "issue_comment",
+    "check_suite",
+    "check_run",
+    "status",
+    "push",
+    "installation",
+    "installation_repositories",
+  ];
+  assert.deepEqual([...FORWARDED_EVENTS].sort(), [...expectedEvents].sort());
+
+  const appSecret = "app-secret-all-events";
+  const env = { ...baseEnv, GITHUB_APP_WEBHOOK_SECRET: appSecret };
+  const samples = [
+    ["pull_request", prBody({ action: "synchronize" }), "del-pr"],
+    ["pull_request_review", JSON.stringify({ action: "submitted", pull_request: { number: 7 }, sender: { type: "User" } }), "del-rev"],
+    ["pull_request_review_comment", JSON.stringify({ action: "created", comment: { body: "@pr-agent explain" }, pull_request: { number: 7 }, sender: { type: "User" } }), "del-rev-cmt"],
+    ["pull_request_review_thread", JSON.stringify({ action: "resolved", thread: { node_id: "t1" }, pull_request: { number: 7 }, sender: { type: "User" } }), "del-thread"],
+    ["issue_comment", JSON.stringify({ action: "created", issue: { number: 7, pull_request: { url: "https://api.github.com/repos/o/r/pulls/7" } }, comment: { body: "@pr-agent review" }, sender: { type: "User" } }), "del-issue-cmt"],
+    ["check_suite", JSON.stringify({ action: "completed", check_suite: { conclusion: "success" }, sender: { type: "Bot" } }), "del-cs"],
+    ["check_run", JSON.stringify({ action: "completed", check_run: { name: "ci", conclusion: "failure" }, sender: { type: "Bot" } }), "del-cr"],
+    ["status", JSON.stringify({ sha: "a".repeat(40), state: "success", context: "ci/build", sender: { type: "Bot" } }), "del-status"],
+    ["push", JSON.stringify({ ref: "refs/heads/main", repository: { full_name: "o/r", default_branch: "main" } }), "del-push"],
+    ["installation", JSON.stringify({ action: "created", installation: { id: 42 }, sender: { type: "User" } }), "del-inst"],
+    ["installation_repositories", JSON.stringify({ action: "added", installation: { id: 42 }, repositories_added: [{ full_name: "o/r" }], sender: { type: "User" } }), "del-inst-repos"],
+  ];
+
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    for (const [event, body, delivery] of samples) {
+      const signature = await sign(body, appSecret);
+      const resp = await post(body, { event, delivery, signature, env });
+      assert.equal(resp.status, 202, `expected 202 for ${event}`);
+    }
+    assert.equal(f.calls.length, samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const [event, body, delivery] = samples[i];
+      const { init } = f.calls[i];
+      assert.equal(init.headers["x-github-event"], event);
+      assert.equal(init.headers["x-github-delivery"], delivery);
+      assert.equal(init.headers["x-hub-signature-256"], await sign(body, appSecret));
+      assert.equal(init.body, body);
+    }
+  } finally {
+    f.restore();
+  }
+});
+
+test("bot review comments and non-completed check_runs are skipped cleanly", async () => {
+  const f = stubFetch(() => new Response("{}", { status: 202 }));
+  try {
+    const botRevComment = JSON.stringify({
+      action: "created",
+      comment: { body: "automated" },
+      pull_request: { number: 7 },
+      sender: { type: "Bot" },
+    });
+    assert.deepEqual(await (await post(botRevComment, { event: "pull_request_review_comment" })).json(), { skipped: "bot" });
+    const botReview = JSON.stringify({
+      action: "submitted",
+      pull_request: { number: 7 },
+      sender: { type: "Bot" },
+    });
+    assert.deepEqual(await (await post(botReview, { event: "pull_request_review" })).json(), { skipped: "bot" });
+    const pendingCheckRun = JSON.stringify({
+      action: "in_progress",
+      check_run: { name: "ci" },
+      sender: { type: "Bot" },
+    });
+    assert.deepEqual(await (await post(pendingCheckRun, { event: "check_run" })).json(), { skipped: "in_progress" });
+    assert.equal(f.calls.length, 0);
   } finally {
     f.restore();
   }

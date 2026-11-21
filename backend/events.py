@@ -35,6 +35,8 @@ except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo r
 log = logging.getLogger("pr-agent.events")
 
 CONFIG_FILES = (".pragent.yaml", ".pragent.yml")
+OWN_CHECK_RUN_NAME = "PR Agent · Merge readiness"
+OWN_STATUS_CONTEXT = "pr-agent/merge-readiness"
 # Bot senders are ignored for conversational events (no reply loops), but not
 # for CI results: check suites and statuses are usually posted by bots.
 _BOT_SENSITIVE = {"issue_comment", "pull_request_review_comment", "pull_request_review"}
@@ -327,10 +329,38 @@ async def _pull_request_review_comment(ctx: EventContext) -> dict[str, Any]:
         "in_reply_to": _int(comment, "in_reply_to_id") or None,
         "path": _str(comment, "path"),
         "author": _str(comment, "user", "login"),
+        "association": _str(comment, "author_association"),
         "mentions_agent": mentions_agent(_str(comment, "body")),
     }
     await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=False)
     return {"recorded": 1, "prs": [number], "mentions_agent": entry["mentions_agent"]}
+
+
+def _sync_thread_finding_state(repo: str, pr_number: int, comment_id: int, action: str, actor: str) -> dict[str, Any] | None:
+    """Keep stored finding lifecycle in sync when a PR review thread is resolved/unresolved."""
+    if comment_id <= 0 or action not in ("resolved", "unresolved"):
+        return None
+    try:
+        try:
+            from review import find_finding_by_comment_id, set_finding_state
+        except ImportError:  # pragma: no cover
+            from backend.review import find_finding_by_comment_id, set_finding_state  # type: ignore[no-redef]
+        found = find_finding_by_comment_id(repo, pr_number, comment_id)
+        if not isinstance(found, dict):
+            return None
+        fp = str(found.get("fingerprint") or "").strip()
+        if not fp:
+            return None
+        cur_state = str(found.get("state") or "open").lower()
+        if action == "resolved" and cur_state != "dismissed":
+            updated = set_finding_state(repo, pr_number, fp, "resolved", by=actor or None)
+            return {"fingerprint": fp, "state": "resolved"} if updated else None
+        if action == "unresolved" and cur_state == "resolved":
+            updated = set_finding_state(repo, pr_number, fp, "open", by=actor or None)
+            return {"fingerprint": fp, "state": "open"} if updated else None
+    except Exception as exc:
+        log.warning("events: thread finding sync failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+    return None
 
 
 @on("pull_request_review_thread")
@@ -342,16 +372,24 @@ async def _pull_request_review_thread(ctx: EventContext) -> dict[str, Any]:
         return {"recorded": 0}
     comments = thread.get("comments") if isinstance(thread.get("comments"), list) else []
     first = comments[0] if comments and isinstance(comments[0], dict) else {}
+    first_comment_id = _int(first, "id")
+    actor = _str(ctx.payload, "sender", "login")
     entry = {
         "kind": "thread",
         "action": ctx.action,  # resolved | unresolved
         "thread_node_id": _str(thread, "node_id"),
         "path": _str(first, "path"),
-        "first_comment_id": _int(first, "id"),
-        "by": _str(ctx.payload, "sender", "login"),
+        "first_comment_id": first_comment_id,
+        "by": actor,
     }
     await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry)
-    return {"recorded": 1, "prs": [number]}
+    finding_updated = await asyncio.to_thread(
+        _sync_thread_finding_state, ctx.repo, number, first_comment_id, ctx.action, actor
+    )
+    out: dict[str, Any] = {"recorded": 1, "prs": [number]}
+    if finding_updated:
+        out["finding_updated"] = finding_updated
+    return out
 
 
 def _check_prs(obj: dict[str, Any]) -> list[int]:
@@ -361,6 +399,8 @@ def _check_prs(obj: dict[str, Any]) -> list[int]:
 
 def _is_own_check(obj: dict[str, Any]) -> bool:
     """Our own merge-readiness check must not mark the PR dirty again (loop)."""
+    if _str(obj, "name") == OWN_CHECK_RUN_NAME:
+        return True
     slug = github_app.app_slug()
     return bool(slug) and _str(obj, "app", "slug") == slug
 
@@ -403,6 +443,9 @@ async def _check_run(ctx: EventContext) -> dict[str, Any]:
 
 @on("status")
 async def _status(ctx: EventContext) -> dict[str, Any]:
+    context = _str(ctx.payload, "context")
+    if context == OWN_STATUS_CONTEXT:
+        return {"recorded": 0, "skipped": "own-status"}
     sha = _str(ctx.payload, "sha")
     if not ctx.repo or not sha:
         return {"recorded": 0}
@@ -411,7 +454,7 @@ async def _status(ctx: EventContext) -> dict[str, Any]:
         return {"recorded": 0, "skipped": "unknown-head"}
     entry = {
         "kind": "status",
-        "context": _str(ctx.payload, "context"),
+        "context": context,
         "state": _str(ctx.payload, "state"),
         "sha": sha,
         "url": _str(ctx.payload, "target_url"),

@@ -358,6 +358,73 @@ class ReviewOnlyProvider:
     provider_name = "review_only"
 
     async def run(self, agent_config: dict, pr_context: dict) -> dict:
+        if (
+            agent_config.get("legacy_single_pass") is True
+            or os.environ.get("REVIEW_ENGINE_MODE", "").strip().lower() == "legacy"
+        ):
+            return await self._run_legacy(agent_config, pr_context)
+
+        try:  # cwd=backend
+            from memory import retrieve_for_diff
+            from merge import recompute_pr_readiness
+            from review import run_structured_review
+        except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+            from backend.memory import retrieve_for_diff  # type: ignore[no-redef]
+            from backend.merge import recompute_pr_readiness  # type: ignore[no-redef]
+            from backend.review import run_structured_review  # type: ignore[no-redef]
+
+        raw_repo = str(pr_context.get("repo") or "")
+        memories_provider = None
+        if agent_config.get("memory_enabled", True) and raw_repo:
+            def _load_memories(changed_paths: list[str], diff_text: str) -> dict[str, Any]:
+                return retrieve_for_diff(raw_repo, changed_paths, diff_text)
+
+            memories_provider = _load_memories
+
+        result = await run_structured_review(
+            agent_config,
+            pr_context,
+            memories_provider=memories_provider,
+            force_full=bool(pr_context.get("force_full")),
+        )
+
+        # Best-effort post-review merge readiness recompute
+        if (
+            result.get("status") in ("completed", "completed_no_comment")
+            and not pr_context.get("skip_readiness")
+        ):
+            try:
+                repo = safe_repo(raw_repo)
+                pr_number = int(pr_context.get("pr_number") or 0)
+                if pr_number > 0:
+                    effective_cfg = (
+                        result["merged_config"]
+                        if isinstance(result.get("merged_config"), dict)
+                        else agent_config
+                    )
+                    raw_weights = effective_cfg.get("weights") or effective_cfg.get("merge_weights")
+                    effective_weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
+                    readiness_res = await recompute_pr_readiness(
+                        repo,
+                        pr_number,
+                        agent_config=effective_cfg,
+                        weights=effective_weights,
+                    )
+                    if isinstance(readiness_res, dict) and isinstance(readiness_res.get("report"), dict):
+                        rep = readiness_res["report"]
+                        result["readiness"] = rep
+                        result.setdefault("logs", []).append(
+                            f"review_only: merge readiness computed ({rep.get('score')}/100, {rep.get('band')})."
+                        )
+            except Exception as exc:
+                log.warning("review_only: post-review readiness recompute failed (%s)", type(exc).__name__)
+                result.setdefault("logs", []).append(
+                    f"review_only: merge readiness recompute skipped ({type(exc).__name__})."
+                )
+
+        return result
+
+    async def _run_legacy(self, agent_config: dict, pr_context: dict) -> dict:
         logs: list[str] = []
         agent_name = agent_config.get("name", agent_config.get("id", "pr-agent"))
         repo = pr_context.get("repo", "")

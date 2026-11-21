@@ -11,6 +11,7 @@ mod daemon;
 mod decider;
 mod github_app;
 mod oauth;
+mod vault;
 
 use autoreview::WorkflowOptions;
 
@@ -501,7 +502,7 @@ fn strip_ansi(input: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
             chars.next();
-            while let Some(code) = chars.next() {
+            for code in chars.by_ref() {
                 if ('@'..='~').contains(&code) {
                     break;
                 }
@@ -1014,7 +1015,12 @@ fn github_login_inner(
     let status = res.status();
     let body: serde_json::Value = res.json().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("GitHub rejected the token (HTTP {}): {}", status, body));
+        let msg = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("invalid credentials");
+        return Err(format!("GitHub rejected the token (HTTP {}): {}", status, msg));
     }
     let login = body
         .get("login")
@@ -1433,7 +1439,7 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
     Ok(path.to_string_lossy().to_string())
 }
 
-/// `owner/name`, each part 1-100 chars of [A-Za-z0-9_.-].
+/// `owner/name`, each part 1-100 chars of [A-Za-z0-9_.-] (excluding `.` and `..`).
 fn valid_repo_name(repo: &str) -> bool {
     let mut parts = repo.split('/');
     match (parts.next(), parts.next(), parts.next()) {
@@ -1441,6 +1447,8 @@ fn valid_repo_name(repo: &str) -> bool {
             let valid = |part: &str| {
                 !part.is_empty()
                     && part.len() <= 100
+                    && part != "."
+                    && part != ".."
                     && part
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
@@ -2191,6 +2199,7 @@ fn gh_commit_workflow(
 /// Each step runs independently and reports its own status. The token,
 /// webhook secret and API key are never returned or logged.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn github_setup_repo(
     token: String,
     repo: String,
@@ -2217,6 +2226,7 @@ async fn github_setup_repo(
     .map_err(|e| e.to_string())?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn github_setup_repo_blocking(
     token: String,
     repo: String,
@@ -2258,10 +2268,8 @@ fn github_setup_repo_blocking(
     // An empty key is allowed: the secrets step then keeps the repo's existing
     // secret (and fails for that repo if there is none), so settings can be
     // updated without pasting the key again.
-    if plan.actions {
-        if openrouter_key.contains('\r') || openrouter_key.contains('\n') {
-            return Err("openrouter_key must be a single line".into());
-        }
+    if plan.actions && (openrouter_key.contains('\r') || openrouter_key.contains('\n')) {
+        return Err("openrouter_key must be a single line".into());
     }
     let provider = workflow_provider.trim();
     let workflow_path = match provider {
@@ -2682,6 +2690,304 @@ fn github_pr_command_blocking(
         .unwrap_or_default())
 }
 
+const ALLOWED_COMMIT_REPO_FILES: &[&str] = &[
+    ".pragent.yaml",
+    ".pragent.yml",
+    ".pr-agent/memory.md",
+];
+const MAX_REPO_FILE_BYTES: usize = 512 * 1024;
+
+/// Validate a repository-relative path for reading via the GitHub Contents API.
+fn validate_read_repo_path(path: &str) -> Result<String, String> {
+    let p = path.trim();
+    if p.is_empty() || p.len() > 256 {
+        return Err("path must be 1-256 characters".into());
+    }
+    if p.starts_with('/') || p.ends_with('/') || p.contains('\\') || p.contains("//") {
+        return Err("path must be a normalized repository-relative path".into());
+    }
+    if !p
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
+        return Err("path contains unsupported characters".into());
+    }
+    for seg in p.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err("path must not contain '.' or '..' segments".into());
+        }
+    }
+    Ok(p.to_string())
+}
+
+/// Strict allowlist for files the desktop app is permitted to commit via `github_commit_repo_file`.
+fn validate_commit_repo_path(path: &str) -> Result<&'static str, String> {
+    let p = path.trim();
+    ALLOWED_COMMIT_REPO_FILES
+        .iter()
+        .copied()
+        .find(|&allowed| allowed == p)
+        .ok_or_else(|| {
+            format!(
+                "refusing to commit unsupported path {:?} (allowed: {})",
+                p,
+                ALLOWED_COMMIT_REPO_FILES.join(", ")
+            )
+        })
+}
+
+fn validate_commit_message(path: &str, message: &str) -> Result<String, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Ok(format!("chore: update {} (PR Agent Control)", path));
+    }
+    if msg.contains('\r') || msg.contains('\n') || msg.contains('\0') {
+        return Err("commit message must be a single line".into());
+    }
+    if msg.chars().count() > 500 {
+        return Err("commit message is too long (max 500 characters)".into());
+    }
+    Ok(msg.to_string())
+}
+
+/// Read a UTF-8 file from a repository's default branch via the GitHub Contents API.
+/// Returns `None` on HTTP 404.
+#[tauri::command]
+async fn github_read_repo_file(
+    token: String,
+    repo: String,
+    path: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || github_read_repo_file_blocking(token, repo, path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_read_repo_file_blocking(
+    token: String,
+    repo: String,
+    path: String,
+) -> Result<Option<String>, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let rel_path = validate_read_repo_path(&path)?;
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+    let branch = gh_default_branch(&client, token, &repo_api)?;
+    let url = format!("{}/contents/{}", repo_api, rel_path);
+    let (status, body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("ref", branch.as_str())],
+        None,
+    )?;
+    match status {
+        404 => Ok(None),
+        200 => {
+            let val: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|_| format!("read {}: GitHub response was not JSON", rel_path))?;
+            if val.get("type").and_then(|t| t.as_str()) != Some("file") {
+                return Err(format!("read {}: path is not a regular file", rel_path));
+            }
+            if val.get("encoding").and_then(|e| e.as_str()) == Some("none")
+                && val.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 0
+            {
+                return Err(format!("read {}: file is too large for GitHub Contents API", rel_path));
+            }
+            let text = gh_file_text(&val)?;
+            Ok(Some(text))
+        }
+        _ => Err(format!("read {}: {}", rel_path, gh_error_text(status, &body))),
+    }
+}
+
+fn extract_commit_sha(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("content")
+                .and_then(|c| c.get("sha"))
+                .and_then(|s| s.as_str())
+                .or_else(|| v.get("commit").and_then(|c| c.get("sha")).and_then(|s| s.as_str()))
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// Upsert an allowlisted repo config or memory file (`.pragent.yaml`, `.pragent.yml`,
+/// `.pr-agent/memory.md`) on the default branch. Skips the commit when content is
+/// unchanged. Returns `{ changed: bool, sha: String, path: String }`.
+#[tauri::command]
+async fn github_commit_repo_file(
+    token: String,
+    repo: String,
+    path: String,
+    content: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        github_commit_repo_file_blocking(token, repo, path, content, message)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn github_commit_repo_file_blocking(
+    token: String,
+    repo: String,
+    path: String,
+    content: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let allowed_path = validate_commit_repo_path(&path)?;
+    if content.len() > MAX_REPO_FILE_BYTES {
+        return Err("file content exceeds maximum allowed size (512 KiB)".into());
+    }
+    let commit_message = validate_commit_message(allowed_path, &message)?;
+
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+    let branch = gh_default_branch(&client, token, &repo_api)?;
+    let url = format!("{}/contents/{}", repo_api, allowed_path);
+
+    let (status, body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("ref", branch.as_str())],
+        None,
+    )?;
+    let existing_sha = match status {
+        200 => {
+            let file_json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|_| format!("{}: existing file response was not JSON", allowed_path))?;
+            if file_json.get("type").and_then(|t| t.as_str()) != Some("file") {
+                return Err(format!("{}: existing path is not a regular file", allowed_path));
+            }
+            let sha = file_json
+                .get("sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: existing file response had no sha", allowed_path))?;
+            if gh_file_text(&file_json).is_ok_and(|current| current == content) {
+                return Ok(serde_json::json!({
+                    "changed": false,
+                    "sha": sha,
+                    "path": allowed_path,
+                }));
+            }
+            Some(sha)
+        }
+        404 => None,
+        _ => return Err(format!("{}: {}", allowed_path, gh_error_text(status, &body))),
+    };
+
+    let make_payload = |sha: Option<&str>| {
+        let mut payload = serde_json::json!({
+            "message": commit_message,
+            "content": STANDARD.encode(content.as_bytes()),
+            "branch": branch,
+        });
+        if let Some(s) = sha {
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("sha".to_string(), serde_json::Value::String(s.to_string()));
+            }
+        }
+        payload
+    };
+
+    let (put_status, put_body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::PUT,
+        &url,
+        &[],
+        Some(make_payload(existing_sha.as_deref())),
+    )?;
+    match put_status {
+        200 | 201 => Ok(serde_json::json!({
+            "changed": true,
+            "sha": extract_commit_sha(&put_body),
+            "path": allowed_path,
+        })),
+        409 => {
+            // Race: re-read the fresh SHA and retry once (or skip if already identical).
+            let (re_status, re_body) = gh_request_json(
+                &client,
+                token,
+                reqwest::Method::GET,
+                &url,
+                &[("ref", branch.as_str())],
+                None,
+            )?;
+            if re_status != 200 {
+                return Err(format!(
+                    "{}: conflict and re-read failed: {}",
+                    allowed_path,
+                    gh_error_text(re_status, &re_body)
+                ));
+            }
+            let fresh_json: serde_json::Value = serde_json::from_str(&re_body)
+                .map_err(|_| format!("{}: conflict re-read was not JSON", allowed_path))?;
+            let fresh_sha = fresh_json
+                .get("sha")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: conflict re-read returned no sha", allowed_path))?;
+            if gh_file_text(&fresh_json).is_ok_and(|current| current == content) {
+                return Ok(serde_json::json!({
+                    "changed": false,
+                    "sha": fresh_sha,
+                    "path": allowed_path,
+                }));
+            }
+            let (retry_status, retry_body) = gh_request_json(
+                &client,
+                token,
+                reqwest::Method::PUT,
+                &url,
+                &[],
+                Some(make_payload(Some(&fresh_sha))),
+            )?;
+            if matches!(retry_status, 200 | 201) {
+                Ok(serde_json::json!({
+                    "changed": true,
+                    "sha": extract_commit_sha(&retry_body),
+                    "path": allowed_path,
+                }))
+            } else {
+                Err(format!(
+                    "commit {}: {}",
+                    allowed_path,
+                    gh_error_text(retry_status, &retry_body)
+                ))
+            }
+        }
+        _ => Err(format!(
+            "commit {}: {}",
+            allowed_path,
+            gh_error_text(put_status, &put_body)
+        )),
+    }
+}
+
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
 /// with an optional Bearer API token. Keeps secrets out of the webview fetch path
 /// (avoids CORS/preflight issues in Tauri) and never logs tokens.
@@ -2696,6 +3002,15 @@ async fn backend_mutate(
     tauri::async_runtime::spawn_blocking(move || backend_mutate_blocking(method, backend_url, path, body_json, api_token))
         .await
         .map_err(|e| e.to_string())?
+}
+
+fn backend_http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent("pr-agent-control")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 fn backend_mutate_blocking(
@@ -2719,7 +3034,16 @@ fn backend_mutate_blocking(
     }
     let url = format!("{}{}", base, p);
     require_secure_for_token(&url, api_token.as_deref().map(str::trim).is_some_and(|t| !t.is_empty()))?;
-    let client = gh_client()?;
+    // Reviews, repo memory bootstrap, and readiness recomputes can invoke LLMs or
+    // wake a cold backend instance, so give POST requests a generous timeout.
+    let timeout_secs = if m == "POST"
+        && (p.ends_with("/review") || p.ends_with("/bootstrap") || p.ends_with("/recompute"))
+    {
+        120
+    } else {
+        30
+    };
+    let client = backend_http_client(timeout_secs)?;
     let mut req = match m.as_str() {
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
@@ -2802,7 +3126,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| daemon::on_window_event(window, event))
+        .on_window_event(daemon::on_window_event)
         .invoke_handler(tauri::generate_handler![
             daemon::daemon_start,
             daemon::daemon_stop,
@@ -2836,6 +3160,12 @@ pub fn run() {
             github_disable_repo,
             github_list_pulls,
             github_pr_command,
+            github_read_repo_file,
+            github_commit_repo_file,
+            vault::vault_save_secret,
+            vault::vault_load_secrets,
+            vault::vault_delete_secret,
+            vault::vault_clear_all,
             github_app::github_app_create,
             oauth::oauth_cancel,
             oauth::oauth_status,
@@ -3082,5 +3412,108 @@ mod dotenv_assignment_tests {
         let content = "'OTHER'='first\nVERCEL_TOKEN = embedded\nlast'\n export VERCEL_TOKEN = old\nVERCEL_TOKEN=duplicate\n# comment = 'ignored\nVERCEL_TOKEN = final";
         assert_eq!(dotenv_key_lines(content, "VERCEL_TOKEN"), vec![false, false, false, true, true, false, true]);
         assert_eq!(dotenv_key_lines("VERCEL_TOKEN = \"first\nsecond\"\nOTHER=value", "VERCEL_TOKEN"), vec![true, true, false]);
+    }
+}
+
+#[cfg(test)]
+mod repo_file_tests {
+    use super::*;
+
+    #[test]
+    fn commit_path_allowlist_only_permits_config_and_memory() {
+        for ok in [".pragent.yaml", ".pragent.yml", ".pr-agent/memory.md", "  .pragent.yaml  "] {
+            assert!(validate_commit_repo_path(ok).is_ok(), "expected {:?} to pass", ok);
+        }
+        assert_eq!(validate_commit_repo_path(" .pr-agent/memory.md ").unwrap(), ".pr-agent/memory.md");
+        for bad in [
+            "",
+            ".github/workflows/pr-agent.yml",
+            "./.pragent.yaml",
+            "/.pragent.yaml",
+            ".pr-agent/../.pragent.yaml",
+            ".pr-agent/other.md",
+            "README.md",
+            ".env",
+            "src/main.rs",
+            ".pragent.yaml?ref=main",
+        ] {
+            assert!(validate_commit_repo_path(bad).is_err(), "expected {:?} to be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn read_path_validation_blocks_traversal_and_url_injection() {
+        for ok in [
+            ".pragent.yaml",
+            ".pragent.yml",
+            ".pr-agent/memory.md",
+            ".github/workflows/pr-agent.yml",
+            "docs/guide_v2.md",
+        ] {
+            assert_eq!(validate_read_repo_path(ok).unwrap(), ok);
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            ".pragent.yaml/",
+            "a//b",
+            "../secret",
+            "a/../b",
+            "./.pragent.yaml",
+            "a/./b",
+            r"a\b",
+            ".pragent.yaml?ref=evil",
+            ".pragent.yaml#frag",
+            "foo%2fbar",
+            "path with spaces.md",
+        ] {
+            assert!(validate_read_repo_path(bad).is_err(), "expected {:?} to be rejected", bad);
+        }
+        assert!(validate_read_repo_path(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn repo_name_validation_rejects_dot_segments() {
+        assert!(valid_repo_name("owner/repo"));
+        assert!(valid_repo_name("my-org/my.repo_1"));
+        for bad in ["", "owner", "a/b/c", "../repo", "owner/..", "./repo", "owner/.", "owner/repo?x=1"] {
+            assert!(!valid_repo_name(bad), "expected {:?} to be invalid", bad);
+        }
+    }
+
+    #[test]
+    fn repo_file_commands_reject_bad_inputs_before_network() {
+        assert!(github_read_repo_file_blocking("".into(), "o/r".into(), ".pragent.yaml".into()).is_err());
+        assert!(github_read_repo_file_blocking("tok".into(), "../bad".into(), ".pragent.yaml".into()).is_err());
+        assert!(github_read_repo_file_blocking("tok".into(), "o/r".into(), "../secret".into()).is_err());
+
+        assert!(github_commit_repo_file_blocking(
+            "".into(),
+            "o/r".into(),
+            ".pragent.yaml".into(),
+            "profile: chill\n".into(),
+            "chore: config".into(),
+        )
+        .is_err());
+        assert!(github_commit_repo_file_blocking(
+            "tok".into(),
+            "o/r".into(),
+            "README.md".into(),
+            "x".into(),
+            "chore: nope".into(),
+        )
+        .is_err());
+        assert!(github_commit_repo_file_blocking(
+            "tok".into(),
+            "o/r".into(),
+            ".pragent.yaml".into(),
+            "x".into(),
+            "line1\nline2".into(),
+        )
+        .is_err());
+        assert_eq!(
+            validate_commit_message(".pragent.yaml", "   ").unwrap(),
+            "chore: update .pragent.yaml (PR Agent Control)"
+        );
     }
 }

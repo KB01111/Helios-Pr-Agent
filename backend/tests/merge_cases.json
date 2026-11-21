@@ -1,0 +1,581 @@
+{
+  "policy_version": "v1",
+  "cases": [
+    {
+      "name": "clean_ready",
+      "signals": {
+        "pr_title": "feat: add merge readiness scorer",
+        "pr_url": "https://github.com/acme/repo/pull/1",
+        "approvals": 1
+      },
+      "expect": {
+        "score": 100,
+        "band": "ready",
+        "open_blockers": 0,
+        "item_codes": []
+      }
+    },
+    {
+      "name": "nits_only_ready",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "nit",
+            "category": "style",
+            "title": "Prefer trailing comma",
+            "file": "backend/merge/score.py",
+            "start_line": 12,
+            "fingerprint": "aaaaaaaaaaaaaaaa"
+          }
+        ]
+      },
+      "expect": {
+        "score": 100,
+        "band": "ready",
+        "open_blockers": 0,
+        "item_codes": ["nit_finding"]
+      }
+    },
+    {
+      "name": "minor_and_weak_desc_still_ready",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "minor",
+            "category": "maintainability",
+            "title": "Extract helper function",
+            "file": "backend/a.py",
+            "start_line": 42,
+            "fingerprint": "bbbbbbbbbbbbbbbb"
+          }
+        ],
+        "weak_description": true
+      },
+      "expect": {
+        "score": 93,
+        "band": "ready",
+        "open_blockers": 0,
+        "item_codes": ["minor_finding", "weak_description"]
+      }
+    },
+    {
+      "name": "boundary_ready_85",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Possible None dereference",
+            "file": "backend/a.py",
+            "start_line": 10,
+            "fingerprint": "cccccccccccccccc"
+          },
+          {
+            "severity": "minor",
+            "category": "style",
+            "title": "Shadowed loop variable",
+            "file": "backend/a.py",
+            "start_line": 22,
+            "fingerprint": "dddddddddddddddd"
+          }
+        ]
+      },
+      "expect": {
+        "score": 85,
+        "band": "ready",
+        "open_blockers": 0,
+        "item_codes": ["major_finding", "minor_finding"]
+      }
+    },
+    {
+      "name": "boundary_ready_with_nits_84",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "perf",
+            "title": "N+1 Redis roundtrip inside loop",
+            "file": "backend/a.py",
+            "start_line": 55,
+            "fingerprint": "eeeeeeeeeeeeeeee"
+          }
+        ],
+        "weak_description": true
+      },
+      "expect": {
+        "score": 84,
+        "band": "ready_with_nits",
+        "open_blockers": 0,
+        "item_codes": ["major_finding", "weak_description"]
+      }
+    },
+    {
+      "name": "boundary_ready_with_nits_70",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Missing timeout on HTTP call",
+            "file": "backend/a.py",
+            "start_line": 15,
+            "fingerprint": "1111111111111111"
+          },
+          {
+            "severity": "minor",
+            "category": "docs",
+            "title": "Outdated docstring",
+            "file": "backend/a.py",
+            "start_line": 1,
+            "fingerprint": "2222222222222222"
+          },
+          {
+            "severity": "minor",
+            "category": "style",
+            "title": "Unused import",
+            "file": "backend/b.py",
+            "start_line": 3,
+            "fingerprint": "3333333333333333"
+          }
+        ],
+        "unresolved_threads": 2
+      },
+      "expect": {
+        "score": 70,
+        "band": "ready_with_nits",
+        "open_blockers": 0,
+        "item_codes": ["major_finding", "unresolved_thread", "minor_finding", "minor_finding"]
+      }
+    },
+    {
+      "name": "boundary_needs_work_69",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Race condition on cache update",
+            "file": "backend/a.py",
+            "start_line": 30,
+            "fingerprint": "4444444444444444"
+          },
+          {
+            "severity": "major",
+            "category": "security",
+            "title": "Unescaped query parameter",
+            "file": "backend/b.py",
+            "start_line": 44,
+            "fingerprint": "5555555555555555"
+          },
+          {
+            "severity": "minor",
+            "category": "maintainability",
+            "title": "Magic number",
+            "file": "backend/b.py",
+            "start_line": 50,
+            "fingerprint": "6666666666666666"
+          }
+        ],
+        "weak_description": true
+      },
+      "expect": {
+        "score": 69,
+        "band": "needs_work",
+        "open_blockers": 0,
+        "item_codes": ["major_finding", "major_finding", "minor_finding", "weak_description"]
+      }
+    },
+    {
+      "name": "boundary_needs_work_50",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Issue 1",
+            "file": "a.py",
+            "start_line": 1,
+            "fingerprint": "7777777777777771"
+          },
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Issue 2",
+            "file": "a.py",
+            "start_line": 2,
+            "fingerprint": "7777777777777772"
+          },
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Issue 3",
+            "file": "a.py",
+            "start_line": 3,
+            "fingerprint": "7777777777777773"
+          }
+        ],
+        "source_changed_without_tests": true,
+        "unresolved_threads": 1
+      },
+      "expect": {
+        "score": 50,
+        "band": "needs_work",
+        "open_blockers": 0,
+        "item_codes": [
+          "major_finding",
+          "major_finding",
+          "major_finding",
+          "unresolved_thread",
+          "untested_source"
+        ]
+      }
+    },
+    {
+      "name": "non_blocker_score_below_50_is_blocked",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Major 1",
+            "file": "a.py",
+            "start_line": 1,
+            "fingerprint": "8888888888888881"
+          },
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Major 2",
+            "file": "a.py",
+            "start_line": 2,
+            "fingerprint": "8888888888888882"
+          },
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Major 3",
+            "file": "a.py",
+            "start_line": 3,
+            "fingerprint": "8888888888888883"
+          },
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Major 4",
+            "file": "a.py",
+            "start_line": 4,
+            "fingerprint": "8888888888888884"
+          }
+        ],
+        "weak_description": true
+      },
+      "expect": {
+        "score": 48,
+        "band": "blocked",
+        "open_blockers": 0,
+        "item_codes": [
+          "major_finding",
+          "major_finding",
+          "major_finding",
+          "major_finding",
+          "weak_description"
+        ]
+      }
+    },
+    {
+      "name": "hard_blocker_changes_requested_caps_at_49",
+      "signals": {
+        "changes_requested": 1
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["changes_requested"]
+      }
+    },
+    {
+      "name": "hard_blocker_failing_check_caps_at_49",
+      "signals": {
+        "failing_checks": [
+          {"name": "pytest (ubuntu)", "url": "https://github.com/acme/repo/actions/runs/1"}
+        ]
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["failing_check"]
+      }
+    },
+    {
+      "name": "hard_blocker_critical_finding_caps_at_49",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "critical",
+            "category": "security",
+            "title": "SQL injection in search endpoint",
+            "file": "backend/search.py",
+            "start_line": 88,
+            "fingerprint": "9999999999999999",
+            "url": "https://github.com/acme/repo/pull/1#discussion_r1"
+          }
+        ]
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["critical_finding"]
+      }
+    },
+    {
+      "name": "hard_blocker_conflict_caps_at_49",
+      "signals": {
+        "has_conflicts": true
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["merge_conflict"]
+      }
+    },
+    {
+      "name": "hard_blocker_safety_flagged_caps_at_49",
+      "signals": {
+        "safety_flagged": true,
+        "safety_human_approved": false
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["safety_flagged"]
+      }
+    },
+    {
+      "name": "safety_flagged_with_human_approval_is_ready",
+      "signals": {
+        "safety_flagged": true,
+        "safety_human_approved": true,
+        "approvals": 1
+      },
+      "expect": {
+        "score": 100,
+        "band": "ready",
+        "open_blockers": 0,
+        "done_items": 1,
+        "item_codes": ["safety_flagged"]
+      }
+    },
+    {
+      "name": "hard_blocker_blocking_memory_caps_at_49",
+      "signals": {
+        "blocking_memory_violations": [
+          {"id": "mem01", "text": "Never use unwrap() in src-tauri"}
+        ]
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["blocking_memory"]
+      }
+    },
+    {
+      "name": "hard_blocker_custom_error_caps_at_49",
+      "signals": {
+        "custom_check_failures": [
+          {"name": "CHANGELOG updated", "mode": "error", "detail": "Public API changed without CHANGELOG entry"}
+        ]
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["custom_error"]
+      }
+    },
+    {
+      "name": "custom_warning_does_not_hard_block",
+      "signals": {
+        "custom_check_failures": [
+          {"name": "Linked issue", "mode": "warning", "detail": "No Fixes #N reference in body"}
+        ]
+      },
+      "expect": {
+        "score": 92,
+        "band": "ready",
+        "open_blockers": 0,
+        "item_codes": ["custom_warning"]
+      }
+    },
+    {
+      "name": "multiple_blockers_clamped_at_0",
+      "signals": {
+        "has_conflicts": true,
+        "failing_checks": [
+          {"name": "ci/test"},
+          {"name": "ci/lint"}
+        ],
+        "changes_requested": 1,
+        "open_findings": [
+          {
+            "severity": "critical",
+            "category": "security",
+            "title": "Token leak",
+            "file": "backend/main.py",
+            "start_line": 311,
+            "fingerprint": "abcdef0123456789"
+          }
+        ]
+      },
+      "expect": {
+        "score": 0,
+        "band": "blocked",
+        "open_blockers": 5,
+        "item_codes": [
+          "merge_conflict",
+          "failing_check",
+          "failing_check",
+          "critical_finding",
+          "changes_requested"
+        ]
+      }
+    },
+    {
+      "name": "custom_weight_override_still_caps_blocker_at_49",
+      "signals": {
+        "failing_checks": [{"name": "unit-tests"}]
+      },
+      "weights": {
+        "failing_check": 5
+      },
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["failing_check"]
+      }
+    },
+    {
+      "name": "custom_weight_override_non_blocker",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "perf",
+            "title": "Unbounded allocation",
+            "file": "src/app.py",
+            "start_line": 12,
+            "fingerprint": "0123456789abcdef"
+          }
+        ]
+      },
+      "weights": {
+        "major_finding": 20
+      },
+      "expect": {
+        "score": 80,
+        "band": "ready_with_nits",
+        "open_blockers": 0,
+        "item_codes": ["major_finding"]
+      }
+    },
+    {
+      "name": "resolved_findings_tick_off_with_zero_penalty",
+      "signals": {
+        "resolved_findings": [
+          {
+            "severity": "critical",
+            "category": "security",
+            "title": "Hardcoded key removed",
+            "file": "backend/auth.py",
+            "start_line": 5,
+            "fingerprint": "fedcba9876543210"
+          },
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Null check added",
+            "file": "backend/app.py",
+            "start_line": 19,
+            "fingerprint": "fedcba9876543211"
+          }
+        ]
+      },
+      "expect": {
+        "score": 100,
+        "band": "ready",
+        "open_blockers": 0,
+        "done_items": 2,
+        "item_codes": ["critical_finding", "major_finding"]
+      }
+    },
+    {
+      "name": "require_approval_missing_blocks_at_49",
+      "signals": {
+        "approvals": 0
+      },
+      "require_approval": true,
+      "expect": {
+        "score": 49,
+        "band": "blocked",
+        "open_blockers": 1,
+        "item_codes": ["missing_approval"]
+      }
+    },
+    {
+      "name": "require_approval_satisfied_is_ready",
+      "signals": {
+        "approvals": 2
+      },
+      "require_approval": true,
+      "expect": {
+        "score": 100,
+        "band": "ready",
+        "open_blockers": 0,
+        "done_items": 1,
+        "item_codes": ["missing_approval"]
+      }
+    },
+    {
+      "name": "pending_check_and_behind_base",
+      "signals": {
+        "pending_checks": [{"name": "build-windows"}],
+        "behind_by": 4,
+        "base_ref": "main"
+      },
+      "expect": {
+        "score": 90,
+        "band": "ready",
+        "open_blockers": 0,
+        "item_codes": ["pending_check", "behind_base"]
+      }
+    },
+    {
+      "name": "custom_score_threshold_demotes_ready_to_ready_with_nits",
+      "signals": {
+        "open_findings": [
+          {
+            "severity": "major",
+            "category": "bug",
+            "title": "Edge case",
+            "file": "a.py",
+            "start_line": 4,
+            "fingerprint": "1234567890abcdef"
+          }
+        ]
+      },
+      "score_threshold": 90,
+      "expect": {
+        "score": 88,
+        "band": "ready_with_nits",
+        "open_blockers": 0,
+        "item_codes": ["major_finding"]
+      }
+    }
+  ]
+}

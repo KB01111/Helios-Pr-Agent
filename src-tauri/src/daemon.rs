@@ -208,7 +208,7 @@ fn valid_id(id: &str) -> bool {
 
 /// `generation == None` (tests) means "always current".
 fn alive(inner: &Inner, generation: Option<u64>) -> bool {
-    generation.map_or(true, |g| inner.is_current(g))
+    generation.is_none_or(|g| inner.is_current(g))
 }
 
 fn handle_item(
@@ -429,12 +429,13 @@ fn show_main(app: &tauri::AppHandle) {
 /// Tray icon so the daemon keeps running after the window is closed. Failure is
 /// non-fatal (e.g. Linux without an app-indicator): the window then closes normally.
 pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem};
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-    let show = MenuItem::with_id(app, "show", "Show PR Agent Control", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Stop daemon and quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let show = MenuItem::with_id(app, "show", "Open PR Agent Control", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit PR Agent Control", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &sep, &quit])?;
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("PR Agent Control")
         .menu(&menu)
@@ -442,6 +443,7 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main(app),
             "quit" => {
+                app.state::<crate::oauth::OAuthState>().cancel_active();
                 let inner = app.state::<DaemonState>().0.clone();
                 let handle = app.clone();
                 // Stop (and tell the backend) off the UI thread, then exit.

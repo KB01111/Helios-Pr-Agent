@@ -241,42 +241,35 @@ Recommended order: **P0 → P1 → P2 → P4 → P3 → P5 → P6**. P4 is pulle
 
 ---
 
-## 8. Status check and what we actually need (added after the P0 merge)
+## 8. Status check — Shipped production capabilities
 
-**P0 is done and wired end to end.** The App is created from the desktop app, its
-credentials now go to the *cloud* backend (previously only a local `backend/.env`, which a
-deployed backend never saw), the event router records every PR event, and the backend can
-verify the App live (`GET /github-app/health`) and repair its webhook URL. Provider, model
-and keys chosen in the app are saved to the backend (`PUT /config/settings`).
+**P0, P1, P2, P4, P5 (chat + feedback loop), and desktop/edge production hardening are shipped.**
 
-Judged against what CodeRabbit and Macroscope are actually used for, in priority order:
-
-| Need | Why it matters | Verdict |
+| Capability | Status | Where |
 |---|---|---|
-| **Inline comments + committable suggestions + incremental review (P1)** | The backend still posts one free-text comment. This is the single biggest quality gap against both products and the base for everything else. | **Must have, next** |
-| **Walkthrough / PR summary (P1)** | Both products lead with it; cheap once the pipeline is structured. | **Must have** (ship with P1) |
-| **Repo memory + dismissal learning (P2)** | Your stated requirement and the main thing that keeps noise down over time. | **Must have** |
-| **Merge-readiness score and Check Run (P4)** | Your stated requirement; the App already has `checks: write`. | **Must have** |
-| Path instructions / `.pragent.yaml`, `chill`/`assertive` profile | Config fields already exist on the agent; needs the loader. | Should have (P1) |
-| Chat in PR threads (`@agent ...`) | Makes memory capture natural ("remember this"). Events are already routed. | Should have (P5, first half) |
-| Linked-issue check, a handful of linters (ruff, eslint, gitleaks, actionlint) | Real precision gains for little cost. Skip the "40+ tools" claim. | Nice to have (P3, reduced) |
-| Approvability (auto-approve low-risk PRs) | Valuable but risky; opt-in only, after the score is trusted. | Later |
-| Code graph / AST cross-file context | Macroscope's core strength and the most expensive thing to build. Not worth it before P1/P2/P4 prove out. | Later |
-| Fix-it agents, generate tests/docstrings, sequence diagrams | Polish. Needs `contents: write`, which the App deliberately does not request yet. | Later |
-| Slack/Linear/Jira digests, analytics dashboard | Team features, irrelevant for a single-user free-tier setup. | Skip for now |
+| **GitHub App + Cloud settings + Event router (P0)** | ✅ **Shipped** | `backend/github_app.py`, `backend/events.py`, `backend/runtime_settings.py`, `src-tauri/src/github_app.rs` |
+| **Native Structured Review Engine: walkthrough, inline committable suggestions, incremental `compare` diff, fingerprinting & `.pragent.yaml` (P1)** | ✅ **Shipped** | `backend/review/{config,diff,pipeline,publisher}.py`, `backend/sandboxes/providers_review.py` |
+| **Repo Memory, dismissal learning, doc bootstrap & `.pr-agent/memory.md` Actions-lite bridge (P2)** | ✅ **Shipped** | `backend/memory/service.py`, `src/pages/memory.tsx`, `src-tauri/src/autoreview.rs` (v7), `src-tauri/src/main.rs` (`github_read_repo_file`, `github_commit_repo_file`) |
+| **Merge Readiness (0–100) + Check Run / PAT status + sticky checklist + PR Inbox (P4)** | ✅ **Shipped** | `backend/merge/{signals,score,publisher}.py`, `backend/tests/merge_cases.json`, `src/pages/pr-inbox.tsx` |
+| **`@pr-agent` PR Chat & feedback loop (`remember`, `dismiss`, `resolve`, `review`, `readiness`, `ask`, `help`) (P5a)** | ✅ **Shipped** | `backend/chat.py` (with `OWNER`/`MEMBER`/`COLLABORATOR` gate, bot + self-reply loop guards) |
+| **Cloud Setup Wizard, Agent v2 UI & `.pragent.yaml` commit (P6a)** | ✅ **Shipped** | `src/pages/cloud-setup.tsx`, `src/pages/agents.tsx`, `src/lib/cloud-agent.ts` |
+| **Windows DPAPI Local Secret Vault & Desktop Packaging** | ✅ **Shipped** | `src-tauri/src/vault.rs` (`%APPDATA%\com.pragent.control\vault.bin`), `src/lib/session.ts`, `src-tauri/tauri.conf.json` |
+| **Cloudflare Worker Dual-Secret Forwarding** | ✅ **Shipped** | `cloudflare-worker/worker.js` (timing-safe HMAC-SHA256 against `GITHUB_WEBHOOK_SECRET` + `GITHUB_APP_WEBHOOK_SECRET`; all 11 GitHub App events with `x-github-event` & `x-github-delivery` preserved) |
+| Linked-issue check, sandbox linters (`ruff`, `eslint`, `gitleaks`, `actionlint`) (P3) | Planned | Future |
+| Approvability auto-approve & AST code graph (P3/P4.4) | Planned | Future |
+| Fix-it push commits / stacked PRs (P5b) | Planned | Future (kept off until `contents: write` autofix workflow ships) |
 
-**Recommended next step:** P1 (structured findings, review with inline suggestions, sticky
-summary) because P2 and P4 both consume its findings.
+### Known operational notes
 
-### Known limits of the current setup
-
-- Saving secrets to a deployed backend needs `BACKEND_API_TOKEN` set on the backend, and
-  the same token entered in the app's Settings. `SETTINGS_ENCRYPTION_KEY` is optional and
-  only changes the key used to encrypt them; it does not replace the token (without the
-  token the API is open, so the backend refuses secret writes). Redis must also be connected
-  for settings to survive a restart. The Integrations "Setup status" card flags both.
-- The App cannot toggle its own webhook *active* flag through the API. The app therefore
-  refuses to create an App without a public base URL, and "Fix webhook URL" only repoints
-  the URL/secret.
-- The Cloudflare worker still takes `GITHUB_APP_WEBHOOK_SECRET` from its own secrets; it is
-  not synced from the backend.
+- Saving secrets to a deployed backend needs `BACKEND_API_TOKEN` set on the backend (which
+  also fails closed on unsigned webhooks unless `ALLOW_UNSIGNED_WEBHOOKS=1`) and Redis
+  connected so settings, memory, findings, and readiness reports survive restarts. On
+  Windows, opting in to **Remember securely on this PC** stores `BACKEND_API_TOKEN` (and
+  optional desktop tokens) encrypted with current-user Windows DPAPI in
+  `%APPDATA%\com.pragent.control\vault.bin`.
+- GitHub's API cannot toggle an App's webhook *active* flag after creation; the wizard
+  therefore checks for a public HTTPS base URL before creating the App, and **Fix webhook
+  URL** repoints the URL/secret on existing Apps.
+- If using the Cloudflare Worker in front of a GitHub App, set `GITHUB_APP_WEBHOOK_SECRET`
+  via `wrangler secret put` to match the App's webhook secret (alongside
+  `GITHUB_WEBHOOK_SECRET` if legacy repo webhooks are also active).

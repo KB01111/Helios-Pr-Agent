@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -29,7 +30,7 @@ from typing import Any, Literal
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Load local .env files before importing store: store snapshots the Redis env
 # vars at import time. Real process env always wins over file values, and
@@ -58,19 +59,36 @@ except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo r
     from backend import decision_flow as decision_flow  # type: ignore[no-redef]
 
 try:
+    import chat as chat_mod  # @pr-agent PR thread commands & Q&A
+    import datamodel as dm
     import events  # GitHub event router (non-review events, activity log)
     import github_app
+    import memory as memory_mod  # repo-specific memory & dismissal learning
+    import merge as merge_mod  # merge-readiness scorer, publisher & PR inbox
+    import review as review_mod  # structured multi-pass review engine
     import runtime_settings  # provider/model/keys saved from the desktop app (cloud, Redis-backed)
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
+    from backend import chat as chat_mod  # type: ignore[no-redef]
+    from backend import datamodel as dm  # type: ignore[no-redef]
     from backend import events as events  # type: ignore[no-redef]
     from backend import github_app as github_app  # type: ignore[no-redef]
+    from backend import memory as memory_mod  # type: ignore[no-redef]
+    from backend import merge as merge_mod  # type: ignore[no-redef]
+    from backend import review as review_mod  # type: ignore[no-redef]
     from backend import runtime_settings as runtime_settings  # type: ignore[no-redef]
 
 try:
-    from sandboxes.providers_review import LLM_PROVIDERS, llm_key_for, normalize_openrouter_model, resolve_llm_provider
+    from sandboxes.providers_review import (
+        LLM_PROVIDERS,
+        ReviewOnlyProvider,
+        llm_key_for,
+        normalize_openrouter_model,
+        resolve_llm_provider,
+    )
 except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo root
     from backend.sandboxes.providers_review import (  # type: ignore[no-redef]
         LLM_PROVIDERS,
+        ReviewOnlyProvider,
         llm_key_for,
         normalize_openrouter_model,
         resolve_llm_provider,
@@ -133,19 +151,19 @@ def _auth_ok(request: Request, *, allow_query_token: bool = False) -> bool:
 
 
 _STREAM_TICKET_TTL_S = 60
-_stream_tickets: dict[str, float] = {}
-_stream_ticket_lock = threading.Lock()
+_STREAM_TICKET_RE = re.compile(r"^[0-9a-f]{32,128}$")
+_MAX_WEBHOOK_BODY_BYTES = 5 * 1024 * 1024
+
+
+def _stream_ticket_key(ticket: str) -> str:
+    return f"streamticket:{ticket}"
 
 
 def _consume_stream_ticket(ticket: str) -> bool:
-    if not ticket:
+    if not ticket or not _STREAM_TICKET_RE.fullmatch(ticket):
         return False
-    now = time.monotonic()
-    with _stream_ticket_lock:
-        for k in [k for k, exp in _stream_tickets.items() if exp < now]:
-            _stream_tickets.pop(k, None)
-        exp = _stream_tickets.pop(ticket, None)
-    return exp is not None and exp >= now
+    # Atomic single-use consume in Redis / shared store (multi-worker safe).
+    return store.rdelete(_stream_ticket_key(ticket)) > 0
 
 
 def _require_auth(request: Request) -> None:
@@ -203,6 +221,12 @@ class PathInstruction(BaseModel):
 
 
 _TOOL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_MEM_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _valid_agent_id(value: str) -> bool:
+    return bool(_AGENT_ID_RE.fullmatch(value)) and value not in (".", "..") and ".." not in value
 
 # Agent settings added for the review engine, repo memory and merge readiness.
 # Agents stored before they existed read back with these defaults.
@@ -242,6 +266,12 @@ class AgentConfig(BaseModel):
         default="suggest", description="suggest = suggestion blocks only; stacked = fix PR; push = commit to the PR branch")
 
     @model_validator(mode="after")
+    def _valid_id(self):
+        if self.id and not _valid_agent_id(self.id):
+            raise ValueError("agent id must match ^[A-Za-z0-9_.-]{1,80}$ and cannot contain '..'")
+        return self
+
+    @model_validator(mode="after")
     def _require_trigger_label(self):
         if self.trigger == "on_label" and not (self.trigger_label or "").strip():
             raise ValueError("trigger_label is required when trigger is on_label")
@@ -272,6 +302,11 @@ class PRContext(BaseModel):
     label: str | None = None
     title: str = ""
     head_ref: str = ""
+    base_ref: str = ""
+    base_sha: str = ""
+    body: str = ""
+    draft: bool = False
+    force_full: bool = False
 
 
 class ApproveBody(BaseModel):
@@ -279,10 +314,40 @@ class ApproveBody(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# App
+# App (lifespan cleanly cancels background tasks on shutdown)
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="PR-Agent Cloud Backend", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    # Import the router once up front: concurrent first-time imports from
+    # worker threads can hit Python's import-lock deadlock detection.
+    try:
+        try:
+            import sandboxes.router  # noqa: F401  (cwd=backend)
+        except ImportError:
+            import backend.sandboxes.router  # type: ignore[no-redef]  # noqa: F401
+    except Exception as exc:
+        log.warning("router preload failed: %s", exc)
+    await asyncio.to_thread(runtime_settings.refresh, True)
+    _reap_stale_queued_runs()
+    try:  # restore open-evaluation markers lost to a crash (or predating the index)
+        await asyncio.to_thread(store.eval_reindex)
+    except Exception as exc:
+        log.warning("evaluation reindex failed: %s", exc)
+    reap_task = asyncio.create_task(_reap_loop())
+    application.state.reap_task = reap_task
+    try:
+        yield
+    finally:
+        reap_task.cancel()
+        try:
+            await reap_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="PR-Agent Cloud Backend", version="0.2.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -309,14 +374,26 @@ def _webhook_secrets() -> list[str]:
     return [s for s in (_get_webhook_secret(), app_secret) if s]
 
 
+def _allow_unsigned_webhooks() -> bool:
+    return os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "").strip().lower() in ("1", "true", "yes")
+
+
 def _verify_signature(raw: bytes, signature: str | None) -> bool:
-    """Verify X-Hub-Signature-256. Dev mode (no secret) accepts with warning."""
+    """Verify X-Hub-Signature-256.
+
+    Fails closed whenever a webhook secret is unreadable OR when
+    ``BACKEND_API_TOKEN`` is configured in production (unless explicitly opted
+    in via ``ALLOW_UNSIGNED_WEBHOOKS=1`` for local development).
+    """
     secrets = _webhook_secrets()
     if not secrets and runtime_settings.webhook_secret_locked():
         # A secret is stored but cannot be decrypted: never fall back to accepting unsigned.
         log.error("webhook: stored webhook secret is unreadable; rejecting until it is re-saved")
         return False
     if not secrets:
+        if _get_api_token() and not _allow_unsigned_webhooks():
+            log.error("webhook: BACKEND_API_TOKEN is set without a webhook secret; rejecting unsigned delivery")
+            return False
         log.warning("webhook: no GITHUB_WEBHOOK_SECRET set — accepting unsigned (dev mode)")
         return True
     if not signature:
@@ -326,6 +403,27 @@ def _verify_signature(raw: bytes, signature: str | None) -> bool:
         mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
         ok = _constant_time_equal(f"sha256={mac}", signature) or ok
     return ok
+
+
+async def _read_bounded_body(request: Request, max_bytes: int = _MAX_WEBHOOK_BODY_BYTES) -> bytes:
+    """Read request body capped at ``max_bytes`` (5 MiB) to prevent memory exhaustion."""
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > max_bytes:
+                raise HTTPException(status_code=413, detail="webhook payload exceeds 5 MiB limit")
+        except ValueError:
+            pass
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail="webhook payload exceeds 5 MiB limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _agent_matches(agent: dict[str, Any], repo: str, action: str, label: str | None) -> bool:
@@ -361,6 +459,8 @@ def _comment_trigger_target(
     if assoc not in _COMMENT_ASSOC_ALLOWED:
         return None
     body_text = str(comment.get("body") or "")
+    if chat_mod.SELF_MARKER_PREFIX in body_text or "<!-- pr-agent-finding:" in body_text:
+        return None
     if not res.get("mentions_agent") and not _REVIEW_CMD_RE.match(body_text):
         return None
     repository = payload.get("repository") if isinstance(payload.get("repository"), dict) else {}
@@ -454,6 +554,422 @@ async def _handle_issue_comment_trigger(
         except Exception as exc:
             log.warning("could not release delivery=%s after comment trigger failure: %s", delivery, exc)
         raise
+
+
+_READINESS_DEBOUNCE_S = 12
+
+
+async def _find_repo_agent(repo: str) -> dict[str, Any] | None:
+    """Return the first enabled agent config targeting ``repo`` (normalized to v2), or None."""
+    try:
+        keys = await store.arkeys(_AGENT_KEY_PATTERN)
+        configs = await store.arget_json_many(keys)
+    except Exception:
+        return None
+    for cfg in configs:
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False:
+            continue
+        targets = cfg.get("target_repos") or []
+        if not targets or repo in targets or "*" in targets:
+            return _agent_v2(cfg)
+    return None
+
+
+async def _effective_readiness_config(
+    repo: str, agent_cfg: dict[str, Any] | None = None, base_ref: str = ""
+) -> dict[str, Any]:
+    """Merge the repo's agent v2 config with cached or base-branch `.pragent.yaml`."""
+    base_agent = (
+        _agent_v2(agent_cfg)
+        if isinstance(agent_cfg, dict)
+        else (await _find_repo_agent(repo) or dict(AGENT_V2_DEFAULTS))
+    )
+    repo_cfg: review_mod.RepoConfig | None = None
+    try:
+        cached = await store.arget_json(dm.repo_config_key(repo))
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("config"), dict)
+            and (not base_ref or cached.get("ref") == base_ref)
+        ):
+            repo_cfg = review_mod.RepoConfig.model_validate(cached["config"])
+        elif github_app.auth_mode() != "none":
+            token, _ = await github_app.token_for_repo(repo)
+            if token:
+                target_ref = base_ref or (cached.get("ref") if isinstance(cached, dict) else "") or "main"
+                repo_cfg = await review_mod.load_repo_config(repo, str(target_ref), token)
+    except Exception as exc:
+        log.debug("readiness repo config merge skipped for %s (%s)", repo, type(exc).__name__)
+    return review_mod.merge_agent_and_repo_config(base_agent, repo_cfg)
+
+
+async def _bg_recompute_readiness(repo: str, pr_number: int) -> None:
+    """Best-effort background merge-readiness recomputation for one PR."""
+    try:
+        merged_cfg = await _effective_readiness_config(repo)
+        raw_weights = merged_cfg.get("weights")
+        weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
+        await merge_mod.recompute_pr_readiness(
+            repo, pr_number, agent_config=merged_cfg, weights=weights
+        )
+    except Exception as exc:
+        log.warning("readiness recompute failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+
+
+async def _schedule_readiness_recompute(
+    repo: str, pr_number: int, tasks: BackgroundTasks | None = None
+) -> bool:
+    """Schedule a debounced background merge-readiness recompute when GitHub auth is available."""
+    if not dm.valid_repo(repo) or pr_number <= 0:
+        return False
+    if github_app.auth_mode() == "none":
+        return False
+    debounce_key = f"readinessdebounce:{repo.lower()}:{int(pr_number)}"
+    if not await store.arset(debounce_key, "1", ex=_READINESS_DEBOUNCE_S, nx=True):
+        return False
+    if tasks is not None:
+        tasks.add_task(_bg_recompute_readiness, repo, int(pr_number))
+    else:
+        asyncio.create_task(_bg_recompute_readiness(repo, int(pr_number)))
+    return True
+
+
+async def _sweep_dirty_prs() -> None:
+    """Background sweeper for PRs marked dirty (`prdirty:{repo}:{pr}`) that missed immediate recompute."""
+    if github_app.auth_mode() == "none":
+        return
+    try:
+        keys = await store.arkeys("prdirty:*")
+    except Exception as exc:
+        log.warning("dirty PR sweep could not list keys: %s", exc)
+        return
+    for key in keys[:20]:
+        rest = key[len("prdirty:"):]
+        if ":" not in rest:
+            continue
+        repo, raw_pr = rest.rsplit(":", 1)
+        try:
+            pr_number = int(raw_pr)
+        except ValueError:
+            continue
+        if not dm.valid_repo(repo) or pr_number <= 0:
+            continue
+        debounce_key = f"readinessdebounce:{repo.lower()}:{pr_number}"
+        if await store.arset(debounce_key, "1", ex=_READINESS_DEBOUNCE_S, nx=True):
+            await _bg_recompute_readiness(repo, pr_number)
+
+
+async def _fetch_pr_comments_for_learning(repo: str, pr_number: int) -> list[dict[str, Any]]:
+    """Best-effort fetch of PR issue & review comments for merged-PR learning extraction."""
+    import httpx
+
+    token, _ = await github_app.token_for_repo(repo)
+    if not token:
+        return []
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    out: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for url in (
+                f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+                f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments",
+            ):
+                resp = await client.get(url, headers=headers, params={"per_page": 100})
+                if resp.status_code != 200:
+                    continue
+                batch = resp.json()
+                if not isinstance(batch, list):
+                    continue
+                for c in batch:
+                    if not isinstance(c, dict):
+                        continue
+                    user = c.get("user") if isinstance(c.get("user"), dict) else {}
+                    if str(user.get("type") or "") == "Bot":
+                        continue
+                    assoc = str(c.get("author_association") or "").strip().upper()
+                    if assoc not in _COMMENT_ASSOC_ALLOWED:
+                        continue
+                    body_text = str(c.get("body") or "")
+                    if (
+                        chat_mod.SELF_MARKER_PREFIX in body_text
+                        or "<!-- pr-agent-finding:" in body_text
+                    ):
+                        continue
+                    out.append({
+                        "body": body_text,
+                        "path": str(c.get("path") or ""),
+                        "author": str(user.get("login") or ""),
+                        "association": assoc,
+                    })
+    except Exception as exc:
+        log.warning("merged PR comment fetch failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+    return out
+
+
+async def _bg_extract_merged_learnings(
+    repo: str, pr_number: int, base_ref: str, agent_cfg: dict[str, Any] | None
+) -> None:
+    """Extract candidate repo learnings from a merged PR's review conversation."""
+    try:
+        if agent_cfg and agent_cfg.get("memory_enabled") is False:
+            return
+        auto_approve = False
+        token, _ = await github_app.token_for_repo(repo)
+        if token and base_ref:
+            repo_cfg = await review_mod.load_repo_config(repo, base_ref, token)
+            merged_cfg = review_mod.merge_agent_and_repo_config(agent_cfg or {}, repo_cfg)
+            if not merged_cfg.get("memory_enabled", True):
+                return
+            auto_approve = bool((merged_cfg.get("memory") or {}).get("auto_approve", False))
+        comments = await _fetch_pr_comments_for_learning(repo, pr_number)
+        if not comments:
+            comments = events.pr_activity(repo, pr_number, limit=100)
+        if comments:
+            await asyncio.to_thread(
+                memory_mod.extract_learnings_from_merged_pr,
+                repo,
+                pr_number,
+                comments,
+                auto_approve=auto_approve,
+            )
+    except Exception as exc:
+        log.warning("merged PR learning extraction failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+
+
+async def _drafts_allowed_for_repo(repo: str, base_ref: str) -> bool:
+    """Consult cached or base-branch `.pragent.yaml` `auto_review.drafts` (defaults to False)."""
+    if not dm.valid_repo(repo):
+        return False
+    try:
+        cached = await store.arget_json(dm.repo_config_key(repo))
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("config"), dict)
+            and (not base_ref or cached.get("ref") == base_ref)
+        ):
+            ar = cached["config"].get("auto_review")
+            if isinstance(ar, dict) and "drafts" in ar:
+                return bool(ar["drafts"])
+        if base_ref and github_app.auth_mode() != "none":
+            token, _ = await github_app.token_for_repo(repo)
+            if token:
+                rc = await review_mod.load_repo_config(repo, base_ref, token)
+                return bool(rc.auto_review.drafts)
+    except Exception as exc:
+        log.debug("draft config lookup failed for %s (%s)", repo, type(exc).__name__)
+    return False
+
+
+async def _run_manual_review_for_pr(
+    repo: str,
+    pr_number: int,
+    *,
+    force_full: bool = False,
+    agent_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the structured review engine + readiness recompute inline and persist a run record."""
+    cfg = _agent_v2(agent_cfg) if isinstance(agent_cfg, dict) else (await _find_repo_agent(repo) or _agent_v2({
+        "id": "manual",
+        "name": "PR Agent",
+        "runtime_mode": "review_only",
+    }))
+    run_id = _new_id("rev-")
+    now = _now_iso()
+    record: dict[str, Any] = {
+        "run_id": run_id,
+        "agent_id": cfg.get("id") or "manual",
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "sha": "",
+        "action": "manual",
+        "status": "running",
+        "created_at": now,
+        "started_at": now,
+        "logs": [],
+    }
+    await store.arset_json(f"run:{run_id}", record)
+    pr_ctx = {
+        "repo": repo,
+        "pr_number": int(pr_number),
+        "sha": "",
+        "action": "manual",
+        "force_full": bool(force_full),
+    }
+    try:
+        result = await ReviewOnlyProvider().run(cfg, pr_ctx)
+    except Exception as exc:
+        log.exception("manual review failed for %s#%d: %s", repo, pr_number, exc)
+        record.update({
+            "status": "failed",
+            "finished_at": _now_iso(),
+            "logs": [f"ERROR: {type(exc).__name__}: {exc}"],
+        })
+        await store.arset_json(f"run:{run_id}", record)
+        return {
+            "status": "failed",
+            "run_id": run_id,
+            "review_posted": False,
+            "pr_comment_posted": False,
+            "findings_count": 0,
+            "walkthrough": None,
+            "summary": None,
+            "readiness": None,
+            "logs": f"ERROR: {type(exc).__name__}",
+        }
+
+    result_logs = result.get("logs") if isinstance(result.get("logs"), list) else []
+    new_or_all = result.get("new_findings") if isinstance(result.get("new_findings"), list) else (
+        result.get("findings") if isinstance(result.get("findings"), list) else []
+    )
+    walkthrough = result.get("walkthrough") if isinstance(result.get("walkthrough"), dict) else None
+    readiness = result.get("readiness") if isinstance(result.get("readiness"), dict) else None
+    record.update({
+        "status": result.get("status", "completed"),
+        "provider": result.get("provider", "review_only"),
+        "sha": str(result.get("last_reviewed_sha") or ""),
+        "diff": result.get("diff"),
+        "cpu_seconds": float(result.get("cpu_seconds") or 0.0),
+        "pr_comment_posted": bool(result.get("pr_comment_posted", False)),
+        "review_posted": bool(result.get("review_posted", False)),
+        "findings_count": len(new_or_all),
+        "walkthrough": walkthrough,
+        "readiness": readiness,
+        "finished_at": _now_iso(),
+        "logs": [str(item) for item in result_logs],
+    })
+    await store.arset_json(f"run:{run_id}", record)
+    return {
+        "status": record["status"],
+        "run_id": run_id,
+        "review_posted": record["review_posted"],
+        "pr_comment_posted": record["pr_comment_posted"],
+        "findings_count": record["findings_count"],
+        "walkthrough": walkthrough,
+        "summary": walkthrough.get("summary") if walkthrough else None,
+        "readiness": readiness,
+        "logs": "\n".join(str(item) for item in result_logs),
+    }
+
+
+async def _bg_handle_chat_mention(
+    repo: str,
+    pr_number: int,
+    *,
+    body: str,
+    author: str,
+    association: str,
+    comment_id: int,
+    path: str,
+    in_reply_to: int | None,
+    is_review_comment: bool,
+    sender_is_bot: bool,
+    agent_cfg: dict[str, Any],
+) -> None:
+    """Execute `@pr-agent` mention handling in the background."""
+    async def _trigger_review(r: str, pr_n: int) -> dict[str, Any]:
+        return await _run_manual_review_for_pr(r, pr_n, force_full=True, agent_cfg=agent_cfg)
+
+    async def _recompute_readiness(r: str, pr_n: int) -> dict[str, Any] | None:
+        merged_cfg = await _effective_readiness_config(r, agent_cfg)
+        raw_weights = merged_cfg.get("weights")
+        weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
+        out = await merge_mod.recompute_pr_readiness(r, pr_n, agent_config=merged_cfg, weights=weights)
+        return out.get("report") if isinstance(out, dict) else None
+
+    try:
+        await chat_mod.handle_pr_mention(
+            repo,
+            pr_number,
+            body=body,
+            author=author,
+            association=association,
+            comment_id=comment_id,
+            path=path,
+            in_reply_to=in_reply_to,
+            is_review_comment=is_review_comment,
+            sender_is_bot=sender_is_bot,
+            trigger_review_fn=_trigger_review,
+            recompute_readiness_fn=_recompute_readiness,
+        )
+    except Exception as exc:
+        log.warning("chat mention handler failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+
+
+async def _handle_chat_mention(
+    event: str, payload: dict[str, Any], res: dict[str, Any], tasks: BackgroundTasks
+) -> dict[str, Any]:
+    """Route `@pr-agent` / `@<app-slug>` mentions on issue or review comments to `chat.handle_pr_mention`."""
+    if not (res.get("recorded") and res.get("action") == "created") or res.get("duplicate"):
+        return res
+    repository = payload.get("repository") if isinstance(payload.get("repository"), dict) else {}
+    repo = str(repository.get("full_name") or "")
+    if not dm.valid_repo(repo):
+        return res
+    is_review_comment = event == "pull_request_review_comment"
+    if is_review_comment:
+        pr_obj = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
+        pr_number = int(pr_obj.get("number") or 0)
+    else:
+        issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
+        pr_number = int(issue.get("number") or 0)
+    if pr_number <= 0:
+        return res
+
+    comment = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+    assoc = str(comment.get("author_association") or "").upper()
+    if assoc not in _COMMENT_ASSOC_ALLOWED:
+        return res
+
+    agent_keys = await store.arkeys(_AGENT_KEY_PATTERN)
+    agent_configs = await store.arget_json_many(agent_keys)
+    matched = _match_comment_agents(agent_configs, repo)
+    if not matched:
+        return {**res, "chat_skipped": "no-chat-enabled-agent"}
+
+    sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+    user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+    sender_is_bot = str(sender.get("type") or "") == "Bot" or str(user.get("type") or "") == "Bot"
+    if sender_is_bot:
+        return {**res, "chat_skipped": "bot"}
+
+    body_text = str(comment.get("body") or "")
+    if (
+        chat_mod.SELF_MARKER_PREFIX in body_text
+        or "<!-- pr-agent-finding:" in body_text
+    ):
+        return {**res, "chat_skipped": "self_reply"}
+
+    author = str(user.get("login") or sender.get("login") or "")
+    try:
+        comment_id = int(comment.get("id") or 0)
+    except (TypeError, ValueError):
+        comment_id = 0
+    raw_reply = comment.get("in_reply_to_id")
+    try:
+        in_reply_to = int(raw_reply) if raw_reply else None
+    except (TypeError, ValueError):
+        in_reply_to = None
+    path = str(comment.get("path") or "") if is_review_comment else ""
+
+    tasks.add_task(
+        _bg_handle_chat_mention,
+        repo,
+        pr_number,
+        body=body_text,
+        author=author,
+        association=assoc,
+        comment_id=comment_id,
+        path=path,
+        in_reply_to=in_reply_to,
+        is_review_comment=is_review_comment,
+        sender_is_bot=sender_is_bot,
+        agent_cfg=_agent_v2(matched[0]),
+    )
+    return {**res, "chat_queued": True}
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +1099,12 @@ def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> 
         if not isinstance(current_logs, list):
             current_logs = []
 
-        patch = {
+        new_or_all_findings = (
+            result.get("new_findings")
+            if isinstance(result.get("new_findings"), list)
+            else (result.get("findings") if isinstance(result.get("findings"), list) else [])
+        )
+        patch: dict[str, Any] = {
             # NOTE: quota is incremented inside SandboxRouter only for real
             # sandbox runs (status == "completed") — never here, so failures,
             # retries, and review fallbacks don't burn quota.
@@ -591,9 +1112,16 @@ def dispatch_run(agent_cfg: dict[str, Any], pr: dict[str, Any], run_id: str) -> 
             "provider": result.get("provider", agent_cfg.get("runtime_mode", "review_only")),
             "diff": result.get("diff"),
             "cpu_seconds": result.get("cpu_seconds", 0),
+            "pr_comment_posted": bool(result.get("pr_comment_posted", False)),
+            "review_posted": bool(result.get("review_posted", False)),
+            "findings_count": len(new_or_all_findings),
             "finished_at": _now_iso(),
             "logs": [str(item) for item in current_logs + result_logs],
         }
+        if isinstance(result.get("walkthrough"), dict):
+            patch["walkthrough"] = result["walkthrough"]
+        if isinstance(result.get("readiness"), dict):
+            patch["readiness"] = result["readiness"]
         current.update(patch)
         store.rset_json(f"run:{run_id}", current)
         log.info("dispatch run=%s finished status=%s", run_id, patch["status"])
@@ -665,26 +1193,10 @@ async def _reap_loop() -> None:
             await decision_flow.sweep()
         except Exception as exc:
             log.warning("decision sweep failed: %s", exc)
-
-
-@app.on_event("startup")
-async def _startup_reap() -> None:
-    # Import the router once up front: concurrent first-time imports from
-    # worker threads can hit Python's import-lock deadlock detection.
-    try:
-        try:
-            import sandboxes.router  # noqa: F401  (cwd=backend)
-        except ImportError:
-            import backend.sandboxes.router  # type: ignore[no-redef]  # noqa: F401
-    except Exception as exc:
-        log.warning("router preload failed: %s", exc)
-    await asyncio.to_thread(runtime_settings.refresh, True)
-    _reap_stale_queued_runs()
-    try:  # restore open-evaluation markers lost to a crash (or predating the index)
-        await asyncio.to_thread(store.eval_reindex)
-    except Exception as exc:
-        log.warning("evaluation reindex failed: %s", exc)
-    app.state.reap_task = asyncio.create_task(_reap_loop())
+        try:  # catch any dirty PRs whose readiness recompute was deferred/debounced
+            await _sweep_dirty_prs()
+        except Exception as exc:
+            log.warning("dirty PR readiness sweep failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +1206,7 @@ async def _startup_reap() -> None:
 
 @app.post("/webhooks/github", status_code=202)
 async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONResponse:
-    raw = await request.body()
+    raw = await _read_bounded_body(request)
     sig = request.headers.get("X-Hub-Signature-256")
     # Webhook secrets and App credentials may live in the cloud settings.
     await asyncio.to_thread(runtime_settings.refresh)
@@ -717,7 +1229,19 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         # by the event router (activity log, readiness marker, installations).
         res = await events.route(event, payload, delivery)
         if event == "issue_comment":
-            res = await _handle_issue_comment_trigger(payload, res, delivery, tasks)
+            if res.get("mentions_agent") and res.get("action") == "created" and not res.get("duplicate"):
+                res = await _handle_chat_mention(event, payload, res, tasks)
+            else:
+                res = await _handle_issue_comment_trigger(payload, res, delivery, tasks)
+        elif event == "pull_request_review_comment":
+            if res.get("mentions_agent") and res.get("action") == "created" and not res.get("duplicate"):
+                res = await _handle_chat_mention(event, payload, res, tasks)
+        elif event in ("check_suite", "check_run", "status", "pull_request_review", "pull_request_review_thread"):
+            if res.get("recorded", 0) > 0 and not res.get("duplicate"):
+                repo_obj = payload.get("repository")
+                repo_ev = str(repo_obj.get("full_name") or "") if isinstance(repo_obj, dict) else ""
+                for pr_num in res.get("prs") or []:
+                    await _schedule_readiness_recompute(repo_ev, int(pr_num), tasks)
         return JSONResponse(res, status_code=202)
 
     pr = payload.get("pull_request")
@@ -736,17 +1260,46 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         except Exception as exc:
             log.warning("webhook: activity recording failed (%s)", type(exc).__name__)
 
+    if isinstance(pr, dict) and action == "closed" and dm.valid_repo(repo_raw):
+        try:
+            closed_pr_num = int(pr.get("number") or 0)
+        except (TypeError, ValueError):
+            closed_pr_num = 0
+        if closed_pr_num > 0:
+            merged = bool(pr.get("merged"))
+            try:
+                await asyncio.to_thread(merge_mod.mark_pr_closed, repo_raw, closed_pr_num, merged=merged)
+            except Exception as exc:
+                log.warning("webhook: mark_pr_closed failed for %s#%d (%s)", repo_raw, closed_pr_num, type(exc).__name__)
+            if merged:
+                base_obj_closed = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+                base_ref_closed = str(base_obj_closed.get("ref") or "")
+                repo_agent = await _find_repo_agent(repo_raw)
+                if repo_agent is None or repo_agent.get("memory_enabled", True):
+                    tasks.add_task(_bg_extract_merged_learnings, repo_raw, closed_pr_num, base_ref_closed, repo_agent)
+
     sender = payload.get("sender")
     if isinstance(sender, dict) and sender.get("type") == "Bot":
         return JSONResponse({"skipped": "bot"}, status_code=202)
 
     if isinstance(pr, dict) and pr.get("draft") is True and action in ("opened", "reopened", "synchronize"):
-        draft_body: dict[str, Any] = {"skipped": "draft"}
-        if activity.get("recorded"):
-            draft_body["recorded"] = activity["recorded"]
-        return JSONResponse(draft_body, status_code=202)
+        base_obj_draft = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+        base_ref_draft = str(base_obj_draft.get("ref") or "")
+        if not await _drafts_allowed_for_repo(repo_raw, base_ref_draft):
+            draft_body: dict[str, Any] = {"skipped": "draft"}
+            if activity.get("recorded"):
+                draft_body["recorded"] = activity["recorded"]
+            return JSONResponse(draft_body, status_code=202)
 
     if not isinstance(pr, dict) or not pr or action not in VALID_PR_ACTIONS:
+        if (
+            isinstance(pr, dict)
+            and action != "closed"
+            and dm.valid_repo(repo_raw)
+            and activity.get("recorded")
+        ):
+            for pr_num in activity.get("prs") or []:
+                await _schedule_readiness_recompute(repo_raw, int(pr_num), tasks)
         body: dict[str, Any] = {"skipped": action or "no-pull_request"}
         if activity.get("recorded"):
             body["recorded"] = activity["recorded"]
@@ -764,7 +1317,14 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     sha = sha if isinstance(sha, str) else ""
     head_ref = (head.get("ref") if isinstance(head, dict) else "") or ""
     head_ref = head_ref if isinstance(head_ref, str) else ""
+    base = pr.get("base")
+    base_ref = (base.get("ref") if isinstance(base, dict) else "") or ""
+    base_ref = base_ref if isinstance(base_ref, str) else ""
+    base_sha = (base.get("sha") if isinstance(base, dict) else "") or ""
+    base_sha = base_sha if isinstance(base_sha, str) else ""
     title = pr.get("title") if isinstance(pr.get("title"), str) else ""
+    pr_body = pr.get("body") if isinstance(pr.get("body"), str) else ""
+    pr_draft = bool(pr.get("draft", False))
     label_obj = payload.get("label")
     label = (label_obj.get("name") if isinstance(label_obj, dict) else None) if action == "labeled" else None
     label = label if isinstance(label, str) and label else None
@@ -793,8 +1353,19 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     # to continue with the legacy flow below (labeled events, layer disabled, or
     # PR files unavailable).
     gate = await decision_flow.gate_webhook(
-        {"repo": repo, "pr_number": pr_number, "sha": sha, "action": action,
-         "label": label, "title": title, "head_ref": head_ref},
+        {
+            "repo": repo,
+            "pr_number": pr_number,
+            "sha": sha,
+            "action": action,
+            "label": label,
+            "title": title,
+            "head_ref": head_ref,
+            "base_ref": base_ref,
+            "base_sha": base_sha,
+            "body": pr_body,
+            "draft": pr_draft,
+        },
         matched,
     )
     if gate is not None:
@@ -823,6 +1394,10 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
         label=label,
         title=title,
         head_ref=head_ref,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        body=pr_body,
+        draft=pr_draft,
     )
     run_ids: list[str] = []
     try:
@@ -953,6 +1528,8 @@ def list_agents(request: Request) -> list[dict[str, Any]]:
 @app.get("/agents/{agent_id}")
 def get_agent(agent_id: str, request: Request) -> dict[str, Any]:
     _require_auth(request)
+    if not _valid_agent_id(agent_id):
+        raise HTTPException(status_code=400, detail="invalid agent id")
     cfg = store.rget_json(f"agent:{agent_id}")
     if not isinstance(cfg, dict):
         raise HTTPException(status_code=404, detail="agent not found")
@@ -962,6 +1539,8 @@ def get_agent(agent_id: str, request: Request) -> dict[str, Any]:
 @app.put("/agents/{agent_id}")
 def update_agent(agent_id: str, agent: AgentConfig, request: Request) -> dict[str, Any]:
     _require_auth(request)
+    if not _valid_agent_id(agent_id):
+        raise HTTPException(status_code=400, detail="invalid agent id")
     existing = store.rget_json(f"agent:{agent_id}")
     if not isinstance(existing, dict):
         raise HTTPException(status_code=404, detail="agent not found")
@@ -979,6 +1558,8 @@ def update_agent(agent_id: str, agent: AgentConfig, request: Request) -> dict[st
 @app.delete("/agents/{agent_id}")
 def delete_agent(agent_id: str, request: Request) -> dict[str, Any]:
     _require_auth(request)
+    if not _valid_agent_id(agent_id):
+        raise HTTPException(status_code=400, detail="invalid agent id")
     if store.rdelete(f"agent:{agent_id}") == 0:
         # Memory fallback returns 1/0; SDK/REST path too. Missing -> 404.
         if not isinstance(store.rget_json(f"agent:{agent_id}"), dict):
@@ -1133,6 +1714,8 @@ async def _test_github_app() -> dict[str, Any]:
             resp = await client.get("https://api.github.com/app", headers=headers)
         if resp.status_code == 200:
             data = resp.json() or {}
+            if data.get("slug"):
+                github_app.remember_app_slug(data.get("slug"))
             return {
                 "configured": True, "ok": True, "slug": data.get("slug"),
                 "installations": data.get("installations_count"),
@@ -1508,13 +2091,10 @@ async def config_test(body: ConfigTestBody, request: Request) -> dict[str, Any]:
 
 @app.post("/events/ticket")
 def events_ticket(request: Request) -> dict[str, Any]:
-    """Mint a 60s single-use ticket for EventSource (which cannot send headers)."""
+    """Mint a 60s single-use ticket in Redis for EventSource (multi-worker safe)."""
     _require_auth(request)
     ticket = uuid.uuid4().hex + uuid.uuid4().hex
-    with _stream_ticket_lock:
-        if len(_stream_tickets) > 1000:
-            _stream_tickets.clear()
-        _stream_tickets[ticket] = time.monotonic() + _STREAM_TICKET_TTL_S
+    store.rset(_stream_ticket_key(ticket), "1", ex=_STREAM_TICKET_TTL_S)
     return {"ticket": ticket, "expires_in": _STREAM_TICKET_TTL_S}
 
 
@@ -1635,6 +2215,328 @@ def health() -> dict[str, Any]:
 @app.get("/")
 def root() -> dict[str, Any]:
     return {"ok": True, "service": "pr-agent-backend", "docs": "/docs"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 / 2 / 4 REST API: Repo Memory, PR Inbox, Readiness, Findings, Review & Config
+# ---------------------------------------------------------------------------
+
+
+def _require_repo(owner: str, name: str) -> str:
+    repo = f"{owner}/{name}"
+    if not dm.valid_repo(repo):
+        raise HTTPException(status_code=400, detail="invalid repository name")
+    return repo
+
+
+def _require_pr_number(pr_number: int) -> int:
+    if pr_number <= 0:
+        raise HTTPException(status_code=400, detail="invalid pr_number")
+    return int(pr_number)
+
+
+def _require_mem_id(mem_id: str) -> str:
+    if not _MEM_ID_RE.fullmatch(mem_id) or mem_id in (".", "..") or ".." in mem_id:
+        raise HTTPException(status_code=400, detail="invalid memory id")
+    return mem_id
+
+
+class MemoryCreateBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str | None = Field(default=None, description="Forbidden on create; auto-generated by server")
+    kind: dm.MemoryKind = "learning"
+    text: str = Field(min_length=1, max_length=dm.MEMORY_TEXT_MAX)
+    scope_globs: list[str] = Field(default_factory=lambda: ["**"], max_length=20)
+    blocking: bool = False
+    status: Literal["active", "pending", "archived"] = "active"
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    author: str | None = Field(default=None, max_length=80)
+
+
+class MemoryUpdateBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    text: str | None = Field(default=None, min_length=1, max_length=dm.MEMORY_TEXT_MAX)
+    scope_globs: list[str] | None = Field(default=None, max_length=20)
+    blocking: bool | None = None
+    status: Literal["active", "pending", "archived"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class MemoryImportBody(BaseModel):
+    items: list[dict[str, Any]] = Field(default_factory=list, max_length=dm.MEMORY_MAX_ENTRIES_PER_REPO)
+
+
+class FindingStateBody(BaseModel):
+    state: Literal["dismissed", "resolved", "open"]
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ManualReviewBody(BaseModel):
+    force_full: bool = False
+
+
+@app.get("/repos/{owner}/{name}/memory")
+def get_repo_memory(
+    owner: str,
+    name: str,
+    request: Request,
+    status: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    items = memory_mod.list_memories(repo, status=status or None, kind=kind or None)
+    profile = memory_mod.get_repo_profile(repo)
+    return {"repo": repo, "items": items, "profile": profile}
+
+
+@app.post("/repos/{owner}/{name}/memory")
+def create_repo_memory(owner: str, name: str, body: MemoryCreateBody, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    # Never allow callers to supply an explicit id on POST (would overwrite existing entries).
+    if body.id is not None and str(body.id).strip():
+        raise HTTPException(status_code=422, detail="id cannot be supplied when creating a memory entry")
+    payload = body.model_dump(exclude={"id"})
+    payload["source"] = "manual"
+    try:
+        return memory_mod.add_memory(repo, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/repos/{owner}/{name}/memory/bootstrap")
+async def bootstrap_repo_memory(owner: str, name: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    await asyncio.to_thread(runtime_settings.refresh)
+    try:
+        return await memory_mod.bootstrap_repo(repo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/repos/{owner}/{name}/memory/import")
+def import_repo_memory(owner: str, name: str, body: MemoryImportBody, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    # Strip caller-supplied ids so imports cannot overwrite arbitrary existing entries.
+    sanitized = [{k: v for k, v in item.items() if k != "id"} for item in body.items if isinstance(item, dict)]
+    return memory_mod.import_memories(repo, sanitized)
+
+
+@app.get("/repos/{owner}/{name}/memory/markdown")
+def get_repo_memory_markdown(owner: str, name: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    return {"repo": repo, "markdown": memory_mod.render_memory_markdown(repo)}
+
+
+@app.patch("/repos/{owner}/{name}/memory/{mem_id}")
+def patch_repo_memory(
+    owner: str, name: str, mem_id: str, body: MemoryUpdateBody, request: Request
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    clean_id = _require_mem_id(mem_id)
+    patch = body.model_dump(exclude_none=True)
+    try:
+        updated = memory_mod.update_memory(repo, clean_id, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if updated is None:
+        raise HTTPException(status_code=404, detail="memory entry not found")
+    return updated
+
+
+@app.delete("/repos/{owner}/{name}/memory/{mem_id}")
+def delete_repo_memory(owner: str, name: str, mem_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    clean_id = _require_mem_id(mem_id)
+    if not memory_mod.delete_memory(repo, clean_id):
+        raise HTTPException(status_code=404, detail="memory entry not found")
+    return {"deleted": True}
+
+
+@app.post("/repos/{owner}/{name}/memory/{mem_id}/approve")
+def approve_repo_memory(owner: str, name: str, mem_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    clean_id = _require_mem_id(mem_id)
+    approved = memory_mod.approve_memory(repo, clean_id)
+    if approved is None:
+        raise HTTPException(status_code=404, detail="memory entry not found")
+    return approved
+
+
+@app.get("/prs/inbox")
+def get_pr_inbox(
+    request: Request,
+    repo: str | None = Query(default=None),
+    state: str = Query(default="open"),
+    band: str | None = Query(default=None),
+) -> dict[str, Any]:
+    _require_auth(request)
+    clean_repo = (repo or "").strip() or None
+    if clean_repo is not None and not dm.valid_repo(clean_repo):
+        raise HTTPException(status_code=400, detail="invalid repository name")
+    items = merge_mod.list_inbox_prs(repo=clean_repo, state=state or "open", band=band or None)
+    return {"items": items}
+
+
+@app.get("/repos/{owner}/{name}/pulls/{pr_number}/readiness")
+def get_pull_readiness(owner: str, name: str, pr_number: int, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    pr_num = _require_pr_number(pr_number)
+    return {
+        "report": merge_mod.get_stored_readiness(repo, pr_num),
+        "findings": review_mod.list_pr_findings(repo, pr_num),
+        "activity_stale": events.is_dirty(repo, pr_num),
+    }
+
+
+@app.post("/repos/{owner}/{name}/pulls/{pr_number}/readiness/recompute")
+async def recompute_pull_readiness(owner: str, name: str, pr_number: int, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    pr_num = _require_pr_number(pr_number)
+    await asyncio.to_thread(runtime_settings.refresh)
+    merged_cfg = await _effective_readiness_config(repo)
+    raw_weights = merged_cfg.get("weights")
+    weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
+    res = await merge_mod.recompute_pr_readiness(repo, pr_num, agent_config=merged_cfg, weights=weights)
+    return {
+        "report": res["report"],
+        "published": {
+            "published": bool(res.get("published")),
+            "merge_gate": res.get("merge_gate"),
+            "auth_kind": res.get("auth_kind"),
+            "check_run": res.get("check_run"),
+            "commit_status": res.get("commit_status"),
+            "comment": res.get("comment"),
+        },
+    }
+
+
+@app.get("/repos/{owner}/{name}/pulls/{pr_number}/findings")
+def get_pull_findings(
+    owner: str,
+    name: str,
+    pr_number: int,
+    request: Request,
+    state: str | None = Query(default=None),
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    pr_num = _require_pr_number(pr_number)
+    return {
+        "repo": repo,
+        "pr_number": pr_num,
+        "findings": review_mod.list_pr_findings(repo, pr_num, state=state or None),
+    }
+
+
+@app.post("/repos/{owner}/{name}/pulls/{pr_number}/findings/{fingerprint}/state")
+async def update_pull_finding_state(
+    owner: str,
+    name: str,
+    pr_number: int,
+    fingerprint: str,
+    body: FindingStateBody,
+    request: Request,
+    tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    pr_num = _require_pr_number(pr_number)
+    if not dm._FINGERPRINT_RE.fullmatch(fingerprint):
+        raise HTTPException(status_code=400, detail="invalid fingerprint")
+    fkey = dm.finding_key(repo, pr_num, fingerprint)
+    existing = await store.arget_json(fkey)
+    if not isinstance(existing, dict):
+        raise HTTPException(status_code=404, detail="finding not found")
+
+    memory_created: dict[str, Any] | None = None
+    if body.state == "dismissed":
+        dismissal = await asyncio.to_thread(
+            memory_mod.record_finding_dismissal,
+            repo,
+            pr_num,
+            fingerprint,
+            finding=existing,
+            reason=body.reason or "",
+        )
+        updated = await store.arget_json(fkey)
+        if not isinstance(updated, dict):
+            updated = {**existing, "state": "dismissed", "fingerprint": fingerprint}
+        if isinstance(dismissal.get("memory"), dict):
+            memory_created = dismissal["memory"]
+    else:
+        updated = await asyncio.to_thread(
+            review_mod.set_finding_state,
+            repo,
+            pr_num,
+            fingerprint,
+            body.state,
+            reason=body.reason,
+        )
+        if not isinstance(updated, dict):
+            raise HTTPException(status_code=404, detail="finding not found")
+        await store.arset(dm.dirty_key(repo, pr_num), _now_iso(), ex=dm.DIRTY_TTL_S)
+
+    # Trigger readiness recompute so score & checklist reflect the finding change.
+    tasks.add_task(_bg_recompute_readiness, repo, pr_num)
+    return {"finding": updated, "memory_created": memory_created}
+
+
+@app.post("/repos/{owner}/{name}/pulls/{pr_number}/review")
+async def trigger_manual_pr_review(
+    owner: str,
+    name: str,
+    pr_number: int,
+    request: Request,
+    body: ManualReviewBody = Body(default_factory=ManualReviewBody),
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    pr_num = _require_pr_number(pr_number)
+    await asyncio.to_thread(runtime_settings.refresh)
+    return await _run_manual_review_for_pr(repo, pr_num, force_full=body.force_full)
+
+
+@app.get("/repos/{owner}/{name}/config")
+async def get_repo_config(
+    owner: str,
+    name: str,
+    request: Request,
+    ref: str | None = Query(default=None),
+) -> dict[str, Any]:
+    _require_auth(request)
+    repo = _require_repo(owner, name)
+    await asyncio.to_thread(runtime_settings.refresh)
+    token, _ = await github_app.token_for_repo(repo)
+    target_ref = (ref or "").strip()
+    if not target_ref and token:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"https://api.github.com/repos/{repo}",
+                    headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"},
+                )
+            if r.status_code == 200:
+                target_ref = str((r.json() or {}).get("default_branch") or "").strip()
+        except Exception:
+            target_ref = ""
+    if not target_ref:
+        target_ref = "main"
+    cfg, source = await review_mod.load_repo_config_with_source(repo, target_ref, token)
+    return {"repo": repo, "config": cfg.model_dump(), "source": source}
 
 
 # Decision layer routes: /autonomy, /daemon/*, /decisions/*

@@ -7,15 +7,15 @@ import { parseJsonLoose, tauriInvoke, tauriUnavailable } from "./tauri";
 export const backendUrl = () => useApp.getState().backendUrl;
 const apiToken = () => useApp.getState().secrets.api;
 
-function fetchOptions(extra?: RequestInit): RequestInit {
+function fetchOptions(extra?: RequestInit, timeoutMs = 15000): RequestInit {
   const opts: RequestInit = { ...(extra || {}) };
   if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
-    opts.signal = AbortSignal.timeout(15000);
+    opts.signal = AbortSignal.timeout(timeoutMs);
   }
   return opts;
 }
 
-export async function apiGet<T = any>(path: string, baseOverride?: string): Promise<T> {
+export async function apiGet<T = any>(path: string, baseOverride?: string, timeoutMs = 15000): Promise<T> {
   const base = (baseOverride || backendUrl()).replace(/\/+$/, "");
   const token = apiToken();
   let raw: unknown;
@@ -36,7 +36,7 @@ export async function apiGet<T = any>(path: string, baseOverride?: string): Prom
     throw new Error("backend returned a non-JSON response");
   }
   const headers: Record<string, string> = token ? { Authorization: "Bearer " + token } : {};
-  const r = await fetch(base + path, fetchOptions({ headers }));
+  const r = await fetch(base + path, fetchOptions({ headers }, timeoutMs));
   if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 300));
   return r.json() as Promise<T>;
 }
@@ -47,6 +47,7 @@ export async function apiMut<T = any>(
   body?: unknown,
   baseOverride?: string,
   tokenOverride?: string,
+  timeoutMs = 15000,
 ): Promise<T> {
   const base = (baseOverride || backendUrl()).replace(/\/+$/, "");
   const token = tokenOverride !== undefined ? tokenOverride : apiToken();
@@ -70,11 +71,14 @@ export async function apiMut<T = any>(
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(
     base + path,
-    fetchOptions({
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body || {}),
-    }),
+    fetchOptions(
+      {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body || {}),
+      },
+      timeoutMs,
+    ),
   );
   if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 300));
   const t = await r.text();

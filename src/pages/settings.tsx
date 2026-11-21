@@ -1,14 +1,33 @@
 import * as React from "react";
-import { Eraser, Plug, Wifi, X } from "lucide-react";
+import { Eraser, Plug, ShieldCheck, Trash2, Wifi, X } from "lucide-react";
 import { AsyncButton, ButtonRow, Console, Field, FieldGrid, Hint, Page, SecretInput, Section } from "@/components/common";
 import { GithubConnect, GithubStateBadge } from "@/components/github-connect";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { checkBackend } from "@/lib/actions";
 import { cancelOAuth, connectOpenRouterOAuth, useOAuth } from "@/lib/oauth";
-import { forgetSecrets } from "@/lib/session";
+import {
+  forgetSecrets,
+  forgetSecretsAndVault,
+  setRememberOnPc,
+  syncAllSecretsToVault,
+  VAULT_KEY_LABELS,
+  wipeLocalVault,
+} from "@/lib/session";
 import { useApp } from "@/lib/store";
+import { isTauri } from "@/lib/tauri";
+import { toastOk } from "@/lib/toast";
 
 export function SettingsPage({ active }: { active: boolean }) {
   const backendUrl = useApp((s) => s.backendUrl);
@@ -19,10 +38,13 @@ export function SettingsPage({ active }: { active: boolean }) {
   const commandcode = useApp((s) => s.secrets.commandcode);
   const opencodeGo = useApp((s) => s.secrets.opencodeGo);
   const setSecret = useApp((s) => s.setSecret);
+  const rememberSecrets = useApp((s) => s.rememberSecrets);
+  const vaultKeys = useApp((s) => s.vaultKeys);
   const activeFlow = useOAuth((s) => s.activeFlow);
 
   const [urlDraft, setUrlDraft] = React.useState(backendUrl);
   const [out, setOut] = React.useState("Not tested.");
+  const [confirmWipeAll, setConfirmWipeAll] = React.useState(false);
   React.useEffect(() => setUrlDraft(backendUrl), [backendUrl]);
 
   const commitUrl = () => {
@@ -68,7 +90,15 @@ export function SettingsPage({ active }: { active: boolean }) {
               autoComplete="off"
             />
           </Field>
-          <Field label="Backend API token" htmlFor="api-token" hint="Session only — cleared on window close.">
+          <Field
+            label="Backend API token"
+            htmlFor="api-token"
+            hint={
+              vaultKeys.includes("backend_api_token")
+                ? "Encrypted in local PC vault (Windows DPAPI) — restored automatically on launch."
+                : "Session only unless Remember securely on this PC is enabled below."
+            }
+          >
             <SecretInput
               id="api-token"
               value={apiToken}
@@ -77,18 +107,80 @@ export function SettingsPage({ active }: { active: boolean }) {
             />
           </Field>
         </FieldGrid>
+
+        {/* Opt-in Windows DPAPI local persistence */}
+        <div className="bg-muted/25 grid gap-3 rounded-lg border p-3.5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <ShieldCheck className="text-primary mt-0.5 size-4 shrink-0" />
+              <div className="grid gap-0.5">
+                <Label htmlFor="settings-remember-pc" className="cursor-pointer text-sm font-medium">
+                  Remember securely on this PC (Windows DPAPI)
+                </Label>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  {isTauri()
+                    ? "Encrypts your Backend API token and provider keys with your Windows user profile so you don't have to re-paste them after restarting the app. Never touches localStorage."
+                    : "Available in the PR Agent desktop app (Windows DPAPI). Browser preview keeps tokens in sessionStorage only."}
+                </p>
+              </div>
+            </div>
+            <Switch
+              id="settings-remember-pc"
+              checked={rememberSecrets}
+              onCheckedChange={(v) => void setRememberOnPc(v)}
+            />
+          </div>
+
+          {isTauri() ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-muted-foreground text-xs">Stored in local vault:</span>
+                {vaultKeys.length > 0 ? (
+                  vaultKeys.map((k) => (
+                    <Badge key={k} variant="secondary" className="text-[10px]">
+                      {VAULT_KEY_LABELS[k] || k}
+                    </Badge>
+                  ))
+                ) : (
+                  <Badge variant="outline" className="text-[10px]">
+                    none
+                  </Badge>
+                )}
+              </div>
+              <ButtonRow>
+                {rememberSecrets ? (
+                  <AsyncButton
+                    variant="outline"
+                    size="xs"
+                    onClick={async () => {
+                      const n = await syncAllSecretsToVault();
+                      toastOk("Vault synced", `Saved ${n} active secret(s) to Windows DPAPI vault.`);
+                    }}
+                  >
+                    Sync current secrets
+                  </AsyncButton>
+                ) : null}
+                {vaultKeys.length > 0 ? (
+                  <AsyncButton variant="ghost" size="xs" onClick={() => wipeLocalVault(false)}>
+                    <Trash2 /> Wipe local vault
+                  </AsyncButton>
+                ) : null}
+              </ButtonRow>
+            </div>
+          ) : null}
+        </div>
+
         <Hint>
-          Session secrets (OpenRouter, Command Code, OpenCode Go, GitHub, Box, API token) live in <b>memory + sessionStorage</b> only and never touch
-          localStorage. Credentials you explicitly save in the Integrations tab are written to <code>backend/.env</code>{" "}
-          (git-ignored) by the Rust backend. Closing the window wipes sessionStorage; “Clear session secrets” wipes it
-          immediately.
+          Active session secrets live in <b>memory + sessionStorage</b> only and never touch <code>localStorage</code>.
+          Enabling Windows DPAPI vault stores an OS-encrypted copy in your user AppData folder; credentials saved in the
+          Integrations tab are encrypted in your cloud backend store (or local <code>backend/.env</code>).
         </Hint>
         <Console>{out}</Console>
       </Section>
 
       <Section
         title="GitHub — OAuth connect"
-        description="One-click browser OAuth creates/installs your personal App or signs in; or import from GitHub CLI. The token stays in memory/session only."
+        description="One-click browser OAuth creates/installs your personal App or signs in; or import from GitHub CLI."
         action={<GithubStateBadge />}
       >
         <GithubConnect showTokenField />
@@ -96,14 +188,27 @@ export function SettingsPage({ active }: { active: boolean }) {
 
       <Section
         title="Keys"
-        action={<Badge variant="outline">session only</Badge>}
+        action={
+          <Badge variant={vaultKeys.length > 0 ? "secondary" : "outline"}>
+            {vaultKeys.length > 0 ? `${vaultKeys.length} in DPAPI vault` : "session only"}
+          </Badge>
+        }
         footer={
-          <AsyncButton variant="destructive" onClick={forgetSecrets}>
-            <Eraser /> Forget all session secrets
-          </AsyncButton>
+          <ButtonRow className="w-full">
+            <AsyncButton variant="outline" onClick={forgetSecrets}>
+              <Eraser /> Forget session secrets
+            </AsyncButton>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => (vaultKeys.length > 0 ? setConfirmWipeAll(true) : void forgetSecretsAndVault())}
+            >
+              <Trash2 /> Forget session &amp; wipe local vault
+            </Button>
+          </ButtonRow>
         }
       >
-        <Field label="OPENROUTER_API_KEY" htmlFor="sett-or" hint="Session only — shared with the Review and Quota tabs.">
+        <Field label="OPENROUTER_API_KEY" htmlFor="sett-or" hint="Shared with Cloud setup, Review, and Quota tabs.">
           <div className="flex flex-wrap gap-2">
             <div className="min-w-56 flex-1">
               <SecretInput
@@ -127,7 +232,7 @@ export function SettingsPage({ active }: { active: boolean }) {
             ) : null}
           </div>
         </Field>
-        <Field label="COMMANDCODE_API_KEY" htmlFor="sett-cc" hint="Session only — shared with the Review tab.">
+        <Field label="COMMANDCODE_API_KEY" htmlFor="sett-cc" hint="Shared with Cloud setup and Review tabs.">
           <SecretInput
             id="sett-cc"
             value={commandcode}
@@ -135,7 +240,7 @@ export function SettingsPage({ active }: { active: boolean }) {
             onChange={(e) => setSecret("commandcode", e.target.value)}
           />
         </Field>
-        <Field label="OPENCODE_GO_API_KEY" htmlFor="sett-oc" hint="Session only — shared with the Review tab.">
+        <Field label="OPENCODE_GO_API_KEY" htmlFor="sett-oc" hint="Shared with Cloud setup and Review tabs.">
           <SecretInput
             id="sett-oc"
             value={opencodeGo}
@@ -144,6 +249,32 @@ export function SettingsPage({ active }: { active: boolean }) {
           />
         </Field>
       </Section>
+
+      <Dialog open={confirmWipeAll} onOpenChange={setConfirmWipeAll}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Wipe session secrets and local PC vault?</DialogTitle>
+            <DialogDescription>
+              This clears all in-memory session tokens and permanently deletes the {vaultKeys.length} encrypted key(s) stored
+              in your Windows DPAPI vault. You will need to re-enter your Backend API token on next launch.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setConfirmWipeAll(false)}>
+              Cancel
+            </Button>
+            <AsyncButton
+              variant="destructive"
+              onClick={async () => {
+                setConfirmWipeAll(false);
+                await forgetSecretsAndVault();
+              }}
+            >
+              <Trash2 /> Wipe everything
+            </AsyncButton>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Page>
   );
 }

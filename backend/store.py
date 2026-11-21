@@ -232,29 +232,43 @@ def rset(key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
     return _mem_set(key, value, ex=ex, nx=nx)
 
 
-def rincr(key: str, by: int = 1) -> int:
+def rincr(key: str, by: int = 1, ex: int | None = None) -> int:
+    ttl = int(ex) if ex is not None and int(ex) > 0 else None
     try:
         if _REDIS is not None:
+            if ttl is not None:
+                pipe = _REDIS.pipeline()
+                pipe.incrby(key, by)
+                pipe.expire(key, ttl)
+                return int(pipe.execute()[0])
             return int(_REDIS.incrby(key, by))
         if _SDK is not None:
-            if by == 1:
-                return int(_SDK.incr(key))  # type: ignore[attr-defined]
-            return int(_SDK.incrby(key, by))  # type: ignore[attr-defined]
+            val = int(_SDK.incr(key)) if by == 1 else int(_SDK.incrby(key, by))  # type: ignore[attr-defined]
+            if ttl is not None:
+                _SDK.expire(key, ttl)  # type: ignore[attr-defined]
+            return val
         if _use_rest():
-            if by == 1:
-                return int(_rest_cmd("INCR", key))  # type: ignore[arg-type]
-            return int(_rest_cmd("INCRBY", key, str(by)))  # type: ignore[arg-type]
+            val = (
+                int(_rest_cmd("INCR", key))  # type: ignore[arg-type]
+                if by == 1
+                else int(_rest_cmd("INCRBY", key, str(by)))  # type: ignore[arg-type]
+            )
+            if ttl is not None:
+                _rest_cmd("EXPIRE", key, str(ttl))
+            return val
     except Exception as exc:
         log.warning("store.rincr(%s) failed: %s", key, exc)
         if _REDIS_CONFIGURED:
             raise
     with _MEM_LOCK:
+        item = _MEM.get(key)
         cur = _mem_get(key)
         try:
             nxt = int(cur or 0) + by
         except ValueError:
             nxt = by
-        _MEM[key] = (str(nxt), None)
+        exp = (time.time() + ttl) if ttl is not None else (item[1] if item and cur is not None else None)
+        _MEM[key] = (str(nxt), exp)
         return nxt
 
 
@@ -485,8 +499,8 @@ async def arset(key: str, value: str, ex: int | None = None, nx: bool = False) -
     return await _to_thread(rset, key, value, ex=ex, nx=nx)
 
 
-async def arincr(key: str, by: int = 1) -> int:
-    return await _to_thread(rincr, key, by)
+async def arincr(key: str, by: int = 1, ex: int | None = None) -> int:
+    return await _to_thread(rincr, key, by, ex)
 
 
 async def ardelete(key: str) -> int:

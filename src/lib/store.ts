@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { VaultKey } from "./tauri";
 
 export type SecretName = "openrouter" | "commandcode" | "opencodeGo" | "github" | "box" | "api";
 
@@ -62,6 +63,9 @@ function loadSecrets(): Record<SecretName, string> {
 }
 
 export type TabId =
+  | "setup"
+  | "inbox"
+  | "memory"
   | "autoreview"
   | "review"
   | "agents"
@@ -73,6 +77,9 @@ export type TabId =
   | "settings";
 
 export const TAB_IDS: TabId[] = [
+  "setup",
+  "inbox",
+  "memory",
   "autoreview",
   "review",
   "agents",
@@ -100,6 +107,15 @@ export interface ReviewConfig {
   raw: string;
 }
 
+export interface PathInstruction {
+  path: string;
+  instructions: string;
+}
+
+export type ReviewProfile = "chill" | "assertive";
+export type MergeGateMode = "off" | "advisory" | "required";
+export type AutofixMode = "off" | "suggest" | "stacked" | "push";
+
 export interface Agent {
   id: string;
   name: string;
@@ -108,6 +124,15 @@ export interface Agent {
   trigger_label?: string | null;
   runtime_mode?: string;
   target_repos?: string[];
+  schema_version?: number;
+  profile?: ReviewProfile;
+  memory_enabled?: boolean;
+  merge_gate?: MergeGateMode;
+  score_threshold?: number;
+  path_instructions?: PathInstruction[];
+  tools?: string[];
+  chat_enabled?: boolean;
+  autofix?: AutofixMode;
   [k: string]: unknown;
 }
 
@@ -147,7 +172,10 @@ interface AppState {
   setTheme: (t: "dark" | "light") => void;
 
   tab: TabId;
+  /** True once the user explicitly picks a tab (or had one saved in localStorage). */
+  tabUserSelected: boolean;
   setTab: (t: TabId) => void;
+  setDefaultTab: (t: TabId) => void;
 
   backendUrl: string;
   setBackendUrl: (u: string) => void;
@@ -159,6 +187,14 @@ interface AppState {
   /** Bumped when session secrets are forgotten so pages can reset their local drafts. */
   clearNonce: number;
   wipeSecrets: () => void;
+
+  /** Opt-in OS-protected local persistence (Windows DPAPI vault). */
+  rememberSecrets: boolean;
+  setRememberSecrets: (v: boolean) => void;
+  vaultLoaded: boolean;
+  setVaultLoaded: (v: boolean) => void;
+  vaultKeys: VaultKey[];
+  setVaultKeys: (keys: VaultKey[]) => void;
 
   review: ReviewConfig;
   setReview: (patch: Partial<ReviewConfig>) => void;
@@ -182,16 +218,21 @@ interface AppState {
 
   escCount: number;
   setEscCount: (n: number) => void;
+  blockedPrCount: number;
+  setBlockedPrCount: (n: number) => void;
 
   cloudBase: string;
   setCloudBase: (v: string) => void;
 }
 
 const initialTheme = (): "dark" | "light" => (lsGet("pragent.theme") === "light" ? "light" : "dark");
-const initialTab = (): TabId => {
+const savedTab = (): TabId | null => {
   const t = lsGet("pragent.tab") as TabId;
-  return TAB_IDS.includes(t) ? t : "autoreview";
+  return TAB_IDS.includes(t) ? t : null;
 };
+const INITIAL_SAVED_TAB = savedTab();
+const initialTab = (): TabId => INITIAL_SAVED_TAB ?? "setup";
+const initialRememberSecrets = (): boolean => lsGet("pragent.remember_secrets") === "1";
 
 export const useApp = create<AppState>((set, get) => ({
   theme: initialTheme(),
@@ -201,9 +242,13 @@ export const useApp = create<AppState>((set, get) => ({
   },
 
   tab: initialTab(),
+  tabUserSelected: INITIAL_SAVED_TAB !== null,
   setTab: (tab) => {
     lsSet("pragent.tab", tab);
-    set({ tab });
+    set({ tab, tabUserSelected: true });
+  },
+  setDefaultTab: (tab) => {
+    if (!get().tabUserSelected) set({ tab });
   },
 
   backendUrl: (lsGet("BACKEND_URL") || "http://localhost:8000").replace(/\/+$/, ""),
@@ -236,6 +281,16 @@ export const useApp = create<AppState>((set, get) => ({
       clearNonce: get().clearNonce + 1,
     });
   },
+
+  rememberSecrets: initialRememberSecrets(),
+  setRememberSecrets: (v) => {
+    lsSet("pragent.remember_secrets", v ? "1" : "0");
+    set({ rememberSecrets: v });
+  },
+  vaultLoaded: false,
+  setVaultLoaded: (vaultLoaded) => set({ vaultLoaded }),
+  vaultKeys: [],
+  setVaultKeys: (vaultKeys) => set({ vaultKeys }),
 
   review: {
     llmProvider: "openrouter",
@@ -271,6 +326,8 @@ export const useApp = create<AppState>((set, get) => ({
 
   escCount: 0,
   setEscCount: (escCount) => set({ escCount }),
+  blockedPrCount: 0,
+  setBlockedPrCount: (blockedPrCount) => set({ blockedPrCount }),
 
   cloudBase: lsGet("pragent.cloud_base"),
   setCloudBase: (v) => {
