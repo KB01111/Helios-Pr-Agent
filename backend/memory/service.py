@@ -165,11 +165,12 @@ def _load_all_raw(repo: str) -> list[dict[str, Any]]:
     return entries
 
 
-def _eviction_key(item: dict[str, Any]) -> tuple[Any, ...]:
+def _eviction_key(item: dict[str, Any], *, protected: bool = False) -> tuple[Any, ...]:
     """Smaller tuple = evicted sooner.
 
     Non-blocking entries are evicted before blocking ones; archived before
-    active/pending; unused entries before used ones; oldest / least recently
+    active/pending; unused entries before used ones; protection breaks ties
+    only within the same retention priority tier; oldest / least recently
     used first.
     """
     is_blocking = 1 if (item.get("blocking") and item.get("status") != "archived") else 0
@@ -177,8 +178,9 @@ def _eviction_key(item: dict[str, Any]) -> tuple[Any, ...]:
     hits = int(item.get("hits") or 0)
     last_used = str(item.get("last_used") or "")
     used = 1 if (last_used or hits > 0) else 0
+    is_protected = 1 if protected else 0
     created = str(item.get("created_at") or "")
-    return (is_blocking, status_rank, used, last_used, hits, created, str(item.get("id") or ""))
+    return (is_blocking, status_rank, used, is_protected, last_used, hits, created, str(item.get("id") or ""))
 
 
 def _prune_entries_to_cap(
@@ -194,13 +196,11 @@ def _prune_entries_to_cap(
     if excess <= 0:
         return 0
     protected = protect_ids or set()
-    unprotected = [e for e in entries if str(e.get("id") or "") not in protected]
-    unprotected.sort(key=_eviction_key)
-    victims = unprotected[:excess]
-    if len(victims) < excess:
-        protected_entries = [e for e in entries if str(e.get("id") or "") in protected]
-        protected_entries.sort(key=_eviction_key)
-        victims.extend(protected_entries[: excess - len(victims)])
+    candidates = sorted(
+        entries,
+        key=lambda e: _eviction_key(e, protected=str(e.get("id") or "") in protected),
+    )
+    victims = candidates[:excess]
     removed = 0
     for victim in victims:
         vid = str(victim.get("id") or "")
@@ -258,9 +258,18 @@ def _prepare_memory_entry(
     if not data.get("created_at"):
         data["created_at"] = _now_iso()
 
+    raw_dismissal_ids = data.get("_dismissal_ids")
     validated = dm.MemoryEntry.model_validate(data).model_dump()
     validated["scope_globs"] = _norm_globs(validated["scope_globs"])
+    if isinstance(raw_dismissal_ids, list):
+        cleaned_ids = [str(x) for x in raw_dismissal_ids if isinstance(x, str) and x][-64:]
+        if cleaned_ids:
+            validated["_dismissal_ids"] = cleaned_ids
     return validated
+
+
+def _repo_lock_key(repo: str) -> str:
+    return f"memrepolock:{repo.lower()}"
 
 
 # ---------------------------------------------------------------------------
@@ -296,15 +305,24 @@ def get_memory(repo: str, mem_id: str) -> dict[str, Any] | None:
 
 def add_memory(repo: str, entry: dm.MemoryEntry | dict[str, Any]) -> dict[str, Any]:
     """Create and persist a memory entry, enforcing the per-repo entry cap."""
-    validated = _prepare_memory_entry(repo, entry)
-    mem_id = validated["id"]
-    store.rset_json(dm.memory_key(repo, mem_id), validated)
-    _prune_to_cap(repo, protect_id=mem_id)
-    return validated
+    dm.memory_prefix(repo)
+    with store.key_lock(_repo_lock_key(repo)):
+        validated = _prepare_memory_entry(repo, entry)
+        mem_id = validated["id"]
+        store.rset_json(dm.memory_key(repo, mem_id), validated)
+        _prune_to_cap(repo, protect_id=mem_id)
+        return validated
 
 
-def update_memory(repo: str, mem_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
-    """Safely update mutable fields (text, scope_globs, blocking, status, confidence, kind)."""
+def _update_memory_record(
+    repo: str,
+    mem_id: str,
+    patch: dict[str, Any],
+    *,
+    append_dismissal_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Apply mutable field updates atomically under the entry lock, preserving
+    internal dismissal-idempotency metadata."""
     dm.memory_prefix(repo)
     if not valid_memory_id(mem_id):
         return None
@@ -327,8 +345,23 @@ def update_memory(repo: str, mem_id: str, patch: dict[str, Any]) -> dict[str, An
                 merged[field_key] = value
         validated = dm.MemoryEntry.model_validate(merged).model_dump()
         validated["scope_globs"] = _norm_globs(validated["scope_globs"])
+        existing_dids = existing.get("_dismissal_ids")
+        dids: list[str] = (
+            [str(x) for x in existing_dids if isinstance(x, str) and x]
+            if isinstance(existing_dids, list)
+            else []
+        )
+        if append_dismissal_id and append_dismissal_id not in dids:
+            dids.append(append_dismissal_id)
+        if dids:
+            validated["_dismissal_ids"] = dids[-64:]
         store.rset_json(key, validated)
         return validated
+
+
+def update_memory(repo: str, mem_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    """Safely update mutable fields (text, scope_globs, blocking, status, confidence, kind)."""
+    return _update_memory_record(repo, mem_id, patch)
 
 
 def delete_memory(repo: str, mem_id: str) -> bool:
@@ -354,7 +387,7 @@ def import_memories(repo: str, items: list[dict[str, Any]]) -> dict[str, Any]:
     """Import memory entries for ``repo``, skipping duplicates/invalid items and
     reporting storage/pruning failures separately."""
     dm.memory_prefix(repo)
-    with store.key_lock(f"memrepolock:{repo.lower()}"):
+    with store.key_lock(_repo_lock_key(repo)):
         existing = _load_all_raw(repo)
         all_entries = list(existing)
         seen_ids = {str(e.get("id") or "") for e in existing}
@@ -605,19 +638,20 @@ def retrieve_for_diff(
     scored_dismissed.sort(key=lambda item: item[0], reverse=True)
 
     selected_rules: list[dict[str, Any]] = []
-    selected_dismissed: list[dict[str, Any]] = []
+    reserved_dismissed: list[dict[str, Any]] = []
+    overflow_dismissed: list[dict[str, Any]] = []
     skipped_dismissed: list[dict[str, Any]] = []
     used_chars = 0
 
     # Reserve up to 25% of budget for dismissed patterns when rules also exist so
     # false-positive suppressions are never starved by a large rule list.
+    dismissed_cap = max_chars // 4 if scored_rules else max_chars
     if scored_dismissed:
-        dismissed_cap = max_chars // 4 if scored_rules else max_chars
         dismissed_used = 0
         for _, entry in scored_dismissed:
             cost = _entry_char_cost(entry)
             if dismissed_used + cost <= dismissed_cap and used_chars + cost <= max_chars:
-                selected_dismissed.append(entry)
+                reserved_dismissed.append(entry)
                 dismissed_used += cost
                 used_chars += cost
             else:
@@ -633,13 +667,56 @@ def retrieve_for_diff(
     for entry in skipped_dismissed:
         cost = _entry_char_cost(entry)
         if used_chars + cost <= max_chars:
-            selected_dismissed.append(entry)
+            overflow_dismissed.append(entry)
             used_chars += cost
 
     now_iso = _now_iso()
     used_ids: list[str] = []
-    persisted_rules = _record_retrieval_hits(repo, selected_rules, now_iso, used_ids)
-    persisted_dismissed = _record_retrieval_hits(repo, selected_dismissed, now_iso, used_ids)
+    persisted_rules: list[dict[str, Any]] = []
+    persisted_dismissed: list[dict[str, Any]] = []
+    deferred_dismissed: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    budget = {"used": 0, "dismissed_used": 0, "max": max_chars}
+
+    _record_retrieval_hits(
+        repo,
+        reserved_dismissed,
+        norm_paths,
+        now_iso,
+        used_ids,
+        rules_out=persisted_rules,
+        dismissed_out=persisted_dismissed,
+        budget=budget,
+        dismissed_budget_cap=dismissed_cap,
+        deferred_dismissed=deferred_dismissed,
+        seen_ids=seen_ids,
+    )
+    _record_retrieval_hits(
+        repo,
+        selected_rules,
+        norm_paths,
+        now_iso,
+        used_ids,
+        rules_out=persisted_rules,
+        dismissed_out=persisted_dismissed,
+        budget=budget,
+        dismissed_budget_cap=dismissed_cap,
+        deferred_dismissed=deferred_dismissed,
+        seen_ids=seen_ids,
+    )
+    if deferred_dismissed or overflow_dismissed:
+        _record_retrieval_hits(
+            repo,
+            deferred_dismissed + overflow_dismissed,
+            norm_paths,
+            now_iso,
+            used_ids,
+            rules_out=persisted_rules,
+            dismissed_out=persisted_dismissed,
+            budget=budget,
+            dismissed_budget_cap=None,
+            seen_ids=seen_ids,
+        )
 
     return {
         "rules": persisted_rules,
@@ -651,27 +728,57 @@ def retrieve_for_diff(
 def _record_retrieval_hits(
     repo: str,
     entries: list[dict[str, Any]],
+    norm_paths: list[str],
     now_iso: str,
     used_ids: list[str],
-) -> list[dict[str, Any]]:
-    """Persist ``hits`` + ``last_used`` on the latest active stored records only."""
-    kept: list[dict[str, Any]] = []
+    *,
+    rules_out: list[dict[str, Any]],
+    dismissed_out: list[dict[str, Any]],
+    budget: dict[str, int],
+    dismissed_budget_cap: int | None = None,
+    deferred_dismissed: list[dict[str, Any]] | None = None,
+    seen_ids: set[str] | None = None,
+) -> None:
+    """Persist ``hits`` + ``last_used`` on the latest active, in-scope stored
+    records, classifying each by its current ``kind`` and charging its actual
+    character cost against the shared ``budget``."""
+    seen = seen_ids if seen_ids is not None else set()
     for entry in entries:
         mem_id = str(entry.get("id") or "")
-        if not valid_memory_id(mem_id):
+        if not valid_memory_id(mem_id) or mem_id in seen:
             continue
         key = dm.memory_key(repo, mem_id)
         with store.key_lock(f"memlock:{repo.lower()}:{mem_id}"):
             latest = store.rget_json(key)
             if not isinstance(latest, dict) or latest.get("status") != "active":
                 continue
+            matched, _ = _entry_matches_paths(latest, norm_paths)
+            if not matched:
+                continue
+            cost = _entry_char_cost(latest)
+            if budget["used"] + cost > budget["max"]:
+                continue
+            is_dismissed = latest.get("kind") == "dismissed_pattern"
+            if (
+                is_dismissed
+                and dismissed_budget_cap is not None
+                and budget["dismissed_used"] + cost > dismissed_budget_cap
+            ):
+                if deferred_dismissed is not None:
+                    deferred_dismissed.append(latest)
+                continue
             updated = dict(latest)
             updated["hits"] = int(updated.get("hits") or 0) + 1
             updated["last_used"] = now_iso
             store.rset_json(key, updated)
-            kept.append(updated)
+            budget["used"] += cost
+            if is_dismissed:
+                budget["dismissed_used"] += cost
+                dismissed_out.append(updated)
+            else:
+                rules_out.append(updated)
+            seen.add(mem_id)
             used_ids.append(mem_id)
-    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +813,29 @@ def _read_dismiss_count(counter_key: str) -> int:
     return 0
 
 
+_CLAIM_AND_INCR_DISMISS_LUA = (
+    "local ttl = tonumber(ARGV[1]) "
+    "local raw = redis.call('GET', KEYS[2]) "
+    "if raw and string.match(raw, '^%s*{') then "
+    "  local ok, obj = pcall(cjson.decode, raw) "
+    "  local legacy = 0 "
+    "  if ok and type(obj) == 'table' and obj['count'] ~= nil then "
+    "    legacy = tonumber(obj['count']) or 0 "
+    "  end "
+    "  if legacy < 0 then legacy = 0 end "
+    "  redis.call('SET', KEYS[2], tostring(math.floor(legacy)), 'EX', ttl) "
+    "end "
+    "if redis.call('SET', KEYS[1], '1', 'EX', ttl, 'NX') then "
+    "  local n = redis.call('INCR', KEYS[2]) "
+    "  redis.call('EXPIRE', KEYS[2], ttl) "
+    "  return n "
+    "end "
+    "local cur = tonumber(redis.call('GET', KEYS[2])) or 0 "
+    "if cur < 0 then cur = 0 end "
+    "return cur"
+)
+
+
 def _increment_dismiss_count(counter_key: str) -> int:
     """Atomically increment the dismissal counter with TTL.
 
@@ -720,6 +850,47 @@ def _increment_dismiss_count(counter_key: str) -> int:
                 legacy_count = _read_dismiss_count(counter_key)
                 store.rset(counter_key, str(legacy_count), ex=_DISMISS_COUNTER_TTL_S)
     return store.rincr(counter_key, 1, ex=_DISMISS_COUNTER_TTL_S)
+
+
+def _claim_and_increment_dismiss_count(counter_key: str, counted_key: str, ttl_s: int) -> int:
+    """Atomically claim ``counted_key`` and increment ``counter_key`` with TTL.
+
+    Uses a single Redis-side Lua EVAL when Redis/Upstash is configured so the
+    claim, counter increment, and TTL commit together and a committed increment
+    can never have its claim deleted on a post-commit error. Falls back to an
+    in-memory lock when running without Redis.
+    """
+    ttl = max(1, int(ttl_s))
+    try:
+        if store._REDIS is not None:
+            return int(store._REDIS.eval(_CLAIM_AND_INCR_DISMISS_LUA, 2, counted_key, counter_key, str(ttl)))
+        if store._SDK is not None and hasattr(store._SDK, "eval"):
+            return int(
+                store._SDK.eval(  # type: ignore[attr-defined]
+                    _CLAIM_AND_INCR_DISMISS_LUA,
+                    keys=[counted_key, counter_key],
+                    args=[str(ttl)],
+                )
+            )
+        if store._use_rest():
+            return int(
+                store._rest_cmd(  # type: ignore[arg-type]
+                    "EVAL", _CLAIM_AND_INCR_DISMISS_LUA, "2", counted_key, counter_key, str(ttl)
+                )
+            )
+    except Exception:
+        if store.redis_configured():
+            raise
+    with store._MEM_LOCK:
+        raw = store._mem_get(counter_key)
+        if raw is not None and raw.lstrip().startswith("{"):
+            legacy_count = _read_dismiss_count(counter_key)
+            store._mem_set(counter_key, str(legacy_count), ex=ttl)
+        if store._mem_get(counted_key) is not None:
+            return _read_dismiss_count(counter_key)
+        count = store.rincr(counter_key, 1, ex=ttl)
+        store._mem_set(counted_key, "1", ex=ttl)
+        return count
 
 
 def record_finding_dismissal(
@@ -772,8 +943,7 @@ def record_finding_dismissal(
                 if clean_author:
                     stored_finding["dismissed_by"] = clean_author
                 store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
-                if not already_dismissed:
-                    store.rset(dm.dirty_key(repo, pr_num), now_iso, ex=dm.DIRTY_TTL_S)
+                store.rset(dm.dirty_key(repo, pr_num), now_iso, ex=dm.DIRTY_TTL_S)
                 finding_updated = True
 
         merged_finding: dict[str, Any] = {**stored_finding, **(finding if isinstance(finding, dict) else {})}
@@ -804,24 +974,19 @@ def record_finding_dismissal(
             else ""
         )
 
+        dismissal_id = f"{pr_num}:{fingerprint}" if has_valid_fp else ""
+
         if has_valid_fp:
             if stored_finding.get("dismissal_counted"):
                 count = _read_dismiss_count(counter_key)
             else:
-                claimed = store.rset(counted_key, "1", ex=_DISMISS_COUNTER_TTL_S, nx=True)
-                if claimed:
-                    try:
-                        count = _increment_dismiss_count(counter_key)
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            store.rdelete(counted_key)
-                        raise
-                    if finding_updated:
-                        stored_finding["dismissal_counted"] = True
-                        with contextlib.suppress(Exception):
-                            store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
-                else:
-                    count = _read_dismiss_count(counter_key)
+                count = _claim_and_increment_dismiss_count(
+                    counter_key, counted_key, _DISMISS_COUNTER_TTL_S
+                )
+                if finding_updated:
+                    stored_finding["dismissal_counted"] = True
+                    with contextlib.suppress(Exception):
+                        store.rset_json(fkey, stored_finding, ex=dm.FINDING_TTL_S)
             already_completed = bool(stored_finding.get("dismissal_completed") or store.rget(done_key))
             needs_pattern_step = not already_completed
         else:
@@ -840,7 +1005,11 @@ def record_finding_dismissal(
             if existing is not None:
                 new_text = str(existing.get("text") or "")
                 has_new_reason = bool(clean_reason and clean_reason.lower() not in new_text.lower())
-                if needs_pattern_step or has_new_reason:
+                applied_ids = existing.get("_dismissal_ids")
+                already_applied = bool(
+                    dismissal_id and isinstance(applied_ids, list) and dismissal_id in applied_ids
+                )
+                if (needs_pattern_step and not already_applied) or has_new_reason:
                     new_conf = min(1.0, round(float(existing.get("confidence", 0.7)) + 0.1, 3))
                     if has_new_reason:
                         candidate = f"{new_text}; {clean_reason}"
@@ -850,10 +1019,11 @@ def record_finding_dismissal(
                         list(existing.get("scope_globs") or []) + _dismissal_scope_globs(file_path)
                     )
                     # Preserve existing status (e.g. keep archived patterns archived until explicitly approved).
-                    memory_entry = update_memory(
+                    memory_entry = _update_memory_record(
                         repo,
                         mem_id,
                         {"text": new_text, "scope_globs": merged_globs, "confidence": new_conf},
+                        append_dismissal_id=dismissal_id or None,
                     )
                     pattern_boosted = True
             elif clean_reason or (needs_pattern_step and count >= 2):
@@ -869,20 +1039,20 @@ def record_finding_dismissal(
                     full_text = f"{base_text} (dismissed {count} times)"
                 full_text = full_text[:dm.MEMORY_TEXT_MAX]
                 conf = 0.8 if clean_reason else min(1.0, round(0.7 + 0.1 * max(0, count - 2), 3))
-                memory_entry = add_memory(
-                    repo,
-                    {
-                        "id": mem_id,
-                        "kind": "dismissed_pattern",
-                        "text": full_text,
-                        "scope_globs": _dismissal_scope_globs(file_path),
-                        "source": "dismissal",
-                        "author": clean_author[:80] or None,
-                        "confidence": conf,
-                        "blocking": False,
-                        "status": "active",
-                    },
-                )
+                new_entry: dict[str, Any] = {
+                    "id": mem_id,
+                    "kind": "dismissed_pattern",
+                    "text": full_text,
+                    "scope_globs": _dismissal_scope_globs(file_path),
+                    "source": "dismissal",
+                    "author": clean_author[:80] or None,
+                    "confidence": conf,
+                    "blocking": False,
+                    "status": "active",
+                }
+                if dismissal_id:
+                    new_entry["_dismissal_ids"] = [dismissal_id]
+                memory_entry = add_memory(repo, new_entry)
                 pattern_created = True
 
         if has_valid_fp:
@@ -1149,6 +1319,55 @@ def _expand_editorconfig_brace_inner(inner: str) -> list[str] | None:
     return out or None
 
 
+def _skip_editorconfig_char_class(pat: str, start: int) -> int | None:
+    """Given ``pat[start] == '['``, return the index of the closing ``']'`` for
+    an EditorConfig character class, or ``None`` if the bracket is unclosed."""
+    n = len(pat)
+    j = start + 1
+    if j < n and pat[j] in ("!", "^"):
+        j += 1
+    if j < n and pat[j] == "]":
+        j += 1
+    while j < n:
+        if pat[j] == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if pat[j] == "]":
+            return j
+        j += 1
+    return None
+
+
+def _find_editorconfig_brace(pat: str) -> tuple[int, int] | None:
+    """Find the first innermost ``{...}`` brace pair outside ``[...]`` character
+    classes and backslash escapes. Returns ``(open_idx, close_idx)`` or ``None``."""
+    n = len(pat)
+    i = 0
+    open_idx: int | None = None
+    while i < n:
+        ch = pat[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "[":
+            end_cls = _skip_editorconfig_char_class(pat, i)
+            if end_cls is not None:
+                i = end_cls + 1
+                continue
+            i += 1
+            continue
+        if ch == "{":
+            open_idx = i
+            i += 1
+            continue
+        if ch == "}" and open_idx is not None:
+            if i > open_idx + 1:
+                return open_idx, i
+            open_idx = None
+        i += 1
+    return None
+
+
 def _editorconfig_section_to_globs(section: str) -> list[str]:
     s = section.strip()
     if not s:
@@ -1160,16 +1379,17 @@ def _editorconfig_section_to_globs(section: str) -> list[str]:
         next_expanded: list[str] = []
         changed = False
         for pat in expanded:
-            brace = re.search(r"\{([^{}]+)\}", pat)
-            if not brace:
+            brace = _find_editorconfig_brace(pat)
+            if brace is None:
                 next_expanded.append(pat)
                 continue
+            start_idx, end_idx = brace
             changed = True
-            alts = _expand_editorconfig_brace_inner(brace.group(1))
+            alts = _expand_editorconfig_brace_inner(pat[start_idx + 1 : end_idx])
             if not alts:
                 return []
-            pre = pat[:brace.start()]
-            post = pat[brace.end():]
+            pre = pat[:start_idx]
+            post = pat[end_idx + 1 :]
             for alt in alts:
                 next_expanded.append(f"{pre}{alt}{post}")
                 if len(next_expanded) > _MAX_EDITORCONFIG_GLOBS:
@@ -1294,6 +1514,7 @@ async def bootstrap_repo(
     fetched: dict[str, str] = {}
     absent: set[str] = set()
     fetch_errors: dict[str, str] = {}
+    contents_access_confirmed = False
     client_cm = contextlib.nullcontext(client) if client is not None else httpx.AsyncClient(timeout=20.0)
     async with client_cm as http:
         for path in BOOTSTRAP_FILES:
@@ -1313,6 +1534,7 @@ async def bootstrap_repo(
                 log.warning("memory.bootstrap: fetch %s/%s returned HTTP %s", repo, path, resp.status_code)
                 fetch_errors[path] = f"http_{resp.status_code}"
                 continue
+            contents_access_confirmed = True
             try:
                 decoded = _decode_github_content(resp.json())
             except Exception as exc:
@@ -1323,6 +1545,38 @@ async def bootstrap_repo(
                 fetch_errors[path] = "decode_error"
                 continue
             fetched[path] = decoded
+
+        # GitHub returns HTTP 404 for both missing files and inaccessible repos /
+        # credentials lacking Contents access. When no file returned 200, probe
+        # repository Contents access with the same credentials before treating
+        # file-level 404s as verified absence.
+        if absent and not contents_access_confirmed:
+            access_err: str | None = None
+            try:
+                probe = await http.get(
+                    f"{GITHUB_API}/repos/{repo}/contents",
+                    headers=headers,
+                )
+                if probe.status_code == 200:
+                    contents_access_confirmed = True
+                else:
+                    log.warning(
+                        "memory.bootstrap: contents access probe for %s returned HTTP %s",
+                        repo,
+                        probe.status_code,
+                    )
+                    access_err = f"contents_access_http_{probe.status_code}"
+            except Exception as exc:
+                log.warning(
+                    "memory.bootstrap: contents access probe for %s failed (%s)",
+                    repo,
+                    type(exc).__name__,
+                )
+                access_err = f"contents_access_{type(exc).__name__}"
+            if not contents_access_confirmed:
+                for path in sorted(absent):
+                    fetch_errors[path] = access_err or "contents_access_unverified"
+                absent.clear()
 
     languages: list[str] = []
     frameworks: list[str] = []

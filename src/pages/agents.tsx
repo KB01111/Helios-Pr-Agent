@@ -31,7 +31,14 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { apiGet, apiMut, backendUrl } from "@/lib/api";
 import { refreshAgents } from "@/lib/actions";
-import { copyToClipboard, getRepoConfig, isValidRepo, mergePragentYaml, type PragentYamlInput } from "@/lib/cloud-agent";
+import {
+  copyToClipboard,
+  getRepoConfig,
+  isValidRepo,
+  mergePragentYaml,
+  validatePathInstructions,
+  type PragentYamlInput,
+} from "@/lib/cloud-agent";
 import {
   useApp,
   type AutofixMode,
@@ -341,10 +348,23 @@ export function AgentsPage({ active }: { active: boolean }) {
       ? existingRepoYaml
       : null;
 
-  const yamlPreview = React.useMemo(
-    () => mergePragentYaml(matchedExistingYaml, yamlInput),
-    [matchedExistingYaml, yamlInput],
+  const pathInstructionsError = React.useMemo(
+    () => validatePathInstructions(form.pathInstructions),
+    [form.pathInstructions],
   );
+
+  const yamlPreviewState = React.useMemo(() => {
+    if (pathInstructionsError) {
+      return { yaml: "", error: pathInstructionsError };
+    }
+    try {
+      return { yaml: mergePragentYaml(matchedExistingYaml, yamlInput), error: null as string | null };
+    } catch (e) {
+      return { yaml: "", error: errText(e, 260) };
+    }
+  }, [pathInstructionsError, matchedExistingYaml, yamlInput]);
+  const yamlPreview = yamlPreviewState.yaml;
+  const yamlPreviewError = yamlPreviewState.error;
 
   const loadExistingRepoYaml = React.useCallback(
     async (targetRepo: string, showToastOnError = false) => {
@@ -412,6 +432,7 @@ export function AgentsPage({ active }: { active: boolean }) {
     const repo = yamlRepo.trim();
     if (!isValidRepo(repo)) return toastErr("Repository", "Enter a valid owner/repo first.");
     const mine = ++yamlSeqRef.current;
+    setYamlLoading(true);
     try {
       if (github) {
         const content = await githubReadRepoFile(github, repo, ".pragent.yaml");
@@ -430,6 +451,8 @@ export function AgentsPage({ active }: { active: boolean }) {
       setExistingSource(`Backend effective config (source: ${res.source})`);
     } catch (e) {
       if (mine === yamlSeqRef.current) toastErr("Could not read repo config", errText(e, 220));
+    } finally {
+      if (mine === yamlSeqRef.current) setYamlLoading(false);
     }
   };
 
@@ -437,6 +460,8 @@ export function AgentsPage({ active }: { active: boolean }) {
     const repo = yamlRepo.trim();
     if (!isValidRepo(repo)) return toastErr("Repository", "Enter a valid owner/repo first.");
     if (!github) return toastErr("GitHub token required", "Connect GitHub first to commit .pragent.yaml.");
+    const ruleErr = validatePathInstructions(form.pathInstructions);
+    if (ruleErr) return toastErr("Invalid path instructions", ruleErr);
     try {
       // Always merge against the latest remote .pragent.yaml so path_filters,
       // pre_merge_checks, labels, tools, weights, and custom sections are preserved.
@@ -448,6 +473,7 @@ export function AgentsPage({ active }: { active: boolean }) {
         ".pragent.yaml",
         merged,
         "chore: configure PR Agent (.pragent.yaml)",
+        { expectedBaseContent: latestRemote },
       );
       toastOk(
         res.changed ? "Committed .pragent.yaml" : ".pragent.yaml already up to date",
@@ -839,7 +865,13 @@ export function AgentsPage({ active }: { active: boolean }) {
               <div className="text-xs font-medium">
                 Preview to commit (.pragent.yaml){yamlLoading ? " — loading existing file…" : ""}
               </div>
-              <Console tall>{yamlPreview}</Console>
+              {yamlPreviewError ? (
+                <div className="border-destructive/40 bg-destructive/10 text-destructive rounded-md border px-3 py-2 text-xs">
+                  {yamlPreviewError}
+                </div>
+              ) : (
+                <Console tall>{yamlPreview}</Console>
+              )}
             </div>
             {existingRepoYaml !== null ? (
               <div className="grid gap-1.5">
@@ -852,13 +884,15 @@ export function AgentsPage({ active }: { active: boolean }) {
             <Button
               type="button"
               variant="outline"
+              disabled={Boolean(yamlPreviewError)}
               onClick={async () => {
+                if (yamlPreviewError) return;
                 if (await copyToClipboard(yamlPreview)) toastOk("Copied", ".pragent.yaml");
               }}
             >
               <ClipboardCopy /> Copy YAML
             </Button>
-            <AsyncButton onClick={commitYaml}>
+            <AsyncButton onClick={commitYaml} disabled={Boolean(yamlPreviewError)}>
               <FileCode2 /> Commit .pragent.yaml
             </AsyncButton>
           </DialogFooter>

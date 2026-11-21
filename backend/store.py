@@ -16,6 +16,7 @@ fallback store:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -750,9 +751,76 @@ def eval_register(
     return False, rec
 
 
+class LockLostError(RuntimeError):
+    """Raised when a lease-protected commit detects the lock lease was lost."""
+
+
 _COMPARE_AND_DELETE = (
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
 )
+
+_COMMIT_IF_LOCK_HELD = (
+    "if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end "
+    "local idx = 2 "
+    "for i = 2, #KEYS do "
+    "  local op = ARGV[idx] "
+    "  if op == 'D' then "
+    "    redis.call('del', KEYS[i]) "
+    "    idx = idx + 1 "
+    "  else "
+    "    local val = ARGV[idx + 1] "
+    "    local ttl = tonumber(ARGV[idx + 2]) "
+    "    if ttl and ttl > 0 then "
+    "      redis.call('set', KEYS[i], val, 'EX', ttl) "
+    "    else "
+    "      redis.call('set', KEYS[i], val) "
+    "    end "
+    "    idx = idx + 3 "
+    "  end "
+    "end "
+    "return 1"
+)
+
+
+def rcommit_if_lock_held(
+    lock_key: str,
+    token: str,
+    ops: list[tuple[str, str | None, int | None]],
+) -> bool:
+    """Atomically apply ``ops`` only if ``lock_key`` still holds ``token``.
+
+    Each element in ``ops`` is ``(key, value_or_none, ex_seconds_or_none)``.
+    When ``value_or_none`` is ``None``, the key is deleted; otherwise it is set.
+    Returns ``True`` if the lease was still held and all writes committed, or
+    ``False`` if the lease expired or was acquired by another owner.
+    """
+    keys = [lock_key]
+    args: list[str] = [token]
+    for key, val, ex in ops:
+        keys.append(key)
+        if val is None:
+            args.append("D")
+        else:
+            args.append("S")
+            args.append(val)
+            args.append(str(int(ex)) if ex and int(ex) > 0 else "0")
+
+    if _REDIS is not None:
+        return bool(_REDIS.eval(_COMMIT_IF_LOCK_HELD, len(keys), *keys, *args))
+    if _SDK is not None and hasattr(_SDK, "eval"):
+        return bool(_SDK.eval(_COMMIT_IF_LOCK_HELD, keys=keys, args=args))  # type: ignore[attr-defined]
+    if _use_rest():
+        return bool(int(_rest_cmd("EVAL", _COMMIT_IF_LOCK_HELD, str(len(keys)), *keys, *args)))  # type: ignore[arg-type]
+    with _MEM_LOCK:
+        if _mem_get(lock_key) != token:
+            return False
+        for key, val, ex in ops:
+            if val is None:
+                _MEM.pop(key, None)
+            else:
+                exp = (time.time() + int(ex)) if ex and int(ex) > 0 else None
+                _MEM[key] = (val, exp)
+        return True
 
 
 def rdelete_if_equal(key: str, token: str) -> bool:
@@ -820,6 +888,24 @@ def key_lock(lock_key: str, lease_s: int = 15, wait_s: float = 5.0):
             rdelete_if_equal(lock_key, token)
         except Exception as exc:  # the lease simply expires
             log.warning("store.key_lock(%s) release failed: %s", lock_key, exc)
+
+
+@contextlib.asynccontextmanager
+async def akey_lock(lock_key: str, lease_s: int = 15, wait_s: float = 5.0):
+    """Async cross-worker exclusive lease on ``lock_key`` without blocking the event loop."""
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    while not await arset(lock_key, token, ex=max(1, int(lease_s)), nx=True):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"could not acquire lock {lock_key}")
+        await asyncio.sleep(0.02)
+    try:
+        yield token
+    finally:
+        try:
+            await asyncio.to_thread(rdelete_if_equal, lock_key, token)
+        except Exception as exc:  # the lease simply expires
+            log.warning("store.akey_lock(%s) release failed: %s", lock_key, exc)
 
 
 @contextlib.contextmanager

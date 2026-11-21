@@ -376,13 +376,32 @@ export interface PragentYamlInput {
   path_instructions?: PathInstruction[];
 }
 
+export const MAX_PATH_INSTRUCTIONS = 50;
+
+export function cleanPathInstructions(rules: PathInstruction[] | undefined): PathInstruction[] {
+  return (rules || [])
+    .map((r) => ({ path: r.path.trim(), instructions: r.instructions.trim() }))
+    .filter((r) => r.path && r.instructions);
+}
+
+export function validatePathInstructions(rules: PathInstruction[] | undefined): string | null {
+  const cleaned = cleanPathInstructions(rules);
+  if (cleaned.length > MAX_PATH_INSTRUCTIONS) {
+    return `Too many path instructions (${cleaned.length}). Maximum allowed is ${MAX_PATH_INSTRUCTIONS}.`;
+  }
+  return null;
+}
+
 function renderPathInstructionsLines(rules: PathInstruction[]): string[] {
-  const cleaned = rules.filter((r) => r.path.trim() && r.instructions.trim());
+  const cleaned = cleanPathInstructions(rules);
+  if (cleaned.length > MAX_PATH_INSTRUCTIONS) {
+    throw new Error(`Too many path instructions (${cleaned.length}). Maximum allowed is ${MAX_PATH_INSTRUCTIONS}.`);
+  }
   if (cleaned.length === 0) return ["path_instructions: []"];
   const out = ["path_instructions:"];
   for (const r of cleaned) {
-    out.push(`  - path: ${yamlString(r.path.trim())}`);
-    out.push(`    instructions: ${yamlString(r.instructions.trim())}`);
+    out.push(`  - path: ${yamlString(r.path)}`);
+    out.push(`    instructions: ${yamlString(r.instructions)}`);
   }
   return out;
 }
@@ -407,6 +426,37 @@ function renderFreshPragentYaml(cfg: PragentYamlInput): string {
   return lines.join("\n");
 }
 
+function splitTrailingYamlComment(inline: string): { value: string; comment: string } {
+  let quote: string | null = null;
+  let depth = 0;
+  for (let i = 0; i < inline.length; i++) {
+    const ch = inline[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < inline.length) {
+        i++;
+      } else if (ch === "'" && quote === "'" && inline[i + 1] === "'") {
+        i++;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === "{" || ch === "[") {
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      depth = Math.max(0, depth - 1);
+    } else if (ch === "#" && depth === 0 && (i === 0 || /\s/.test(inline[i - 1]))) {
+      return {
+        value: inline.slice(0, i).trim(),
+        comment: inline.slice(i).trim(),
+      };
+    }
+  }
+  return { value: inline.trim(), comment: "" };
+}
+
 function parseSimpleFlowMapping(inline: string): [string, string][] | null {
   const trimmed = inline.trim();
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
@@ -423,6 +473,8 @@ function parseSimpleFlowMapping(inline: string): [string, string][] | null {
       cur += ch;
       if (ch === "\\" && quote === '"' && i + 1 < inner.length) {
         cur += inner[++i];
+      } else if (ch === "'" && quote === "'" && inner[i + 1] === "'") {
+        cur += inner[++i];
       } else if (ch === quote) {
         quote = null;
       }
@@ -436,6 +488,7 @@ function parseSimpleFlowMapping(inline: string): [string, string][] | null {
       cur += ch;
     } else if (ch === "}" || ch === "]") {
       depth--;
+      if (depth < 0) return null;
       cur += ch;
     } else if (ch === "," && depth === 0) {
       parts.push(cur);
@@ -444,37 +497,103 @@ function parseSimpleFlowMapping(inline: string): [string, string][] | null {
       cur += ch;
     }
   }
+  if (quote !== null || depth !== 0) return null;
   if (cur.trim()) parts.push(cur);
   for (const part of parts) {
     const colon = part.indexOf(":");
     if (colon <= 0) return null;
-    const k = part.slice(0, colon).trim();
+    const rawKey = part.slice(0, colon).trim();
     const v = part.slice(colon + 1).trim();
+    if (!v) return null;
+    const k =
+      (rawKey.startsWith('"') && rawKey.endsWith('"')) || (rawKey.startsWith("'") && rawKey.endsWith("'"))
+        ? rawKey.slice(1, -1)
+        : rawKey;
     if (!/^[A-Za-z0-9_-]+$/.test(k)) return null;
     entries.push([k, v]);
   }
   return entries;
 }
 
+function parseTopLevelKeyLine(line: string): { key: string; colonIdx: number } | null {
+  if (line.startsWith('"')) {
+    let key = "";
+    for (let i = 1; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "\\") {
+        if (i + 1 >= line.length) return null;
+        const next = line[++i];
+        if (next === '"' || next === "\\") key += next;
+        else if (next === "n") key += "\n";
+        else if (next === "t") key += "\t";
+        else key += next;
+      } else if (ch === '"') {
+        const rest = line.slice(i + 1);
+        const m = /^\s*:(?:\s|$)/.exec(rest);
+        if (!m) return null;
+        return { key, colonIdx: i + 1 + rest.indexOf(":") };
+      } else {
+        key += ch;
+      }
+    }
+    return null;
+  }
+  if (line.startsWith("'")) {
+    let key = "";
+    for (let i = 1; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "'" && line[i + 1] === "'") {
+        key += "'";
+        i++;
+      } else if (ch === "'") {
+        const rest = line.slice(i + 1);
+        const m = /^\s*:(?:\s|$)/.exec(rest);
+        if (!m) return null;
+        return { key, colonIdx: i + 1 + rest.indexOf(":") };
+      } else {
+        key += ch;
+      }
+    }
+    return null;
+  }
+  const m = /^([A-Za-z0-9_.-]+)\s*:(?:\s|$)/.exec(line);
+  if (m) {
+    return { key: m[1], colonIdx: line.indexOf(":") };
+  }
+  return null;
+}
+
 function mergeMappingBlock(
   blockLines: string[],
   keyName: string,
   updates: Record<string, string>,
+  headerColonIdx?: number,
 ): string[] {
   const header = blockLines[0] || `${keyName}:`;
-  const colonIdx = header.indexOf(":");
+  const colonIdx = headerColonIdx !== undefined ? headerColonIdx : header.indexOf(":");
   const inlineRest = colonIdx >= 0 ? header.slice(colonIdx + 1).trim() : "";
+  const { value: inlineVal, comment: trailingComment } = splitTrailingYamlComment(inlineRest);
 
-  // Convert simple flow mappings like `memory: { enabled: false, max_items: 25 }` to block form
-  // while preserving all unmanaged keys.
+  // Convert simple flow mappings like `memory: { enabled: false, max_items: 25 } # note`
+  // to block form while preserving all unmanaged keys and trailing comments.
   let bodyLines = blockLines.slice(1);
-  if (inlineRest && !inlineRest.startsWith("#")) {
-    const flow = parseSimpleFlowMapping(inlineRest);
-    if (flow !== null) {
-      bodyLines = flow.map(([k, v]) => `  ${k}: ${v}`);
-    } else {
-      // Non-mapping scalar value (e.g. `memory: null`): replace with clean block mapping.
+  if (inlineVal) {
+    if (inlineVal.startsWith("{")) {
+      const flow = parseSimpleFlowMapping(inlineVal);
+      if (flow !== null) {
+        bodyLines = flow.map(([k, v]) => `  ${k}: ${v}`);
+      } else {
+        throw new Error(
+          `Cannot safely merge unsupported flow mapping for "${keyName}" in .pragent.yaml. Edit the file manually.`,
+        );
+      }
+    } else if (/^(?:null|~)$/i.test(inlineVal)) {
+      // Explicit null value (e.g. `memory: null`): replace with clean block mapping.
       bodyLines = [];
+    } else {
+      throw new Error(
+        `Cannot safely merge unsupported value for "${keyName}" in .pragent.yaml. Edit the file manually.`,
+      );
     }
   }
 
@@ -523,7 +642,7 @@ function mergeMappingBlock(
     mergedBody.push(`${childIndent}${subKey}: ${val}`);
   }
 
-  const headerComment = inlineRest.startsWith("#") ? ` ${inlineRest}` : "";
+  const headerComment = trailingComment ? ` ${trailingComment}` : "";
   return [`${keyName}:${headerComment}`, ...mergedBody];
 }
 
@@ -542,9 +661,10 @@ export function mergePragentYaml(existingYaml: string | null | undefined, cfg: P
     rawLines.pop();
   }
 
-  // Locate top-level key blocks (column 0 `key: ...`).
+  // Locate top-level key blocks (column 0 `key: ...` or `"key": ...` or `'key': ...`).
   interface BlockSpan {
     key: string;
+    colonIdx: number;
     start: number;
     end: number; // exclusive, excluding trailing blank/comment lines before next key
   }
@@ -552,16 +672,33 @@ export function mergePragentYaml(existingYaml: string | null | undefined, cfg: P
   const docEndIdx = rawLines.findIndex((l) => l === "...");
   const scanLimit = docEndIdx >= 0 ? docEndIdx : rawLines.length;
 
-  const keyStarts: { key: string; idx: number }[] = [];
+  const keyStarts: { key: string; colonIdx: number; idx: number }[] = [];
   for (let i = 0; i < scanLimit; i++) {
     const line = rawLines[i];
-    if (line === "---" || line.startsWith("#") || line.trim() === "" || /^\s/.test(line)) {
+    if (line.startsWith("#") || line.trim() === "" || /^\s/.test(line)) {
       continue;
     }
-    const m = /^([A-Za-z0-9_-]+)\s*:/.exec(line);
-    if (m) {
-      keyStarts.push({ key: m[1], idx: i });
+    if (line === "---" || /^---\s/.test(line)) {
+      if (keyStarts.length > 0) {
+        throw new Error("Multi-document .pragent.yaml is not supported for automatic merge. Edit the file manually.");
+      }
+      continue;
     }
+    if (keyStarts.length === 0 && /^%(?:YAML|TAG)\b/.test(line)) {
+      continue;
+    }
+    if ((line === "-" || /^-\s/.test(line)) && keyStarts.length > 0) {
+      // Zero-indented block sequence item belonging to the preceding top-level key.
+      continue;
+    }
+    const parsedKey = parseTopLevelKeyLine(line);
+    if (parsedKey) {
+      keyStarts.push({ key: parsedKey.key, colonIdx: parsedKey.colonIdx, idx: i });
+      continue;
+    }
+    throw new Error(
+      `Cannot safely determine top-level YAML section boundaries near line ${i + 1}. Edit .pragent.yaml manually.`,
+    );
   }
 
   for (let k = 0; k < keyStarts.length; k++) {
@@ -571,7 +708,7 @@ export function mergePragentYaml(existingYaml: string | null | undefined, cfg: P
     while (end > start + 1 && (rawLines[end - 1].trim() === "" || rawLines[end - 1].startsWith("#"))) {
       end--;
     }
-    spans.push({ key: keyStarts[k].key, start, end });
+    spans.push({ key: keyStarts[k].key, colonIdx: keyStarts[k].colonIdx, start, end });
   }
 
   const clampedThreshold = Math.max(0, Math.min(100, Math.round(cfg.score_threshold)));
@@ -610,16 +747,16 @@ export function mergePragentYaml(existingYaml: string | null | undefined, cfg: P
         handled.add("score_threshold");
         break;
       case "memory":
-        out.push(...mergeMappingBlock(block, "memory", memoryUpdates));
+        out.push(...mergeMappingBlock(block, "memory", memoryUpdates, span.colonIdx));
         handled.add("memory");
         break;
       case "chat":
-        out.push(...mergeMappingBlock(block, "chat", chatUpdates));
+        out.push(...mergeMappingBlock(block, "chat", chatUpdates, span.colonIdx));
         handled.add("chat");
         break;
       case "auto_review":
         if (autoReviewUpdates) {
-          out.push(...mergeMappingBlock(block, "auto_review", autoReviewUpdates));
+          out.push(...mergeMappingBlock(block, "auto_review", autoReviewUpdates, span.colonIdx));
         } else {
           out.push(...block);
         }

@@ -1069,7 +1069,7 @@ def verify_and_filter_findings(
         # full PR diff (`anchor_diff`) because GitHub interprets review comment
         # positions against the PR diff (not the incremental compare).
         if anchor_diff is not None:
-            adf = anchor_diff.get_file(df.path)
+            adf = anchor_diff.get_file(df.path, exact=True)
             if adf is None or adf.is_binary:
                 counters["dropped_out_of_diff"] += 1
                 continue
@@ -1077,9 +1077,13 @@ def verify_and_filter_findings(
             if pr_hunk is None or start_line not in pr_hunk.valid_lines(side):
                 counters["dropped_out_of_diff"] += 1
                 continue
-            # For LEFT anchors, also ensure the deleted/old line text matches the PR merge base
-            # (a line added in push 1 and deleted in push 2 never existed in the PR merge base).
+            # For LEFT anchors, require the full PR diff to actually show a deletion
+            # at the LEFT endpoint (not merely a context line with matching text) and
+            # ensure the deleted/old line text matches the PR merge base.
             if side == "LEFT":
+                if end_line not in adf.deleted_lines:
+                    counters["dropped_out_of_diff"] += 1
+                    continue
                 inc_code = df.code_span(start_line, end_line, "LEFT")
                 pr_code = adf.code_span(start_line, end_line, "LEFT")
                 if not pr_code or (inc_code and inc_code != pr_code):

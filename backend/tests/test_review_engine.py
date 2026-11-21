@@ -1512,25 +1512,64 @@ def test_yaml_escapes_off_boolean_duplicate_keys_and_unset_export():
     # Single-pass double-quoted escape decoding round-trips literal \n vs real newline
     y_esc = 'path_instructions:\n  - path: "src/**"\n    instructions: "literal \\\\n and real \\nline"\n'
     cfg_pure = parse_pragent_yaml(y_esc, use_pyyaml=False)
-    cfg_py = parse_pragent_yaml(y_esc, use_pyyaml=True)
     assert cfg_pure.path_instructions[0].instructions == "literal \\n and real \nline"
-    assert cfg_py.path_instructions[0].instructions == cfg_pure.path_instructions[0].instructions
 
-    # merge_gate: off stays string "off" while auto_review.enabled: false is bool False in BOTH parsers
+    # merge_gate: off stays string "off" while auto_review.enabled: false is bool False in subset parser
     y_off = "merge_gate: off\nauto_review:\n  enabled: false\n"
-    for use_py in (True, False):
-        cfg = parse_pragent_yaml(y_off, use_pyyaml=use_py)
-        assert cfg.merge_gate == "off"
-        assert cfg.auto_review.enabled is False
+    cfg_off_pure = parse_pragent_yaml(y_off, use_pyyaml=False)
+    assert cfg_off_pure.merge_gate == "off"
+    assert cfg_off_pure.auto_review.enabled is False
 
-    # Duplicate keys are rejected in BOTH parsers (including flow and sequence mappings)
+    # Duplicate keys are rejected in subset parser (including flow and sequence mappings)
     dup_block = "profile: chill\nprofile: assertive\n"
     dup_flow = "memory: {enabled: true, enabled: false}\n"
     dup_seq = "path_instructions:\n  - path: src/**\n    path: lib/**\n    instructions: hi\n"
     for sample in (dup_block, dup_flow, dup_seq):
-        for use_py in (True, False):
-            with pytest.raises(ValueError, match="duplicate"):
-                parse_pragent_yaml(sample, use_pyyaml=use_py)
+        with pytest.raises(ValueError, match="duplicate"):
+            parse_pragent_yaml(sample, use_pyyaml=False)
+
+    # Empty unset RepoConfig export re-imports cleanly WITHOUT PyYAML
+    empty_exported = render_pragent_yaml(RepoConfig())
+    assert parse_pragent_yaml(empty_exported, use_pyyaml=False) == RepoConfig()
+
+    # Explicitly require PyYAML before running the use_pyyaml=True assertions
+    pytest.importorskip("yaml")
+
+    cfg_py = parse_pragent_yaml(y_esc, use_pyyaml=True)
+    assert cfg_py.path_instructions[0].instructions == cfg_pure.path_instructions[0].instructions
+
+    cfg_off_py = parse_pragent_yaml(y_off, use_pyyaml=True)
+    assert cfg_off_py.merge_gate == "off"
+    assert cfg_off_py.auto_review.enabled is False
+
+    for sample in (dup_block, dup_flow, dup_seq):
+        with pytest.raises(ValueError, match="duplicate"):
+            parse_pragent_yaml(sample, use_pyyaml=True)
+
+    # Valid YAML merge (<<) with explicit override loads properly under PyYAML
+    y_merge = (
+        "x_defaults: &ar_defaults\n"
+        "  enabled: true\n"
+        "  drafts: true\n"
+        "auto_review:\n"
+        "  <<: *ar_defaults\n"
+        "  enabled: false\n"
+    )
+    cfg_merge = parse_pragent_yaml(y_merge, use_pyyaml=True)
+    assert cfg_merge.auto_review.enabled is False
+    assert cfg_merge.auto_review.drafts is True
+
+    # Negative control: duplicate explicit keys alongside a merge are still rejected
+    y_merge_dup = (
+        "x_defaults: &ar_defaults\n"
+        "  enabled: true\n"
+        "auto_review:\n"
+        "  <<: *ar_defaults\n"
+        "  enabled: false\n"
+        "  enabled: true\n"
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_pragent_yaml(y_merge_dup, use_pyyaml=True)
 
     # Export preserves inherited settings (omits unset fields) while keeping explicit chill
     partial = parse_pragent_yaml("memory:\n  enabled: false\n", use_pyyaml=True)
@@ -1546,7 +1585,7 @@ def test_yaml_escapes_off_boolean_duplicate_keys_and_unset_export():
 
 
 def test_diff_canonical_paths_path_filter_fallback_min_slice_and_line_shift():
-    from review.diff import select_budgeted_files
+    from review.diff import _MIN_FILE_SLICE, select_budgeted_files
     # a/foo must NOT overwrite foo
     diff_a = (
         "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1,1 +1,2 @@\n root\n+root2\n"
@@ -1566,13 +1605,30 @@ def test_diff_canonical_paths_path_filter_fallback_min_slice_and_line_shift():
     )
     assert sel == []
 
-    # Complete small chunk fits even when remaining < _MIN_FILE_SLICE (120)
+    # Noisy-file fallback preserves numbered per-file chunks paired with each DiffFile
+    two_locks = (
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,1 +1,2 @@\n {}\n+{\"a\":1}\n"
+        "diff --git a/yarn.lock b/yarn.lock\n"
+        "--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1,1 +1,2 @@\n old\n+new\n"
+    )
+    sel_noisy, _ = select_budgeted_files(parse_unified_diff(two_locks), 2000, numbered=True)
+    assert [df.path for df, _ in sel_noisy] == ["package-lock.json", "yarn.lock"]
+    assert "[R2] +{\"a\":1}" in sel_noisy[0][1]
+    assert "[R2] +new" in sel_noisy[1][1]
+
+    # Complete small chunk fits even when remaining < _MIN_FILE_SLICE (120) — must enter allocator!
     big_src = _file_diff("src/big.py", 12)
     tiny_doc = "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n+x\n"
-    combo = parse_unified_diff(big_src + tiny_doc)
+    overflow_doc = _file_diff("z.md", 15, prefix="doc")
+    combo = parse_unified_diff(big_src + tiny_doc + overflow_doc)
     budget = len(big_src) + len(tiny_doc) + 5  # remaining after big_src is < 120 but >= len(tiny_doc)
+    assert len(big_src) + len(tiny_doc) + len(overflow_doc) > budget
+    assert (budget - len(big_src)) < _MIN_FILE_SLICE
     sel2, _ = select_budgeted_files(combo, budget)
-    assert any(df.path == "a.md" for df, _ in sel2)
+    sel2_map = {df.path: chunk for df, chunk in sel2}
+    assert sel2_map.get("a.md") == tiny_doc
+    assert "z.md" not in sel2_map
 
     # Line-shift remapping: inserting 10 lines above line 100 shifts finding to line 110
     shift_diff = (
@@ -1582,6 +1638,34 @@ def test_diff_canonical_paths_path_filter_fallback_min_slice_and_line_shift():
     df_shift = parse_unified_diff(shift_diff).get_file("app.py")
     was_mod, new_lo, new_hi = df_shift.span_modified_or_remapped(100, 100, "RIGHT")
     assert was_mod is False and new_lo == 110 and new_hi == 110
+
+    # Context-bearing hunk (old_count > 0) inserting inside a multi-line span invalidates it,
+    # while inserting strictly above the span only shifts it.
+    ctx_ins_diff = (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -8,6 +8,7 @@\n"
+        " l8\n l9\n l10\n+inserted\n l11\n l12\n l13\n"
+    )
+    df_ctx = parse_unified_diff(ctx_ins_diff).get_file("app.py")
+    assert df_ctx.span_modified_or_remapped(10, 12, "RIGHT")[0] is True
+    assert df_ctx.span_modified_or_remapped(11, 13, "RIGHT") == (False, 12, 14)
+
+    # LEFT finding uses merge-base coordinates: unrelated prior-head edit at same line number preserves it
+    push_delta = parse_unified_diff(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -12,1 +12,1 @@\n-prior_head_line12\n+new_head_line12\n"
+    ).get_file("app.py")
+    pr_still_del = parse_unified_diff(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -11,3 +11,2 @@\n ctx\n-merge_base_deleted_12\n ctx\n"
+    ).get_file("app.py")
+    pr_reverted = parse_unified_diff(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -20,1 +20,2 @@\n other\n+added\n"
+    ).get_file("app.py")
+    assert push_delta.span_modified_or_remapped(12, 12, "LEFT") == (False, 12, 12)
+    assert push_delta.span_modified_or_remapped(12, 12, "LEFT", pr_file=pr_still_del) == (False, 12, 12)
+    assert push_delta.span_modified_or_remapped(12, 12, "LEFT", pr_file=pr_reverted)[0] is True
 
 
 def test_pipeline_scoped_dismissal_nan_confidence_suggestion_clear_and_pass_b_error():
@@ -1608,5 +1692,422 @@ def test_pipeline_scoped_dismissal_nan_confidence_suggestion_clear_and_pass_b_er
 
     with pytest.raises(LLMCallError):
         asyncio.run(generate_findings(parse_unified_diff(SAMPLE_DIFF), {"repo": "o/r", "pr_number": 1}, llm_call=bad_llm))
+
+
+def test_pass_c_left_endpoint_requires_pr_diff_deletion():
+    # Incremental diff deletes line 5 ("keep_me"), while full PR diff only has line 5 as context
+    inc_diff = parse_unified_diff(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -4,3 +4,2 @@\n ctx4\n-keep_me\n ctx6\n"
+    )
+    pr_diff_ctx_only = parse_unified_diff(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -4,3 +4,4 @@\n ctx4\n keep_me\n+added\n ctx6\n"
+    )
+    pr_diff_deleted = parse_unified_diff(
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        "@@ -4,3 +4,2 @@\n ctx4\n-keep_me\n ctx6\n"
+    )
+    raw = [{
+        "file": "app.py",
+        "start_line": 5,
+        "end_line": 5,
+        "side": "LEFT",
+        "severity": "major",
+        "category": "bug",
+        "title": "Removed guard",
+        "body": "Guard was removed.",
+        "confidence": 0.9,
+    }]
+    kept_ctx = verify_and_filter_findings(raw, inc_diff, anchor_diff=pr_diff_ctx_only, profile="assertive")
+    assert kept_ctx == []
+    kept_del = verify_and_filter_findings(raw, inc_diff, anchor_diff=pr_diff_deleted, profile="assertive")
+    assert len(kept_del) == 1
+
+
+def test_reconciliation_exact_paths_renames_and_overlapping_run_guards():
+    from review.publisher import commit_staged_finding_updates, stage_finding_updates
+
+    # 1. Exact path lookup: modifying foo.py must NOT touch a stored finding on a/foo.py
+    delta_root_only = parse_unified_diff(
+        "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+    stored_nested = [{
+        "fingerprint": "fp_nested_a",
+        "file": "a/foo.py",
+        "start_line": 1,
+        "end_line": 1,
+        "side": "RIGHT",
+        "state": "open",
+        "head_sha": "sha1",
+    }]
+    staged, outdated, remaps = stage_finding_updates(stored_nested, delta_root_only)
+    assert outdated == [] and remaps == {}
+    assert staged[0]["state"] == "open" and staged[0]["file"] == "a/foo.py"
+
+    # 2. Renamed file: surviving line updates path while preserving fingerprint; deleted line -> outdated
+    rename_diff = parse_unified_diff(
+        "diff --git a/old_mod.py b/new_mod.py\n"
+        "rename from old_mod.py\n"
+        "rename to new_mod.py\n"
+        "@@ -1,3 +1,4 @@\n"
+        "+header\n"
+        " line1\n"
+        "-line2_deleted\n"
+        "+line2_replaced\n"
+        " line3\n"
+    )
+    fp_survive = dm.finding_fingerprint("old_mod.py", "line3", "bug", "Survives rename")
+    fp_deleted = dm.finding_fingerprint("old_mod.py", "line2_deleted", "bug", "Deleted in rename")
+    save_pr_findings(
+        "o/r",
+        10,
+        [
+            {
+                "fingerprint": fp_survive,
+                "file": "old_mod.py",
+                "start_line": 3,
+                "end_line": 3,
+                "side": "RIGHT",
+                "state": "open",
+                "title": "Survives rename",
+            },
+            {
+                "fingerprint": fp_deleted,
+                "file": "old_mod.py",
+                "start_line": 2,
+                "end_line": 2,
+                "side": "RIGHT",
+                "state": "open",
+                "title": "Deleted in rename",
+            },
+        ],
+        head_sha="sha1",
+    )
+    staged_ren, outdated_ren, remaps_ren = stage_finding_updates(
+        list_pr_findings("o/r", 10), rename_diff
+    )
+    assert outdated_ren == [fp_deleted]
+    assert fp_survive in remaps_ren
+    assert remaps_ren[fp_survive]["file"] == "new_mod.py"
+    assert remaps_ren[fp_survive]["start_line"] == 4
+    commit_staged_finding_updates("o/r", 10, outdated_ren, remaps_ren, head_sha="sha2")
+    open_after = list_pr_findings("o/r", 10, state="open")
+    assert len(open_after) == 1
+    assert open_after[0]["fingerprint"] == fp_survive
+    assert open_after[0]["file"] == "new_mod.py"
+    assert open_after[0]["start_line"] == 4
+    assert len(list_pr_findings("o/r", 10, state="outdated")) == 1
+
+    # 3. Overlapping-run guard: stale remap with old head_sha/span is skipped, and stale bookmark CAS is rejected
+    stale_remap = {
+        fp_survive: {
+            "file": "old_mod.py",
+            "start_line": 99,
+            "end_line": 99,
+            "expected_file": "old_mod.py",
+            "expected_start_line": 3,
+            "expected_end_line": 3,
+            "expected_head_sha": "sha1",
+        }
+    }
+    commit_staged_finding_updates("o/r", 10, [], stale_remap, head_sha="sha1b")
+    still_new = list_pr_findings("o/r", 10, state="open")[0]
+    assert still_new["file"] == "new_mod.py" and still_new["start_line"] == 4 and still_new["head_sha"] == "sha2"
+
+    set_last_reviewed_sha("o/r", 10, "sha2")
+    assert set_last_reviewed_sha("o/r", 10, "sha1b", expected_sha="sha1") is False
+    assert get_last_reviewed_sha("o/r", 10) == "sha2"
+    assert set_last_reviewed_sha("o/r", 10, "sha3", expected_sha="sha2") is True
+    assert get_last_reviewed_sha("o/r", 10) == "sha3"
+
+
+def test_publisher_reconciliation_checkpoint_no_diff_guards_anchor_fallback_missing_sha_and_partial_delivery(monkeypatch):
+    import httpx as _httpx
+
+    # 1. Unreconciled finding revision: full diff with open findings & failing compare retains prior SHA
+    set_last_reviewed_sha("o/r", 21, "sha_old")
+    save_pr_findings(
+        "o/r",
+        21,
+        [{
+            "fingerprint": dm.finding_fingerprint("app.py", "code", "bug", "Existing open"),
+            "file": "app.py",
+            "start_line": 2,
+            "end_line": 2,
+            "side": "RIGHT",
+            "state": "open",
+            "title": "Existing open",
+        }],
+        head_sha="sha_old",
+    )
+
+    def unrec_gh(method, url, headers, params, body):
+        if "/contents/" in url:
+            return _FakeResp(404)
+        if "/compare/" in url:
+            return _FakeResp(404, {"message": "Not Found"})
+        if method == "GET" and url.endswith("/pulls/21"):
+            return _FakeResp(200, text=_file_diff("app.py", 2))
+        if method == "GET" and url.endswith("/issues/21/comments"):
+            return _FakeResp(200, [])
+        if method == "POST" and url.endswith("/issues/21/comments"):
+            return _FakeResp(201, {"id": 100})
+        raise AssertionError((method, url))
+
+    empty_replies = iter([
+        json.dumps({"summary": "ok", "effort": 1, "file_table": [], "sequence_diagram": None}),
+        json.dumps({"findings": []}),
+    ])
+    res_unrec = asyncio.run(
+        run_structured_review(
+            {"id": "a", "name": "Bot"},
+            {
+                "repo": "o/r",
+                "pr_number": 21,
+                "sha": "sha_new",
+                "base_ref": "main",
+                "action": "synchronize",
+                "github_token": "tok",
+            },
+            github_client=_MockGitHubClient(unrec_gh),
+            llm_call=lambda m, j: asyncio.sleep(0, result=next(empty_replies)),
+        )
+    )
+    assert res_unrec["status"] == "completed"
+    assert res_unrec["last_reviewed_sha"] == "sha_old"
+    assert get_last_reviewed_sha("o/r", 21) == "sha_old"
+
+    # 2. Filtered no-diff review commits staged finding transitions BEFORE advancing bookmark
+    set_last_reviewed_sha("o/r", 22, "sha_a")
+    save_pr_findings(
+        "o/r",
+        22,
+        [{
+            "fingerprint": dm.finding_fingerprint("docs/a.md", "old", "bug", "Doc issue"),
+            "file": "docs/a.md",
+            "start_line": 1,
+            "end_line": 1,
+            "side": "RIGHT",
+            "state": "open",
+            "title": "Doc issue",
+        }],
+        head_sha="sha_a",
+    )
+    doc_change_diff = (
+        "diff --git a/docs/a.md b/docs/a.md\n--- a/docs/a.md\n+++ b/docs/a.md\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+    cfg_yaml_b64 = base64.b64encode(b"path_filters:\n  exclude:\n    - 'docs/**'\n").decode()
+
+    def filtered_gh(method, url, headers, params, body):
+        if "/contents/.pragent.yaml" in url:
+            return _FakeResp(200, {"sha": "blob22", "content": cfg_yaml_b64})
+        if "/compare/sha_a...sha_b" in url:
+            return _FakeResp(200, text=doc_change_diff)
+        raise AssertionError((method, url))
+
+    res_filt = asyncio.run(
+        run_structured_review(
+            {"id": "a", "name": "Bot"},
+            {
+                "repo": "o/r",
+                "pr_number": 22,
+                "sha": "sha_b",
+                "base_ref": "main",
+                "action": "synchronize",
+                "github_token": "tok",
+            },
+            github_client=_MockGitHubClient(filtered_gh),
+            llm_call=lambda *a: (_ for _ in ()).throw(AssertionError("LLM should not run")),
+        )
+    )
+    assert res_filt["status"] == "completed_no_comment"
+    assert res_filt["last_reviewed_sha"] == "sha_b"
+    assert list_pr_findings("o/r", 22, state="open") == []
+    assert len(list_pr_findings("o/r", 22, state="outdated")) == 1
+
+    # 3. No-diff path verifies PR head via _verify_pr_head when github_client is None (rejects moved head)
+    set_last_reviewed_sha("o/r", 23, "sha_1")
+
+    def moved_no_diff_gh(method, url, headers, params, body):
+        if "/contents/" in url:
+            return _FakeResp(404)
+        if "/compare/sha_1...sha_2" in url:
+            return _FakeResp(200, text="")
+        if method == "GET" and url.endswith("/pulls/23"):
+            if "application/vnd.github.diff" in headers.get("Accept", ""):
+                return _FakeResp(200, text="")
+            return _FakeResp(200, {"head": {"sha": "sha_3_newer"}})
+        raise AssertionError((method, url, headers))
+
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **kw: _MockGitHubClient(moved_no_diff_gh))
+    res_moved = asyncio.run(
+        run_structured_review(
+            {"id": "a", "name": "Bot"},
+            {
+                "repo": "o/r",
+                "pr_number": 23,
+                "sha": "sha_2",
+                "base_ref": "main",
+                "action": "synchronize",
+                "github_token": "tok",
+            },
+            llm_call=lambda *a: (_ for _ in ()).throw(AssertionError("LLM should not run")),
+        )
+    )
+    assert res_moved["status"] == "completed_no_comment"
+    assert res_moved.get("stale_head") is True
+    assert res_moved["last_reviewed_sha"] == "sha_1"
+    assert get_last_reviewed_sha("o/r", 23) == "sha_1"
+
+    # 4. Failed full PR diff fetch during incremental review keeps findings in summary (no inline POST)
+    set_last_reviewed_sha("o/r", 24, "sha_p1")
+    inc_24 = _file_diff("src/x.py", 2)
+    posted_inline_24: list[Any] = []
+    posted_summary_24: list[str] = []
+
+    def anchor_fail_gh(method, url, headers, params, body):
+        if "/contents/" in url:
+            return _FakeResp(404)
+        if "/compare/sha_p1...sha_p2" in url:
+            return _FakeResp(200, text=inc_24)
+        if method == "GET" and url.endswith("/pulls/24"):
+            return _FakeResp(500, {"message": "boom"})
+        if method == "POST" and url.endswith("/pulls/24/reviews"):
+            posted_inline_24.append(body)
+            return _FakeResp(201, {"id": 999})
+        if method == "GET" and url.endswith("/issues/24/comments"):
+            return _FakeResp(200, [])
+        if method == "POST" and url.endswith("/issues/24/comments"):
+            posted_summary_24.append(body["body"])
+            return _FakeResp(201, {"id": 500})
+        raise AssertionError((method, url))
+
+    p24_replies = iter([
+        json.dumps({"summary": "inc", "effort": 1, "file_table": [], "sequence_diagram": None}),
+        json.dumps({
+            "findings": [{
+                "file": "src/x.py",
+                "start_line": 2,
+                "end_line": 2,
+                "side": "RIGHT",
+                "severity": "major",
+                "category": "bug",
+                "title": "Unvalidated incremental finding",
+                "body": "Keep in summary only.",
+                "confidence": 0.9,
+            }]
+        }),
+    ])
+    res_24 = asyncio.run(
+        run_structured_review(
+            {"id": "a", "name": "Bot"},
+            {
+                "repo": "o/r",
+                "pr_number": 24,
+                "sha": "sha_p2",
+                "base_ref": "main",
+                "action": "synchronize",
+                "github_token": "tok",
+            },
+            github_client=_MockGitHubClient(anchor_fail_gh),
+            llm_call=lambda m, j: asyncio.sleep(0, result=next(p24_replies)),
+        )
+    )
+    assert res_24["status"] == "completed"
+    assert res_24["review_posted"] is False
+    assert res_24["pr_comment_posted"] is True
+    assert posted_inline_24 == []
+    assert any("Unvalidated incremental finding" in b for b in posted_summary_24)
+
+    # 5. Missing head_sha (even after hydration) returns retryable failure without posting or saving
+    def missing_sha_gh(method, url, headers, params, body):
+        if method == "GET" and url.endswith("/pulls/25"):
+            return _FakeResp(500, {"message": "err"})
+        raise AssertionError((method, url))
+
+    res_25 = asyncio.run(
+        run_structured_review(
+            {"id": "a", "name": "Bot"},
+            {
+                "repo": "o/r",
+                "pr_number": 25,
+                "base_ref": "main",
+                "action": "opened",
+                "github_token": "tok",
+            },
+            github_client=_MockGitHubClient(missing_sha_gh),
+            llm_call=lambda *a: (_ for _ in ()).throw(AssertionError("LLM should not run")),
+        )
+    )
+    assert res_25["status"] == "failed"
+    assert list_pr_findings("o/r", 25) == []
+
+    # 6. publish_review preserves partial success when summary PATCH raises after inline review accepted
+    finding_26 = {
+        "fingerprint": dm.finding_fingerprint("src/x.py", "x", "bug", "Inline accepted"),
+        "file": "src/x.py",
+        "start_line": 2,
+        "end_line": 2,
+        "side": "RIGHT",
+        "severity": "major",
+        "category": "bug",
+        "title": "Inline accepted",
+        "body": "Body",
+    }
+
+    def patch_raises_gh(method, url, headers, params, body):
+        if method == "POST" and url.endswith("/pulls/26/reviews"):
+            return _FakeResp(201, {"id": 777, "comments": []})
+        if method == "GET" and url.endswith("/issues/26/comments"):
+            return _FakeResp(200, [{"id": 88, "body": review_marker("a") + "\nold"}])
+        if method == "PATCH" and url.endswith("/issues/comments/88"):
+            raise RuntimeError("transient patch timeout")
+        raise AssertionError((method, url))
+
+    pub_26 = asyncio.run(
+        publish_review(
+            "o/r",
+            26,
+            "sha26",
+            {"summary": "s", "effort": 1, "file_table": []},
+            [finding_26],
+            agent_key="a",
+            agent_name="Bot",
+            github_token="tok",
+            client=_MockGitHubClient(patch_raises_gh),
+        )
+    )
+    assert pub_26["review_posted"] is True
+    assert pub_26["pr_comment_posted"] is False
+    assert pub_26.get("summary_error") == "RuntimeError"
+
+    # Failure before inline acceptance still propagates so findings stay eligible for retry
+    def pre_inline_raises_gh(method, url, headers, params, body):
+        if method == "POST" and url.endswith("/pulls/27/reviews"):
+            return _FakeResp(500, {"message": "err"})
+        if method == "GET" and url.endswith("/issues/27/comments"):
+            return _FakeResp(200, [])
+        if method == "POST" and url.endswith("/issues/27/comments"):
+            raise RuntimeError("summary post boom")
+        raise AssertionError((method, url))
+
+    with pytest.raises(RuntimeError, match="summary post boom"):
+        asyncio.run(
+            publish_review(
+                "o/r",
+                27,
+                "sha27",
+                {"summary": "s", "effort": 1, "file_table": []},
+                [finding_26],
+                agent_key="a",
+                agent_name="Bot",
+                github_token="tok",
+                client=_MockGitHubClient(pre_inline_raises_gh),
+            )
+        )
+
 
 

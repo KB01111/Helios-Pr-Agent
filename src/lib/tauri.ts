@@ -99,10 +99,10 @@ export async function vaultStatus(): Promise<VaultStatus> {
         backend: String(obj.backend || (obj.supported ? "windows-dpapi" : "unsupported")),
       };
     }
-    return { supported: false, backend: "unsupported" };
+    throw new Error("Unexpected response from vault_status");
   } catch (e) {
     if (isVaultUnsupported(e)) return { supported: false, backend: "unsupported" };
-    return { supported: false, backend: "unsupported" };
+    throw e;
   }
 }
 
@@ -177,15 +177,20 @@ export async function githubCommitRepoFile(
   path: string,
   content: string,
   message: string,
+  opts?: { expectedBaseContent?: string | null },
 ): Promise<CommitRepoFileResult> {
   try {
-    const raw = await tauriInvoke<CommitRepoFileResult>("github_commit_repo_file", {
+    const args: Record<string, unknown> = {
       token,
       repo,
       path,
       content,
       message,
-    });
+    };
+    if (opts && "expectedBaseContent" in opts) {
+      args.expectedBaseContent = opts.expectedBaseContent;
+    }
+    const raw = await tauriInvoke<CommitRepoFileResult>("github_commit_repo_file", args);
     const obj = jsonObj(raw);
     if (!obj || typeof obj !== "object") {
       throw new Error("Unexpected response from github_commit_repo_file");

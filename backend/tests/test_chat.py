@@ -607,4 +607,122 @@ def test_invoke_callback_does_not_retry_when_body_raises_type_error():
     assert invocations["n"] == 1  # nosec B101
 
 
+def test_clarification_fingerprint_prefix_and_unmatched_fingerprint_no_synthetic_pattern(monkeypatch):
+    calls: list[dict] = []
+    _install_fake_httpx(monkeypatch, calls)
+
+    fp1 = dm.finding_fingerprint("backend/auth.py", "line1", "security", "SQL injection risk")
+    fp2 = dm.finding_fingerprint("backend/auth.py", "line2", "bug", "Null pointer dereference")
+    for fp, title, cid in ((fp1, "SQL injection risk", 201), (fp2, "Null pointer dereference", 202)):
+        store.rset_json(
+            dm.finding_key(REPO, 7, fp),
+            {
+                "fingerprint": fp,
+                "file": "backend/auth.py",
+                "severity": "major",
+                "category": "bug",
+                "title": title,
+                "state": "open",
+                "comment_id": cid,
+            },
+            ex=dm.FINDING_TTL_S,
+        )
+
+    # Ambiguous dismiss returns full fingerprints in clarification reply
+    amb = asyncio.run(
+        chat.handle_pr_mention(
+            REPO, 7, body="@pr-agent dismiss", author="alice", association="OWNER",
+            comment_id=999, path="backend/auth.py",
+        )
+    )
+    assert amb.get("ambiguous") is True  # nosec B101
+    assert fp1 in amb["reply"] and fp2 in amb["reply"]  # nosec B101
+
+    # Unique 16-char prefix selects fp2
+    pref_res = asyncio.run(
+        chat.handle_pr_mention(
+            REPO, 7, body=f"@pr-agent resolve {fp2[:16]}", author="alice", association="OWNER",
+        )
+    )
+    assert pref_res["resolved"] is True and pref_res["finding"]["fingerprint"] == fp2  # nosec B101
+
+    # Unmatched fingerprint during PR-level dismiss MUST NOT create a synthetic pattern
+    unmatched = asyncio.run(
+        chat.handle_pr_mention(
+            REPO, 7, body="@pr-agent dismiss deadbeef12345678", author="alice", association="OWNER",
+        )
+    )
+    assert unmatched["dismissal"] is None  # nosec B101
+    assert memory.list_memories(REPO) == []  # nosec B101
+
+
+def test_command_naming_two_findings_requests_clarification(monkeypatch):
+    calls: list[dict] = []
+    _install_fake_httpx(monkeypatch, calls)
+
+    fp1 = dm.finding_fingerprint("backend/auth.py", "a", "security", "First issue")
+    fp2 = dm.finding_fingerprint("backend/auth.py", "b", "bug", "Second issue")
+    for fp, title in ((fp1, "First issue"), (fp2, "Second issue")):
+        store.rset_json(
+            dm.finding_key(REPO, 7, fp),
+            {
+                "fingerprint": fp,
+                "file": "backend/auth.py",
+                "severity": "major",
+                "category": "bug",
+                "title": title,
+                "state": "open",
+            },
+            ex=dm.FINDING_TTL_S,
+        )
+
+    res = asyncio.run(
+        chat.handle_pr_mention(
+            REPO, 7, body=f"@pr-agent resolve {fp1} {fp2}", author="alice", association="OWNER",
+        )
+    )
+    assert res["resolved"] is False and res.get("ambiguous") is True  # nosec B101
+    assert store.rget_json(dm.finding_key(REPO, 7, fp1))["state"] == "open"  # nosec B101
+    assert store.rget_json(dm.finding_key(REPO, 7, fp2))["state"] == "open"  # nosec B101
+
+
+def test_dismiss_checks_thread_identity_before_title_matching(monkeypatch):
+    calls: list[dict] = []
+    _install_fake_httpx(monkeypatch, calls)
+
+    fp_other = dm.finding_fingerprint("backend/auth.py", "x", "security", "Constant time comparison")
+    store.rset_json(
+        dm.finding_key(REPO, 7, fp_other),
+        {
+            "fingerprint": fp_other,
+            "file": "backend/auth.py",
+            "severity": "major",
+            "category": "security",
+            "title": "Constant time comparison",
+            "state": "open",
+            "comment_id": 501,
+        },
+        ex=dm.FINDING_TTL_S,
+    )
+
+    # Replying on a DIFFERENT thread (comment_id=999) with words from fp_other's title must NOT select fp_other
+    matched, _ = chat._resolve_finding_target(
+        REPO, 7, comment_id=999, path="backend/auth.py", query="constant time comparison is fine"
+    )
+    assert matched is None  # nosec B101
+
+    # Exact thread ID still matches
+    matched_exact, _ = chat._resolve_finding_target(
+        REPO, 7, comment_id=999, in_reply_to=501, path="backend/auth.py", query="intentional"
+    )
+    assert matched_exact is not None and matched_exact[0] == fp_other  # nosec B101
+
+    # Explicit fingerprint still matches
+    matched_fp, _ = chat._resolve_finding_target(
+        REPO, 7, comment_id=999, path="backend/auth.py", query=f"{fp_other} intentional"
+    )
+    assert matched_fp is not None and matched_fp[0] == fp_other  # nosec B101
+
+
+
 

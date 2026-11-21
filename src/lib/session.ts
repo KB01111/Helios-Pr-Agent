@@ -1,3 +1,4 @@
+import { toast } from "sonner";
 import { stopStream } from "./actions";
 import { useGh } from "./github";
 import { useApp, type SecretName } from "./store";
@@ -45,9 +46,18 @@ export const useVaultHydrated = (): boolean => useApp((s) => s.vaultLoaded);
 
 let suppressAutosave = false;
 let wipeEpoch = 0;
+let rememberEpoch = 0;
 let vaultQueue: Promise<unknown> = Promise.resolve();
 let activeHydrationPromise: Promise<VaultKey[]> | null = null;
 const pendingTimers = new Map<VaultKey, ReturnType<typeof setTimeout>>();
+
+const autosaveToastId = (key: VaultKey) => `vault-autosave-${key}`;
+
+function dismissAllAutosaveToasts() {
+  for (const key of Object.keys(VAULT_TO_SECRET) as VaultKey[]) {
+    toast.dismiss(autosaveToastId(key));
+  }
+}
 
 function enqueueVaultOp<T>(op: () => Promise<T>): Promise<T> {
   const run = vaultQueue.then(op, op);
@@ -73,13 +83,15 @@ function removeVaultKey(key: VaultKey) {
   if (cur.includes(key)) useApp.getState().setVaultKeys(cur.filter((k) => k !== key));
 }
 
-function scheduleVaultSync(secretName: SecretName, vaultKey: VaultKey) {
+function scheduleVaultSync(secretName: SecretName, vaultKey: VaultKey, delayMs = 250) {
   const existing = pendingTimers.get(vaultKey);
   if (existing) clearTimeout(existing);
   const scheduledEpoch = wipeEpoch;
+  const scheduledClearNonce = useApp.getState().clearNonce;
   const timer = setTimeout(() => {
     pendingTimers.delete(vaultKey);
-    if (scheduledEpoch !== wipeEpoch) return;
+    if (scheduledEpoch !== wipeEpoch || scheduledClearNonce !== useApp.getState().clearNonce) return;
+    let attemptedOp: "save" | "delete" = "save";
     void enqueueVaultOp(async () => {
       // Wait for boot capability check if an edit happened before vaultStatus() resolved.
       if (!useApp.getState().vaultLoaded && activeHydrationPromise) {
@@ -87,24 +99,51 @@ function scheduleVaultSync(secretName: SecretName, vaultKey: VaultKey) {
       }
       if (scheduledEpoch !== wipeEpoch) return;
       const state = useApp.getState();
+      if (state.clearNonce !== scheduledClearNonce) return;
       if (!state.rememberSecrets || !state.vaultSupported || !isTauri()) return;
       const latest = (state.secrets[secretName] || "").trim();
       if (latest) {
+        attemptedOp = "save";
         const ok = await vaultSaveSecret(vaultKey, latest);
         if (ok && scheduledEpoch === wipeEpoch) {
           addVaultKey(vaultKey);
           useApp.getState().setVaultError("");
+          toast.dismiss(autosaveToastId(vaultKey));
         }
       } else {
+        attemptedOp = "delete";
         const ok = await vaultDeleteSecret(vaultKey);
         if (ok && scheduledEpoch === wipeEpoch) {
           removeVaultKey(vaultKey);
+          toast.dismiss(autosaveToastId(vaultKey));
         }
       }
-    }).catch(() => {
-      /* surfaced on explicit save; avoid noisy toasts per keystroke */
+    }).catch((e) => {
+      const state = useApp.getState();
+      if (
+        scheduledEpoch !== wipeEpoch ||
+        state.clearNonce !== scheduledClearNonce ||
+        !state.rememberSecrets ||
+        !state.vaultSupported ||
+        !isTauri()
+      ) {
+        return;
+      }
+      const label = VAULT_KEY_LABELS[vaultKey] || vaultKey;
+      const verb = attemptedOp === "delete" ? "remove" : "save";
+      toast.error(`Could not ${verb} ${label} in local vault`, {
+        id: autosaveToastId(vaultKey),
+        description: `${errText(e, 180)} — Session value updated, but local PC vault was not.`,
+        duration: Infinity,
+        action: {
+          label: "Retry",
+          onClick: () => {
+            scheduleVaultSync(secretName, vaultKey, 0);
+          },
+        },
+      });
     });
-  }, 250);
+  }, delayMs);
   pendingTimers.set(vaultKey, timer);
 }
 
@@ -115,6 +154,7 @@ function scheduleVaultSync(secretName: SecretName, vaultKey: VaultKey) {
 useApp.subscribe((state, prev) => {
   if (state.clearNonce !== prev.clearNonce) {
     cancelPendingVaultWrites();
+    dismissAllAutosaveToasts();
     return;
   }
   if (suppressAutosave || !state.rememberSecrets || !isTauri()) {
@@ -204,34 +244,51 @@ export async function hydrateFromVault(): Promise<VaultKey[]> {
   }
 }
 
+export interface VaultSyncResult {
+  saved: number;
+  canceled: boolean;
+}
+
 /** Save all currently populated supported session secrets to the OS-protected vault. */
-export async function syncAllSecretsToVault(): Promise<number> {
-  if (!isTauri() || !useApp.getState().vaultSupported) return 0;
+export async function syncAllSecretsToVault(opts?: { requireRememberEpoch?: number }): Promise<VaultSyncResult> {
+  if (!isTauri() || !useApp.getState().vaultSupported) return { saved: 0, canceled: true };
   const syncEpoch = wipeEpoch;
+  const reqRememberEpoch = opts?.requireRememberEpoch;
+  const isCanceled = () =>
+    syncEpoch !== wipeEpoch ||
+    (reqRememberEpoch !== undefined &&
+      (reqRememberEpoch !== rememberEpoch || !useApp.getState().rememberSecrets));
+
   let saved = 0;
   for (const [secretName, vaultKey] of Object.entries(SECRET_TO_VAULT) as [SecretName, VaultKey][]) {
-    if (syncEpoch !== wipeEpoch) break;
-    const ok = await enqueueVaultOp(async () => {
-      if (syncEpoch !== wipeEpoch) return false;
+    if (isCanceled()) return { saved, canceled: true };
+    const step = await enqueueVaultOp(async (): Promise<"saved" | "skipped" | "canceled"> => {
+      if (isCanceled()) return "canceled";
       const state = useApp.getState();
-      if (!state.vaultSupported || !isTauri()) return false;
+      if (!state.vaultSupported || !isTauri()) return "canceled";
       const val = (state.secrets[secretName] || "").trim();
-      if (!val) return false;
+      if (!val) return "skipped";
       const written = await vaultSaveSecret(vaultKey, val);
       if (written && syncEpoch === wipeEpoch) {
         addVaultKey(vaultKey);
         useApp.getState().setVaultError("");
+        toast.dismiss(autosaveToastId(vaultKey));
       }
-      return written;
+      return written ? "saved" : "skipped";
     });
-    if (ok) saved++;
+    if (step === "canceled") return { saved, canceled: true };
+    if (step === "saved") saved++;
   }
-  return saved;
+  if (isCanceled()) return { saved, canceled: true };
+  return { saved, canceled: false };
 }
 
 /** Toggle opt-in Windows DPAPI persistence for secrets on this PC. */
 export async function setRememberOnPc(enabled: boolean): Promise<boolean> {
   if (!enabled) {
+    rememberEpoch += 1;
+    cancelPendingVaultWrites();
+    dismissAllAutosaveToasts();
     useApp.getState().setRememberSecrets(false);
     toastOk("Auto-save paused", "New secret edits stay in session only. Use Wipe local vault to remove already-saved keys.");
     return true;
@@ -246,17 +303,24 @@ export async function setRememberOnPc(enabled: boolean): Promise<boolean> {
     );
     return false;
   }
+  const reqRememberEpoch = ++rememberEpoch;
   useApp.getState().setRememberSecrets(true);
   try {
-    const count = await syncAllSecretsToVault();
+    const res = await syncAllSecretsToVault({ requireRememberEpoch: reqRememberEpoch });
+    if (res.canceled || reqRememberEpoch !== rememberEpoch || !useApp.getState().rememberSecrets) {
+      return false;
+    }
     toastOk(
       "Secure local persistence enabled",
-      count > 0
-        ? `Encrypted and saved ${count} secret(s) with Windows DPAPI.`
+      res.saved > 0
+        ? `Encrypted and saved ${res.saved} secret(s) with Windows DPAPI.`
         : "Future tokens you enter will be encrypted with Windows DPAPI on this PC.",
     );
     return true;
   } catch (e) {
+    if (reqRememberEpoch !== rememberEpoch || !useApp.getState().rememberSecrets) {
+      return false;
+    }
     toastErr("Vault save failed", errText(e, 220));
     return false;
   }
@@ -273,13 +337,17 @@ export async function saveSecretToVault(name: SecretName, value: string): Promis
     const trimmed = value.trim();
     if (!trimmed) {
       const ok = await vaultDeleteSecret(vaultKey);
-      if (ok && opEpoch === wipeEpoch) removeVaultKey(vaultKey);
+      if (ok && opEpoch === wipeEpoch) {
+        removeVaultKey(vaultKey);
+        toast.dismiss(autosaveToastId(vaultKey));
+      }
       return ok;
     }
     const ok = await vaultSaveSecret(vaultKey, trimmed);
     if (ok && opEpoch === wipeEpoch) {
       addVaultKey(vaultKey);
       useApp.getState().setVaultError("");
+      toast.dismiss(autosaveToastId(vaultKey));
     }
     return ok;
   });
@@ -288,7 +356,9 @@ export async function saveSecretToVault(name: SecretName, value: string): Promis
 /** Delete all secrets stored in the OS-protected local vault without touching active session values. */
 export async function wipeLocalVault(silent = false): Promise<boolean> {
   wipeEpoch += 1;
+  rememberEpoch += 1;
   cancelPendingVaultWrites();
+  dismissAllAutosaveToasts();
   useApp.getState().setRememberSecrets(false);
   try {
     const ok = await enqueueVaultOp(async () => {

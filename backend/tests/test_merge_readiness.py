@@ -1147,8 +1147,10 @@ def test_shared_head_sha_commit_status_aggregates_strictest_open_pr():
             r2 = await publish_readiness(
                 REPO, 111, rep_pass, merge_gate="required", github_token="ghp_pat1", auth_kind="pat", client=client
             )
-            # Close PR #110 -> now PR #111 is the only open PR on SHA -> publishes success!
+            # Close PR #110 -> automatically schedules open sibling PR #111 (marks dirty) without manual publish!
+            assert not events.is_dirty(REPO, 111)
             mark_pr_closed(REPO, 110, merged=False)
+            assert events.is_dirty(REPO, 111)
             r3 = await publish_readiness(
                 REPO, 111, rep_pass, merge_gate="required", github_token="ghp_pat1", auth_kind="pat", client=client
             )
@@ -1428,5 +1430,369 @@ def test_required_gate_write_failure_keeps_dirty_flag_and_bounded_retries():
         res_n = asyncio.run(_run_once())
         assert res_n["published"] is False
     assert store.rget(dkey) is None
+
+
+def test_per_dirty_token_retry_budget_and_isolated_cleanup():
+    from merge import publisher as merge_pub
+
+    pr_num = 119
+    dkey = dm.dirty_key(REPO, pr_num)
+
+    # Exhaust retry budget for tok-A
+    store.rset(dkey, "tok-A")
+    for _ in range(merge_pub._MAX_PUBLISH_RETRIES):
+        merge_pub._finalize_dirty_flag(REPO, pr_num, "tok-A", retry_needed=True)
+        assert store.rget(dkey) == "tok-A"
+    merge_pub._finalize_dirty_flag(REPO, pr_num, "tok-A", retry_needed=True)
+    assert store.rget(dkey) is None
+
+    # Newer dirty token tok-B gets its own full retry budget
+    store.rset(dkey, "tok-B")
+    merge_pub._finalize_dirty_flag(REPO, pr_num, "tok-B", retry_needed=True)
+    assert store.rget(dkey) == "tok-B"
+
+    # Completing an older token tok-A must NOT wipe tok-B's retry counter or dirty marker
+    merge_pub._finalize_dirty_flag(REPO, pr_num, "tok-A", retry_needed=False)
+    assert store.rget(dkey) == "tok-B"
+    assert store.rget(merge_pub._publish_retry_key(REPO, pr_num, "tok-B")) == "1"
+
+
+def test_pat_unresolved_identity_marks_comment_lookup_incomplete_and_skips_create():
+    posts: list[str] = []
+
+    def handler_fail_user(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/user":
+            return httpx.Response(500, text="user lookup failed")
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/statuses/{SHA}":
+            return httpx.Response(201, json={"id": 1})
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/issues/120/comments":
+            return httpx.Response(200, json=[
+                {"id": 50, "user": {"login": "ci-bot", "type": "User"}, "body": f"{READINESS_MARKER}\nexisting"},
+            ])
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/issues/120/comments":
+            posts.append(request.url.path)
+            return httpx.Response(201, json={"id": 51})
+        return httpx.Response(404)
+
+    rep = compute_readiness(REPO, 120, SHA, MergeSignals())
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_fail_user)) as client:
+            return await publish_readiness(
+                REPO, 120, rep, merge_gate="advisory", github_token="ghp_unverified_tok_120", auth_kind="pat", client=client
+            )
+
+    res = asyncio.run(_run())
+    assert res["comment"] == {"action": "skipped", "reason": "comment_lookup_incomplete"}
+    assert posts == []
+
+
+def test_sticky_comment_displays_incomplete_signals_and_suppresses_all_passed():
+    rep_empty = compute_readiness(REPO, 121, SHA, MergeSignals())
+    complete_md = render_readiness_comment(rep_empty)
+    assert "All pre-merge checks passed" in complete_md
+
+    incomplete_md = render_readiness_comment(rep_empty, incomplete_signals=["check_runs", "files"])
+    assert "All pre-merge checks passed" not in incomplete_md
+    assert "check_runs" in incomplete_md and "files" in incomplete_md
+
+    posted_bodies: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/check-runs":
+            return httpx.Response(201, json={"id": 7121})
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/issues/121/comments":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/issues/121/comments":
+            posted_bodies.append(json.loads(request.content.decode())["body"])
+            return httpx.Response(201, json={"id": 8121})
+        return httpx.Response(404)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await publish_readiness(
+                REPO, 121, rep_empty, merge_gate="advisory", github_token="ghs_app",
+                auth_kind="app", client=client, incomplete_signals=["reviews"],
+            )
+
+    asyncio.run(_run())
+    assert len(posted_bodies) == 1
+    assert "reviews" in posted_bodies[0]
+    assert "All pre-merge checks passed" not in posted_bodies[0]
+
+
+def test_mark_pr_closed_persists_pending_close_on_lock_contention_and_recovers():
+    from merge import publisher as merge_pub
+
+    pr_num = 122
+    rep = compute_readiness(REPO, pr_num, SHA, MergeSignals())
+    asyncio.run(publish_readiness(REPO, pr_num, rep, merge_gate="off"))
+
+    # Hold the PR state lock so mark_pr_closed hits contention
+    lock_key = merge_pub._pr_state_lock_key(REPO, pr_num)
+    store.rset(lock_key, "other-worker-token", ex=30)
+    try:
+        res = mark_pr_closed(REPO, pr_num, merged=True, head_sha=SHA, lock_wait_s=0.05, max_attempts=1)
+        assert res is None
+        assert store.rget_json(merge_pub._pending_close_key(REPO, pr_num)) is not None
+    finally:
+        store.rdelete(lock_key)
+
+    # Recovery via publish_readiness (without needing prdirty or sweeper): applies pending close & rejects stale open snapshot
+    older_ts = "2020-01-01T00:00:00+00:00"
+    pub_res = asyncio.run(
+        publish_readiness(REPO, pr_num, rep, merge_gate="off", pr_meta={"state": "open"}, snapshot_at=older_ts)
+    )
+    assert pub_res.get("stale") is True
+    assert store.rget_json(merge_pub._pending_close_key(REPO, pr_num)) is None
+    inbox_row = store.rget_json(merge_pub.inbox_key(REPO, pr_num))
+    assert isinstance(inbox_row, dict) and inbox_row["state"] == "merged"
+
+
+def test_expired_lease_holder_cannot_commit_pr_state():
+    from merge import publisher as merge_pub
+
+    pr_num = 123
+    lock_key = merge_pub._pr_state_lock_key(REPO, pr_num)
+    target_key = merge_pub.inbox_key(REPO, pr_num)
+    store.rset(lock_key, "new-owner-token", ex=30)
+    store.rset_json(target_key, {"state": "merged", "owner": "new"})
+
+    # Old owner with expired token must NOT overwrite state
+    ok = store.rcommit_if_lock_held(
+        lock_key,
+        "expired-owner-token",
+        [(target_key, json.dumps({"state": "open", "owner": "old"}), 60)],
+    )
+    assert ok is False
+    assert store.rget_json(target_key) == {"state": "merged", "owner": "new"}
+
+
+def test_publish_readiness_lock_wait_does_not_block_event_loop_and_serializes_github_writes():
+    from merge import publisher as merge_pub
+
+    pr_num = 124
+    rep_old = compute_readiness(REPO, pr_num, SHA, MergeSignals(failing_checks=[{"name": "ci"}]))
+    rep_new = compute_readiness(REPO, pr_num, SHA, MergeSignals())
+    write_order: list[str] = []
+    loop_ticks = 0
+
+    async def _run():
+        nonlocal loop_ticks
+
+        async def _ticker():
+            nonlocal loop_ticks
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+                loop_ticks += 1
+
+        # Hold state lock briefly in background to verify event loop keeps ticking during wait
+        state_lock = merge_pub._pr_state_lock_key(REPO, pr_num)
+        store.rset(state_lock, "busy", ex=5)
+
+        async def _release_soon():
+            await asyncio.sleep(0.06)
+            store.rdelete(state_lock)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path == f"/repos/{REPO}/check-runs":
+                body = json.loads(request.content.decode())
+                write_order.append(body["conclusion"])
+                return httpx.Response(201, json={"id": 9124})
+            if request.method == "PATCH" and "/check-runs/" in request.url.path:
+                body = json.loads(request.content.decode())
+                write_order.append(body["conclusion"])
+                return httpx.Response(200, json={"id": 9124})
+            if request.method == "GET" and request.url.path.endswith("/comments"):
+                return httpx.Response(200, json=[])
+            if request.method == "POST" and request.url.path.endswith("/comments"):
+                return httpx.Response(201, json={"id": 9125})
+            if request.method == "PATCH" and "/issues/comments/" in request.url.path:
+                return httpx.Response(200, json={"id": 9125})
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            t_tick = asyncio.create_task(_ticker())
+            t_rel = asyncio.create_task(_release_soon())
+            # Newer snapshot runs first, older snapshot queued behind publish lock -> older MUST NOT write after newer!
+            res_new = await publish_readiness(
+                REPO, pr_num, rep_new, merge_gate="required", github_token="ghs_app",
+                auth_kind="app", client=client, snapshot_at="2026-01-02T00:00:00+00:00",
+            )
+            res_old = await publish_readiness(
+                REPO, pr_num, rep_old, merge_gate="required", github_token="ghs_app",
+                auth_kind="app", client=client, snapshot_at="2026-01-01T00:00:00+00:00",
+            )
+            await asyncio.gather(t_tick, t_rel)
+            return res_new, res_old
+
+    res_new, res_old = asyncio.run(_run())
+    assert loop_ticks >= 2
+    assert res_new["published"] is True
+    assert res_old.get("stale") is True
+    assert write_order == ["success"]
+
+
+def test_stale_thread_resolve_cannot_override_newer_unresolve(monkeypatch):
+    import events as events_mod
+
+    fp = dm.finding_fingerprint("backend/app.py", "x = 1", "bug", "Race test finding")
+    store.rset_json(
+        dm.finding_key(REPO, 125, fp),
+        {
+            "fingerprint": fp,
+            "file": "backend/app.py",
+            "severity": "major",
+            "category": "bug",
+            "title": "Race test finding",
+            "state": "open",
+            "comment_id": 7701,
+        },
+        ex=dm.FINDING_TTL_S,
+    )
+
+    unresolve_done = asyncio.Event()
+    perm_started = asyncio.Event()
+
+    async def slow_write_perm(repo: str, actor: str) -> bool:
+        perm_started.set()
+        await unresolve_done.wait()
+        return True
+
+    monkeypatch.setattr(events_mod, "_actor_has_write_permission", slow_write_perm)
+
+    payload_resolve = {
+        "action": "resolved",
+        "repository": {"full_name": REPO},
+        "sender": {"login": "alice", "type": "User"},
+        "pull_request": {"number": 125},
+        "thread": {"node_id": "T_RACE", "comments": [{"id": 7701, "path": "backend/app.py"}]},
+    }
+    payload_unresolve = {
+        "action": "unresolved",
+        "repository": {"full_name": REPO},
+        "sender": {"login": "alice", "type": "User"},
+        "pull_request": {"number": 125},
+        "thread": {"node_id": "T_RACE", "comments": [{"id": 7701, "path": "backend/app.py"}]},
+    }
+
+    async def _run():
+        t_res = asyncio.create_task(events_mod.route("pull_request_review_thread", payload_resolve, "d-res-1"))
+        await perm_started.wait()
+        await events_mod.route("pull_request_review_thread", payload_unresolve, "d-unres-2")
+        unresolve_done.set()
+        return await t_res
+
+    res = asyncio.run(_run())
+    assert "finding_updated" not in res
+    assert store.rget_json(dm.finding_key(REPO, 125, fp))["state"] == "open"
+
+
+def test_webhook_repo_secret_cannot_write_installation_cache_and_closed_pr_schedules_sibling(monkeypatch):
+    import hashlib
+    import hmac
+    from fastapi.testclient import TestClient
+    import main
+
+    repo_secret = "repo-secret-123"
+    app_secret = "app-secret-456"
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", repo_secret)
+    monkeypatch.setenv("GITHUB_APP_WEBHOOK_SECRET", app_secret)
+    monkeypatch.setattr(main, "GITHUB_WEBHOOK_SECRET", repo_secret)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_token")
+
+    def _sig(body: bytes, secret: str) -> str:
+        return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    client = TestClient(main.app)
+    review_payload = {
+        "action": "submitted",
+        "repository": {"full_name": REPO},
+        "installation": {"id": 99999},
+        "pull_request": {"number": 126, "head": {"sha": SHA, "ref": "feat"}},
+        "review": {"id": 1, "state": "commented", "user": {"login": "bob"}},
+        "sender": {"type": "User"},
+    }
+    raw = json.dumps(review_payload).encode()
+
+    # 1. Repo-secret signed delivery MUST NOT cache installation id
+    r_repo = client.post(
+        "/webhooks/github",
+        content=raw,
+        headers={
+            "X-GitHub-Event": "pull_request_review",
+            "X-GitHub-Delivery": "del-repo-sec",
+            "X-Hub-Signature-256": _sig(raw, repo_secret),
+            "Content-Type": "application/json",
+        },
+    )
+    assert r_repo.status_code == 202
+    assert store.rget(f"ghinst:{REPO.lower()}") is None
+
+    # 2. App-secret signed delivery DOES cache installation id
+    r_app = client.post(
+        "/webhooks/github",
+        content=raw,
+        headers={
+            "X-GitHub-Event": "pull_request_review",
+            "X-GitHub-Delivery": "del-app-sec",
+            "X-Hub-Signature-256": _sig(raw, app_secret),
+            "Content-Type": "application/json",
+        },
+    )
+    assert r_app.status_code == 202
+    assert store.rget(f"ghinst:{REPO.lower()}") == "99999"
+
+    # 3. Closing PR #110 via webhook schedules open sibling PR #111 sharing the same head SHA
+    scheduled: list[tuple[str, int]] = []
+
+    async def fake_schedule(repo: str, pr_num: int, tasks=None, *, bypass_debounce=False, base_ref=""):
+        scheduled.append((repo, pr_num))
+        return True
+
+    monkeypatch.setattr(main, "_schedule_readiness_recompute", fake_schedule)
+    from merge import publisher as merge_pub
+    events.remember_head(REPO, 110, SHA)
+    events.remember_head(REPO, 111, SHA)
+    store.rset_json(merge_pub.inbox_key(REPO, 110), {"repo": REPO, "pr_number": 110, "head_sha": SHA, "state": "open"})
+    store.rset_json(merge_pub.inbox_key(REPO, 111), {"repo": REPO, "pr_number": 111, "head_sha": SHA, "state": "open"})
+
+    close_payload = {
+        "action": "closed",
+        "repository": {"full_name": REPO},
+        "pull_request": {"number": 110, "merged": False, "head": {"sha": SHA, "ref": "f1"}},
+        "sender": {"type": "User"},
+    }
+    raw_close = json.dumps(close_payload).encode()
+    r_close = client.post(
+        "/webhooks/github",
+        content=raw_close,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": "del-close-110",
+            "X-Hub-Signature-256": _sig(raw_close, app_secret),
+            "Content-Type": "application/json",
+        },
+    )
+    assert r_close.status_code == 202
+    assert (REPO, 111) in scheduled
+    assert events.is_dirty(REPO, 111)
+
+
+def test_effective_readiness_config_uses_pr_snapshot_and_marks_policy_incomplete(monkeypatch):
+    import main
+
+    # When PR snapshot cannot be fetched, _effective_readiness_config must mark _policy_incomplete=True
+    async def no_snapshot(repo: str, pr_num: int):
+        return None
+
+    monkeypatch.setattr(main, "_fetch_pr_snapshot", no_snapshot)
+    cfg = asyncio.run(
+        main._effective_readiness_config(
+            REPO, {"merge_gate": "required", "score_threshold": 80}, base_ref="stale-webhook-ref", pr_number=127
+        )
+    )
+    assert cfg.get("_policy_incomplete") is True
+
 
 

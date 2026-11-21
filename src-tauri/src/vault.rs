@@ -91,8 +91,14 @@ mod file_lock {
     use std::fs::{File, OpenOptions};
     use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const ERROR_LOCK_VIOLATION: u32 = 33;
+
+    pub(super) const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+    const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
     #[repr(C)]
     struct Overlapped {
@@ -140,6 +146,13 @@ mod file_lock {
 
     impl VaultFileGuard {
         pub(super) fn acquire(vault_path: &Path) -> Result<Self, String> {
+            Self::acquire_with_timeout(vault_path, DEFAULT_LOCK_TIMEOUT)
+        }
+
+        pub(super) fn acquire_with_timeout(
+            vault_path: &Path,
+            timeout: Duration,
+        ) -> Result<Self, String> {
             if let Some(parent) = vault_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("could not create vault directory: {}", e))?;
@@ -152,30 +165,44 @@ mod file_lock {
                 .truncate(false)
                 .open(&lock_path)
                 .map_err(|e| format!("could not open vault lock file: {}", e))?;
-            let mut overlapped = Overlapped {
-                internal: 0,
-                internal_high: 0,
-                offset: 0,
-                offset_high: 0,
-                h_event: std::ptr::null_mut(),
-            };
-            // SAFETY: `file` holds a valid OS handle for the lifetime of `Self`,
-            // and `overlapped` is a valid zero-initialized OVERLAPPED struct.
-            let ok = unsafe {
-                LockFileEx(
-                    file.as_raw_handle(),
-                    LOCKFILE_EXCLUSIVE_LOCK,
-                    0,
-                    1,
-                    0,
-                    &mut overlapped,
-                )
-            };
-            if ok == 0 {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let mut overlapped = Overlapped {
+                    internal: 0,
+                    internal_high: 0,
+                    offset: 0,
+                    offset_high: 0,
+                    h_event: std::ptr::null_mut(),
+                };
+                // SAFETY: `file` holds a valid OS handle for the lifetime of `Self`,
+                // and `overlapped` is a valid zero-initialized OVERLAPPED struct.
+                let ok = unsafe {
+                    LockFileEx(
+                        file.as_raw_handle(),
+                        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                        0,
+                        1,
+                        0,
+                        &mut overlapped,
+                    )
+                };
+                if ok != 0 {
+                    return Ok(Self { file });
+                }
                 let err = unsafe { GetLastError() };
-                return Err(format!("could not lock vault file (error 0x{:08X})", err));
+                if err != ERROR_LOCK_VIOLATION {
+                    return Err(format!("could not lock vault file (error 0x{:08X})", err));
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "vault is locked by another process (timed out after {} ms); retry or close the other instance",
+                        timeout.as_millis()
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(remaining.min(LOCK_POLL_INTERVAL));
             }
-            Ok(Self { file })
         }
     }
 
@@ -799,6 +826,143 @@ mod tests {
         assert_eq!(loaded.get("backend_api_token").map(String::as_str), Some("tok_4"));
         assert_eq!(loaded.get("github_token").map(String::as_str), Some("gh_4"));
         assert!(file_lock::lock_file_path(&path).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn cross_process_vault_worker_helper() {
+        let Ok(mode) = std::env::var("PR_AGENT_VAULT_TEST_CHILD_MODE") else {
+            return;
+        };
+        let vault_path = PathBuf::from(
+            std::env::var("PR_AGENT_VAULT_TEST_PATH").expect("missing PR_AGENT_VAULT_TEST_PATH"),
+        );
+        match mode.as_str() {
+            "hold_then_save" => {
+                let ready_path = PathBuf::from(
+                    std::env::var("PR_AGENT_VAULT_TEST_READY")
+                        .expect("missing PR_AGENT_VAULT_TEST_READY"),
+                );
+                let release_path = PathBuf::from(
+                    std::env::var("PR_AGENT_VAULT_TEST_RELEASE")
+                        .expect("missing PR_AGENT_VAULT_TEST_RELEASE"),
+                );
+                let guard = file_lock::VaultFileGuard::acquire(&vault_path)
+                    .expect("child 1 should acquire OS lock");
+                std::fs::write(&ready_path, b"locked").expect("write ready marker");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !release_path.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for release marker"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                drop(guard);
+                save_secret_at(&vault_path, "backend_api_token", "proc_a_token")
+                    .expect("child 1 save should succeed");
+            }
+            "save_key" => {
+                let key = std::env::var("PR_AGENT_VAULT_TEST_KEY")
+                    .expect("missing PR_AGENT_VAULT_TEST_KEY");
+                let val = std::env::var("PR_AGENT_VAULT_TEST_VAL")
+                    .expect("missing PR_AGENT_VAULT_TEST_VAL");
+                save_secret_at(&vault_path, &key, &val).expect("child 2 save should succeed");
+            }
+            other => panic!("unknown child mode: {}", other),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_lock_enforces_cross_process_exclusion_and_preserves_writes() {
+        let (dir, path) = scratch_vault_path("cross_proc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ready_path = dir.join("ready.flag");
+        let release_path = dir.join("release.flag");
+        let exe = std::env::current_exe().unwrap();
+
+        let mut child1 = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "vault::tests::cross_process_vault_worker_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PR_AGENT_VAULT_TEST_CHILD_MODE", "hold_then_save")
+            .env("PR_AGENT_VAULT_TEST_PATH", &path)
+            .env("PR_AGENT_VAULT_TEST_READY", &ready_path)
+            .env("PR_AGENT_VAULT_TEST_RELEASE", &release_path)
+            .spawn()
+            .expect("spawn child 1");
+
+        // Wait deterministically until child 1 holds the OS lock.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_path.exists() {
+            if let Some(status) = child1.try_wait().unwrap() {
+                panic!("child 1 exited before acquiring lock: {}", status);
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                let _ = child1.kill();
+                let _ = child1.wait();
+                panic!("timed out waiting for child 1 to acquire lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        // Bounded acquisition from another process must return the documented contention error.
+        let lock_err = file_lock::VaultFileGuard::acquire_with_timeout(
+            &path,
+            std::time::Duration::from_millis(150),
+        )
+        .err()
+        .expect("bounded lock acquisition should fail while child 1 holds the OS lock");
+        assert!(
+            lock_err.contains("locked by another process") && lock_err.contains("timed out"),
+            "unexpected contention error: {}",
+            lock_err
+        );
+
+        // Launch a second OS process writing a different key; it must wait while child 1 holds the lock.
+        let mut child2 = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "vault::tests::cross_process_vault_worker_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PR_AGENT_VAULT_TEST_CHILD_MODE", "save_key")
+            .env("PR_AGENT_VAULT_TEST_PATH", &path)
+            .env("PR_AGENT_VAULT_TEST_KEY", "github_token")
+            .env("PR_AGENT_VAULT_TEST_VAL", "proc_b_github")
+            .spawn()
+            .expect("spawn child 2");
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            child2.try_wait().unwrap().is_none(),
+            "second process must wait for OS lock while first process holds it"
+        );
+
+        // Release child 1 so both processes complete their writes.
+        std::fs::write(&release_path, b"go").unwrap();
+        let status1 = child1.wait().unwrap();
+        let status2 = child2.wait().unwrap();
+        assert!(status1.success(), "child 1 failed: {}", status1);
+        assert!(status2.success(), "child 2 failed: {}", status2);
+
+        let loaded = load_secrets_at(&path).unwrap();
+        assert_eq!(
+            loaded.get("backend_api_token").map(String::as_str),
+            Some("proc_a_token")
+        );
+        assert_eq!(
+            loaded.get("github_token").map(String::as_str),
+            Some("proc_b_github")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

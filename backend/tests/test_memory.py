@@ -539,6 +539,8 @@ def test_bootstrap_repo_accepts_explicit_token_without_token_lookup(monkeypatch)
 
         async def get(self, url, headers=None):
             seen_auth.append((headers or {}).get("Authorization", ""))
+            if url.endswith("/contents"):
+                return _Resp(200, data=[])
             return _Resp(404, data={})
 
     import github_app
@@ -642,24 +644,46 @@ def test_update_memory_preserves_concurrent_edits_to_different_fields(monkeypatc
     )
     mid = created["id"]
     mem_key = dm.memory_key(REPO, mid)
-    first_entered = threading.Event()
-    orig_rget_json = store.rget_json
+    lock_key = f"memlock:{REPO.lower()}:{mid}"
+    first_in_lock = threading.Event()
+    second_contended = threading.Event()
+    second_read_while_first_held = threading.Event()
+    first_holder_tid: list[int] = []
+    first_lock_active = threading.Event()
 
-    def _slow_first_read(key: str):
+    orig_rget_json = store.rget_json
+    orig_rset = store.rset
+
+    def _tracking_rset(key: str, value: str, ex=None, nx: bool = False):
+        ok = orig_rset(key, value, ex=ex, nx=nx)
+        if key == lock_key and nx and not ok:
+            second_contended.set()
+        return ok
+
+    def _guarded_rget_json(key: str):
         val = orig_rget_json(key)
-        if key == mem_key and not first_entered.is_set():
-            first_entered.set()
-            # Yield so the second thread starts waiting on the same key_lock.
-            threading.Event().wait(0.05)
+        if key == mem_key:
+            tid = threading.get_ident()
+            if not first_in_lock.is_set():
+                first_holder_tid.append(tid)
+                first_lock_active.set()
+                first_in_lock.set()
+                # Wait deterministically until the second worker hits the contested key lock.
+                assert second_contended.wait(timeout=2.0)  # nosec B101
+                assert not second_read_while_first_held.is_set()  # nosec B101
+                first_lock_active.clear()
+            elif first_lock_active.is_set() and tid not in first_holder_tid:
+                second_read_while_first_held.set()
         return val
 
-    monkeypatch.setattr(store, "rget_json", _slow_first_read)
+    monkeypatch.setattr(store, "rset", _tracking_rset)
+    monkeypatch.setattr(store, "rget_json", _guarded_rget_json)
 
     def _patch_blocking():
         return memory.update_memory(REPO, mid, {"blocking": True})
 
     def _patch_text():
-        assert first_entered.wait(timeout=2.0)  # nosec B101
+        assert first_in_lock.wait(timeout=2.0)  # nosec B101
         return memory.update_memory(REPO, mid, {"text": "Updated rule text"})
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -668,6 +692,8 @@ def test_update_memory_preserves_concurrent_edits_to_different_fields(monkeypatc
         f1.result()
         f2.result()
 
+    assert second_contended.is_set()  # nosec B101
+    assert not second_read_while_first_held.is_set()  # nosec B101
     final = memory.get_memory(REPO, mid)
     assert final is not None  # nosec B101
     assert final["blocking"] is True  # nosec B101
@@ -1164,3 +1190,365 @@ def test_extract_learnings_from_merged_pr_escapes_literal_glob_metacharacters():
     assert [r["id"] for r in hit_wild["rules"]] == [created[1]["id"]]  # nosec B101
     miss_wild = memory.retrieve_for_diff(REPO, ["src/axbyc.ts"], diff_text="schema validation")
     assert miss_wild["rules"] == []  # nosec B101
+
+
+# ---------------------------------------------------------------------------
+# PR #18 follow-up review fixes (threads 1-10)
+# ---------------------------------------------------------------------------
+
+
+def test_batch_eviction_preserves_blocking_and_used_over_imported_unused(monkeypatch):
+    monkeypatch.setattr(dm, "MEMORY_MAX_ENTRIES_PER_REPO", 4)
+    blocking_old = memory.add_memory(
+        REPO,
+        {"text": "Blocking security rule", "blocking": True, "created_at": "2026-01-01T00:00:00+00:00"},
+    )
+    used_old = memory.add_memory(
+        REPO,
+        {
+            "text": "Used non-blocking rule",
+            "blocking": False,
+            "hits": 4,
+            "last_used": "2026-06-01T00:00:00+00:00",
+            "created_at": "2026-01-02T00:00:00+00:00",
+        },
+    )
+    unused_old = memory.add_memory(
+        REPO,
+        {"text": "Unused old rule", "blocking": False, "created_at": "2026-01-03T00:00:00+00:00"},
+    )
+
+    # Import 3 unused non-blocking entries (total 6, cap 4 -> 2 victims).
+    # Must evict unused_old + 1 imported unused entry, preserving blocking_old and used_old!
+    res = memory.import_memories(
+        REPO,
+        [
+            {"text": "Imported unused 1", "created_at": "2026-01-01T00:00:01+00:00"},
+            {"text": "Imported unused 2", "created_at": "2026-07-02T00:00:00+00:00"},
+            {"text": "Imported unused 3", "created_at": "2026-07-03T00:00:00+00:00"},
+        ],
+    )
+    assert res["imported"] == 3 and res["failed"] == 0  # nosec B101
+    remaining_ids = {m["id"] for m in memory.list_memories(REPO)}
+    assert len(remaining_ids) == 4  # nosec B101
+    assert blocking_old["id"] in remaining_ids  # nosec B101
+    assert used_old["id"] in remaining_ids  # nosec B101
+    assert unused_old["id"] not in remaining_ids  # nosec B101
+
+
+def test_add_memory_and_import_serialize_through_repo_lock(monkeypatch):
+    monkeypatch.setattr(dm, "MEMORY_MAX_ENTRIES_PER_REPO", 4)
+    repo_lock_key = f"memrepolock:{REPO.lower()}"
+    contended = threading.Event()
+    import_in_lock = threading.Event()
+
+    orig_rset = store.rset
+    orig_rkeys = store.rkeys
+
+    def _tracking_rset(key: str, value: str, ex=None, nx: bool = False):
+        ok = orig_rset(key, value, ex=ex, nx=nx)
+        if key == repo_lock_key and nx and not ok:
+            contended.set()
+        return ok
+
+    def _pausing_rkeys(pattern: str):
+        keys = orig_rkeys(pattern)
+        if pattern.startswith(dm.memory_prefix(REPO)) and not import_in_lock.is_set():
+            import_in_lock.set()
+            assert contended.wait(timeout=2.0)  # nosec B101
+        return keys
+
+    monkeypatch.setattr(store, "rset", _tracking_rset)
+    monkeypatch.setattr(store, "rkeys", _pausing_rkeys)
+
+    def _run_import():
+        return memory.import_memories(
+            REPO,
+            [{"text": f"Imported item {i}"} for i in range(4)],
+        )
+
+    def _run_add():
+        assert import_in_lock.wait(timeout=2.0)  # nosec B101
+        return memory.add_memory(REPO, {"text": "Concurrent add_memory item"})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_imp = pool.submit(_run_import)
+        f_add = pool.submit(_run_add)
+        f_imp.result()
+        f_add.result()
+
+    assert contended.is_set()  # nosec B101
+    assert len(memory.list_memories(REPO)) <= 4  # nosec B101
+
+
+def test_retrieve_for_diff_reclassifies_rechecks_scope_and_enforces_latest_budget(monkeypatch):
+    import memory.service as memory_service
+
+    m_reclass = memory.add_memory(
+        REPO,
+        {"kind": "learning", "text": "Originally a learning rule", "scope_globs": ["backend/**"], "blocking": True},
+    )
+    m_rescope = memory.add_memory(
+        REPO,
+        {"kind": "learning", "text": "Rule whose scope will move", "scope_globs": ["backend/**"]},
+    )
+    m_grow = memory.add_memory(
+        REPO,
+        {"kind": "learning", "text": "Short rule", "scope_globs": ["backend/**"]},
+    )
+    m_ok = memory.add_memory(
+        REPO,
+        {"kind": "learning", "text": "Normal surviving rule", "scope_globs": ["backend/**"]},
+    )
+
+    orig_list = memory_service.list_memories
+
+    def _list_then_edit(repo: str, **kwargs):
+        entries = orig_list(repo, **kwargs)
+        # 1. Reclassify m_reclass from learning -> dismissed_pattern
+        memory.update_memory(repo, m_reclass["id"], {"kind": "dismissed_pattern", "blocking": False})
+        # 2. Change m_rescope scope so it no longer matches backend/store.py
+        memory.update_memory(repo, m_rescope["id"], {"scope_globs": ["frontend/**"]})
+        # 3. Grow m_grow text so it exceeds the remaining budget
+        memory.update_memory(repo, m_grow["id"], {"text": "X" * 400})
+        return entries
+
+    monkeypatch.setattr(memory_service, "list_memories", _list_then_edit)
+
+    res = memory.retrieve_for_diff(REPO, ["backend/store.py"], diff_text="rule", max_chars=250)
+
+    # m_reclass must be in dismissed, NOT rules!
+    assert [d["id"] for d in res["dismissed"]] == [m_reclass["id"]]  # nosec B101
+    assert [r["id"] for r in res["rules"]] == [m_ok["id"]]  # nosec B101
+    assert set(res["used_ids"]) == {m_reclass["id"], m_ok["id"]}  # nosec B101
+
+    # m_rescope and m_grow were skipped without incrementing hits
+    assert memory.get_memory(REPO, m_rescope["id"])["hits"] == 0  # type: ignore[index]  # nosec B101
+    assert memory.get_memory(REPO, m_grow["id"])["hits"] == 0  # type: ignore[index]  # nosec B101
+    assert memory.get_memory(REPO, m_reclass["id"])["hits"] == 1  # type: ignore[index]  # nosec B101
+    assert memory.get_memory(REPO, m_ok["id"])["hits"] == 1  # type: ignore[index]  # nosec B101
+
+
+def test_record_finding_dismissal_sets_dirty_marker_on_retry(monkeypatch):
+    fp = dm.finding_fingerprint("src/d.py", "dirty()", "style", "Dirty marker retry test")
+    store.rset_json(
+        dm.finding_key(REPO, 55, fp),
+        {"fingerprint": fp, "file": "src/d.py", "category": "style", "title": "Dirty marker retry test", "state": "open"},
+        ex=dm.FINDING_TTL_S,
+    )
+    dirty_k = dm.dirty_key(REPO, 55)
+    orig_rset = store.rset
+    fail_dirty = {"once": True}
+
+    def _fail_dirty_once(key: str, value: str, ex=None, nx: bool = False):
+        if key == dirty_k and fail_dirty["once"]:
+            fail_dirty["once"] = False
+            raise RuntimeError("transient dirty write failure")
+        return orig_rset(key, value, ex=ex, nx=nx)
+
+    monkeypatch.setattr(store, "rset", _fail_dirty_once)
+
+    with pytest.raises(RuntimeError, match="transient dirty write failure"):
+        memory.record_finding_dismissal(REPO, 55, fp, author="alice")
+
+    # Finding is already marked dismissed, yet dirty key is absent.
+    assert store.rget(dirty_k) is None  # nosec B101
+
+    # Retry succeeds and sets the dirty key even though already_dismissed is True!
+    res = memory.record_finding_dismissal(REPO, 55, fp, author="alice")
+    assert res["already_dismissed"] is True  # nosec B101
+    assert store.rget(dirty_k) is not None  # nosec B101
+
+
+def test_record_finding_dismissal_atomic_redis_lua_claim_and_no_claim_delete(monkeypatch):
+    import memory.service as memory_service
+
+    # Simulate a Redis client whose EVAL commits claim + INCR + TTL atomically,
+    # then drops the response on the first call (post-commit network error).
+    redis_kv: dict[str, str] = {}
+    eval_calls = {"n": 0}
+    delete_calls: list[str] = []
+
+    class _FakeRedis:
+        def eval(self, script, numkeys, *keys_and_args):
+            eval_calls["n"] += 1
+            counted_k, counter_k, _ttl = keys_and_args[0], keys_and_args[1], keys_and_args[2]
+            if counted_k not in redis_kv:
+                redis_kv[counted_k] = "1"
+                redis_kv[counter_k] = str(int(redis_kv.get(counter_k, "0")) + 1)
+            val = int(redis_kv[counter_k])
+            if eval_calls["n"] == 1:
+                raise RuntimeError("socket timeout after Redis commit")
+            return val
+
+    orig_rdelete = store.rdelete
+
+    def _track_delete(key: str):
+        delete_calls.append(key)
+        return orig_rdelete(key)
+
+    monkeypatch.setattr(store, "_REDIS", _FakeRedis())
+    monkeypatch.setattr(store, "_REDIS_CONFIGURED", True)
+    monkeypatch.setattr(store, "rdelete", _track_delete)
+
+    counter_k = f"memdismiss:{REPO.lower()}:abcdef1234567890"
+    counted_k = f"memdismisscounted:{REPO.lower()}:60:fp:abcdef1234567890"
+
+    with pytest.raises(RuntimeError, match="socket timeout after Redis commit"):
+        memory_service._claim_and_increment_dismiss_count(counter_k, counted_k, 3600)
+
+    # Claim was NOT deleted after committed increment!
+    assert counted_k not in delete_calls  # nosec B101
+    assert redis_kv[counter_k] == "1"  # nosec B101
+
+    # Retry sees the already-committed claim and returns 1 without incrementing again!
+    count_retry = memory_service._claim_and_increment_dismiss_count(counter_k, counted_k, 3600)
+    assert count_retry == 1  # nosec B101
+    assert redis_kv[counter_k] == "1"  # nosec B101
+
+
+def test_record_finding_dismissal_pattern_boost_is_idempotent_across_done_marker_failure(monkeypatch):
+    # First create a dismissed_pattern with explicit reason on PR #70.
+    fp1 = dm.finding_fingerprint("src/p1.py", "x()", "style", "Idempotent boost test")
+    r1 = memory.record_finding_dismissal(
+        REPO,
+        70,
+        fp1,
+        finding={"file": "src/p1.py", "category": "style", "title": "Idempotent boost test"},
+        reason="Intentional pattern",
+        author="alice",
+    )
+    assert r1["pattern_created"] is True  # nosec B101
+    conf_after_create = r1["memory"]["confidence"]
+
+    # Second distinct dismissal on PR #71 boosts confidence, then done_key write fails!
+    fp2 = dm.finding_fingerprint("src/p2.py", "y()", "style", "Idempotent boost test")
+    store.rset_json(
+        dm.finding_key(REPO, 71, fp2),
+        {"fingerprint": fp2, "file": "src/p2.py", "category": "style", "title": "Idempotent boost test", "state": "open"},
+        ex=dm.FINDING_TTL_S,
+    )
+
+    orig_rset = store.rset
+    fail_done = {"once": True}
+
+    def _fail_done_once(key: str, value: str, ex=None, nx: bool = False):
+        if key.startswith("memdismissdone:") and fail_done["once"]:
+            fail_done["once"] = False
+            raise RuntimeError("transient done marker failure")
+        return orig_rset(key, value, ex=ex, nx=nx)
+
+    monkeypatch.setattr(store, "rset", _fail_done_once)
+
+    with pytest.raises(RuntimeError, match="transient done marker failure"):
+        memory.record_finding_dismissal(REPO, 71, fp2, author="bob")
+
+    saved_mid = memory.get_memory(REPO, r1["memory"]["id"])
+    assert saved_mid is not None  # nosec B101
+    conf_after_boost = saved_mid["confidence"]
+    assert conf_after_boost > conf_after_create  # nosec B101
+
+    # Retry completes missing done_key without boosting confidence a second time!
+    r2_retry = memory.record_finding_dismissal(REPO, 71, fp2, author="bob")
+    assert r2_retry["pattern_boosted"] is False  # nosec B101
+    assert r2_retry["memory"]["confidence"] == conf_after_boost  # nosec B101
+
+    # A 3rd DISTINCT dismissal still boosts confidence!
+    fp3 = dm.finding_fingerprint("src/p3.py", "z()", "style", "Idempotent boost test")
+    r3 = memory.record_finding_dismissal(
+        REPO,
+        72,
+        fp3,
+        finding={"file": "src/p3.py", "category": "style", "title": "Idempotent boost test"},
+        author="carol",
+    )
+    assert r3["pattern_boosted"] is True  # nosec B101
+    assert r3["memory"]["confidence"] > conf_after_boost  # nosec B101
+
+
+def test_editorconfig_braces_inside_char_classes_are_not_expanded():
+    import memory.service as memory_service
+
+    cfg = (
+        "[file[ab{1..2}].txt]\n"
+        "indent_size = 2\n"
+        "[file[ab{1..2}].{py,rs}]\n"
+        "indent_size = 4\n"
+        "[file[!]{1..2}].txt]\n"
+        "indent_size = 3\n"
+        "[*.{1..3}]\n"
+        "indent_size = 2\n"
+    )
+    facts = dict(memory_service._extract_editorconfig_facts(cfg))
+    assert facts["EditorConfig [file[ab{1..2}].txt]: indent_size=2"] == ["**/file[ab{1..2}].txt"]  # nosec B101
+    assert facts["EditorConfig [file[ab{1..2}].{py,rs}]: indent_size=4"] == [
+        "**/file[ab{1..2}].py",
+        "**/file[ab{1..2}].rs",
+    ]  # nosec B101
+    assert facts["EditorConfig [file[!]{1..2}].txt]: indent_size=3"] == ["**/file[!]{1..2}].txt"]  # nosec B101
+    assert facts["EditorConfig [*.{1..3}]: indent_size=2"] == ["**/*.1", "**/*.2", "**/*.3"]  # nosec B101
+
+
+def test_bootstrap_repo_verifies_contents_access_before_treating_all_404_as_absence():
+    class _Client:
+        def __init__(self, handler):
+            self._handler = handler
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            return self._handler(url)
+
+    # 1. Initial valid bootstrap creates profile + bootstrap facts.
+    initial_files = {
+        "package.json": json.dumps({"dependencies": {"react": "^18"}, "scripts": {"test": "vitest"}}),
+        "AGENTS.md": "- Always run vitest before merging.\n",
+    }
+
+    def _ok_handler(url: str):
+        path = url.split("/contents/", 1)[-1] if "/contents/" in url else ""
+        if path in initial_files:
+            return _Resp(200, data=_b64_payload(initial_files[path]))
+        return _Resp(404, data={"message": "Not Found"})
+
+    res1 = asyncio.run(memory.bootstrap_repo(REPO, github_token="tok", client=_Client(_ok_handler)))
+    assert res1["ok"] is True  # nosec B101
+    saved_profile = memory.get_repo_profile(REPO)
+    assert saved_profile is not None and "React" in saved_profile["frameworks"]  # nosec B101
+    initial_texts = {m["text"] for m in memory.list_memories(REPO)}
+    assert any("Always run vitest" in t for t in initial_texts)  # nosec B101
+
+    # 2. All-404 response when token lacks Contents access (probe /contents also returns 404):
+    # MUST NOT overwrite saved profile or delete existing bootstrap facts!
+    res_unauth = asyncio.run(
+        memory.bootstrap_repo(
+            REPO,
+            github_token="bad-tok",
+            client=_Client(lambda _u: _Resp(404, data={"message": "Not Found"})),
+        )
+    )
+    assert res_unauth["ok"] is False  # nosec B101
+    assert res_unauth["partial"] is True  # nosec B101
+    assert res_unauth["profile_preserved"] is True  # nosec B101
+    assert res_unauth["removed"] == 0  # nosec B101
+    assert memory.get_repo_profile(REPO) == saved_profile  # nosec B101
+    assert {m["text"] for m in memory.list_memories(REPO)} == initial_texts  # nosec B101
+
+    # 3. All-404 file responses when probe /contents returns 200 (genuine removal):
+    # Confirmed absence removes obsolete bootstrap facts and updates profile.
+    def _confirmed_empty_handler(url: str):
+        if url.endswith("/contents"):
+            return _Resp(200, data=[])
+        return _Resp(404, data={"message": "Not Found"})
+
+    res_empty = asyncio.run(
+        memory.bootstrap_repo(REPO, github_token="tok", client=_Client(_confirmed_empty_handler))
+    )
+    assert res_empty["ok"] is True  # nosec B101
+    assert res_empty["removed"] >= 2  # nosec B101
+    assert memory.get_repo_profile(REPO)["files_indexed"] == []  # type: ignore[index]  # nosec B101
+

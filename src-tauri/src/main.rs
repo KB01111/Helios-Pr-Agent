@@ -2802,9 +2802,148 @@ fn resolve_commit_conflict(
     Ok(CommitConflictResolution::CompetingEdit)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum GitTreeLookup {
+    RegularFile,
+    Directory { sha: String },
+    Symlink,
+    Other { entry_type: String, mode: String },
+    Missing,
+}
+
+fn lookup_git_tree_segment(
+    tree_json: &serde_json::Value,
+    segment: &str,
+    label: &str,
+) -> Result<GitTreeLookup, String> {
+    let entries = tree_json
+        .get("tree")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| format!("{}: GitHub tree response missing entries", label))?;
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.get("path").and_then(|p| p.as_str()) == Some(segment))
+    else {
+        if tree_json
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "{}: GitHub tree listing was truncated; cannot verify file type",
+                label
+            ));
+        }
+        return Ok(GitTreeLookup::Missing);
+    };
+    let mode = entry.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match (mode, entry_type) {
+        ("100644" | "100755", "blob") => Ok(GitTreeLookup::RegularFile),
+        ("120000", _) => Ok(GitTreeLookup::Symlink),
+        ("040000", "tree") => {
+            let sha = entry
+                .get("sha")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("{}: GitHub tree directory entry missing sha", label))?;
+            Ok(GitTreeLookup::Directory {
+                sha: sha.to_string(),
+            })
+        }
+        _ => Ok(GitTreeLookup::Other {
+            entry_type: entry_type.to_string(),
+            mode: mode.to_string(),
+        }),
+    }
+}
+
+fn gh_branch_head_commit_and_tree(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    branch: &str,
+    label: &str,
+) -> Result<Option<(String, String)>, String> {
+    let url = format!("{}/commits", repo_api);
+    let (status, body) = gh_request_json(
+        client,
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("sha", branch), ("per_page", "1")],
+        None,
+    )?;
+    match status {
+        404 | 409 => return Ok(None),
+        200 => {}
+        _ => return Err(format!("{}: {}", label, gh_error_text(status, &body))),
+    }
+    let commits: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| format!("{}: GitHub commits response was not JSON", label))?;
+    let Some(head) = commits.as_array().and_then(|arr| arr.first()) else {
+        return Ok(None);
+    };
+    let commit_sha = head
+        .get("sha")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{}: GitHub head commit missing sha", label))?;
+    let tree_sha = head
+        .get("commit")
+        .and_then(|c| c.get("tree"))
+        .and_then(|t| t.get("sha"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{}: GitHub head commit missing tree sha", label))?;
+    Ok(Some((commit_sha.to_string(), tree_sha.to_string())))
+}
+
+/// Walk the Git tree rooted at `root_tree_sha` along `rel_path` to verify that
+/// every parent component is a directory (`040000` tree) and the leaf is a
+/// regular file (`100644` or `100755` blob). Returns `Ok(false)` when absent.
+fn gh_verify_regular_file_at_tree(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    root_tree_sha: &str,
+    rel_path: &str,
+    label: &str,
+) -> Result<bool, String> {
+    let segments: Vec<&str> = rel_path.split('/').collect();
+    let mut current_tree = root_tree_sha.to_string();
+    for (idx, seg) in segments.iter().enumerate() {
+        let tree_url = format!("{}/git/trees/{}", repo_api, current_tree);
+        let (status, body) =
+            gh_request_json(client, token, reqwest::Method::GET, &tree_url, &[], None)?;
+        match status {
+            404 => return Ok(false),
+            200 => {}
+            _ => return Err(format!("{}: {}", label, gh_error_text(status, &body))),
+        }
+        let tree_json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| format!("{}: GitHub tree response was not JSON", label))?;
+        let is_last = idx + 1 == segments.len();
+        match lookup_git_tree_segment(&tree_json, seg, label)? {
+            GitTreeLookup::Missing => return Ok(false),
+            GitTreeLookup::RegularFile if is_last => return Ok(true),
+            GitTreeLookup::Directory { sha } if !is_last => current_tree = sha,
+            GitTreeLookup::Symlink => {
+                return Err(format!("{}: path is a symlink, not a regular file", label));
+            }
+            _ => {
+                return Err(format!("{}: path is not a regular file", label));
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Read a UTF-8 file from a repository's default branch via the GitHub Contents API
 /// using the raw media type (`application/vnd.github.raw+json`), which supports files
-/// larger than 1 MiB (capped at 2 MiB here). Returns `None` on HTTP 404.
+/// larger than 1 MiB (capped at 2 MiB here). Verifies the Git tree entry at the same
+/// commit before reading raw contents so symlinks, directories, and submodules are
+/// rejected instead of followed. Returns `None` on HTTP 404 or missing path.
 #[tauri::command]
 async fn github_read_repo_file(
     token: String,
@@ -2833,10 +2972,28 @@ fn github_read_repo_file_blocking(
     let client = gh_client()?;
     let repo_api = format!("https://api.github.com/repos/{}", repo);
     let branch = gh_default_branch(&client, token, &repo_api)?;
+    let label = format!("read {}", rel_path);
+
+    let Some((commit_sha, root_tree_sha)) =
+        gh_branch_head_commit_and_tree(&client, token, &repo_api, &branch, &label)?
+    else {
+        return Ok(None);
+    };
+    if !gh_verify_regular_file_at_tree(
+        &client,
+        token,
+        &repo_api,
+        &root_tree_sha,
+        &rel_path,
+        &label,
+    )? {
+        return Ok(None);
+    }
+
     let url = format!("{}/contents/{}", repo_api, rel_path);
     let res = client
         .get(&url)
-        .query(&[("ref", branch.as_str())])
+        .query(&[("ref", commit_sha.as_str())])
         .header("Accept", "application/vnd.github.raw+json")
         .header("Authorization", format!("Bearer {}", token))
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -2850,7 +3007,6 @@ fn github_read_repo_file_blocking(
         .unwrap_or("")
         .to_ascii_lowercase();
     let content_len = res.content_length();
-    let label = format!("read {}", rel_path);
 
     match status {
         404 => Ok(None),
@@ -2863,8 +3019,6 @@ fn github_read_repo_file_blocking(
                     ));
                 }
             }
-            // GitHub returns pure `application/json` (not `application/vnd.github.raw+json`)
-            // when the requested path is a directory, symlink, or submodule.
             if content_type.starts_with("application/json") {
                 let body = read_bounded_utf8(res, MAX_READ_REPO_FILE_BYTES, &label)?;
                 let val: serde_json::Value = serde_json::from_str(&body)
@@ -2909,9 +3063,78 @@ fn extract_commit_sha(body: &str) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedBase {
+    /// Caller did not supply a baseline (unconditional upsert).
+    Any,
+    /// Caller merged against an absent remote file (expects 404).
+    Absent,
+    /// Caller merged against this exact remote file content.
+    Content(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BaseCheckOutcome {
+    AlreadyUpToDate,
+    Proceed,
+}
+
+fn check_commit_base(
+    expected_base: &ExpectedBase,
+    remote_content: Option<&str>,
+    desired_content: &str,
+    path: &str,
+) -> Result<BaseCheckOutcome, String> {
+    if let Some(current) = remote_content {
+        if current == desired_content {
+            return Ok(BaseCheckOutcome::AlreadyUpToDate);
+        }
+    }
+    match (expected_base, remote_content) {
+        (ExpectedBase::Any, _) => Ok(BaseCheckOutcome::Proceed),
+        (ExpectedBase::Absent, None) => Ok(BaseCheckOutcome::Proceed),
+        (ExpectedBase::Absent, Some(_)) => Err(format!(
+            "conflict: {} was created remotely after your preview. Reload the file and try again.",
+            path
+        )),
+        (ExpectedBase::Content(expected), Some(current)) if current == expected => {
+            Ok(BaseCheckOutcome::Proceed)
+        }
+        (ExpectedBase::Content(_), Some(_)) => Err(format!(
+            "conflict: {} changed remotely after your preview. Reload the file and try again.",
+            path
+        )),
+        (ExpectedBase::Content(_), None) => Err(format!(
+            "conflict: {} was deleted remotely after your preview. Reload the file and try again.",
+            path
+        )),
+    }
+}
+
+fn parse_expected_base_from_body(
+    body: &tauri::ipc::InvokeBody,
+    expected_base_content: Option<String>,
+) -> Result<ExpectedBase, String> {
+    if let Some(s) = expected_base_content {
+        return Ok(ExpectedBase::Content(s));
+    }
+    if let tauri::ipc::InvokeBody::Json(serde_json::Value::Object(map)) = body {
+        if let Some(val) = map.get("expectedBaseContent") {
+            return match val {
+                serde_json::Value::Null => Ok(ExpectedBase::Absent),
+                serde_json::Value::String(s) => Ok(ExpectedBase::Content(s.clone())),
+                _ => Err("expectedBaseContent must be a string or null".into()),
+            };
+        }
+    }
+    Ok(ExpectedBase::Any)
+}
+
 /// Upsert an allowlisted repo config or memory file (`.pragent.yaml`, `.pragent.yml`,
 /// `.pr-agent/memory.md`) on the default branch. Skips the commit when content is
-/// unchanged. Returns `{ changed: bool, sha: String, path: String }`.
+/// unchanged. When `expectedBaseContent` is provided (`null` or string), refuses to
+/// overwrite if the remote file no longer matches that baseline.
+/// Returns `{ changed: bool, sha: String, path: String }`.
 #[tauri::command]
 async fn github_commit_repo_file(
     token: String,
@@ -2919,9 +3142,12 @@ async fn github_commit_repo_file(
     path: String,
     content: String,
     message: String,
+    expected_base_content: Option<String>,
+    req: tauri::ipc::Request<'_>,
 ) -> Result<serde_json::Value, String> {
+    let expected_base = parse_expected_base_from_body(req.body(), expected_base_content)?;
     tauri::async_runtime::spawn_blocking(move || {
-        github_commit_repo_file_blocking(token, repo, path, content, message)
+        github_commit_repo_file_blocking(token, repo, path, content, message, expected_base)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2933,6 +3159,7 @@ fn github_commit_repo_file_blocking(
     path: String,
     content: String,
     message: String,
+    expected_base: ExpectedBase,
 ) -> Result<serde_json::Value, String> {
     let token = token.trim();
     if token.is_empty() {
@@ -2973,16 +3200,33 @@ fn github_commit_repo_file_blocking(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .ok_or_else(|| format!("{}: existing file response had no sha", allowed_path))?;
-            if gh_file_text(&file_json).is_ok_and(|current| current == content) {
-                return Ok(serde_json::json!({
-                    "changed": false,
-                    "sha": sha,
-                    "path": allowed_path,
-                }));
+            let current_text = match gh_file_text(&file_json) {
+                Ok(text) => Some(text),
+                Err(_) if matches!(expected_base, ExpectedBase::Any) => None,
+                Err(e) => {
+                    return Err(format!(
+                        "{}: could not decode existing file to verify baseline: {}",
+                        allowed_path, e
+                    ));
+                }
+            };
+            if let Some(ref current) = current_text {
+                if check_commit_base(&expected_base, Some(current), &content, allowed_path)?
+                    == BaseCheckOutcome::AlreadyUpToDate
+                {
+                    return Ok(serde_json::json!({
+                        "changed": false,
+                        "sha": sha,
+                        "path": allowed_path,
+                    }));
+                }
             }
             Some(sha)
         }
-        404 => None,
+        404 => {
+            check_commit_base(&expected_base, None, &content, allowed_path)?;
+            None
+        }
         _ => return Err(format!("{}: {}", allowed_path, gh_error_text(status, &body))),
     };
 
@@ -3597,6 +3841,7 @@ mod repo_file_tests {
             ".pragent.yaml".into(),
             "profile: chill\n".into(),
             "chore: config".into(),
+            ExpectedBase::Any,
         )
         .is_err());
         assert!(github_commit_repo_file_blocking(
@@ -3605,6 +3850,7 @@ mod repo_file_tests {
             "README.md".into(),
             "x".into(),
             "chore: nope".into(),
+            ExpectedBase::Any,
         )
         .is_err());
         assert!(github_commit_repo_file_blocking(
@@ -3613,6 +3859,7 @@ mod repo_file_tests {
             ".pragent.yaml".into(),
             "x".into(),
             "line1\nline2".into(),
+            ExpectedBase::Any,
         )
         .is_err());
         assert_eq!(
@@ -3693,6 +3940,162 @@ mod repo_file_tests {
         assert_eq!(
             resolve_commit_conflict(None, &competing_json, "profile: chill\n", ".pragent.yaml").unwrap(),
             CommitConflictResolution::CompetingEdit
+        );
+    }
+
+    #[test]
+    fn lookup_git_tree_segment_distinguishes_regular_files_symlinks_and_dirs() {
+        let tree = serde_json::json!({
+            "truncated": false,
+            "tree": [
+                { "path": ".pragent.yaml", "mode": "100644", "type": "blob", "sha": "aaa" },
+                { "path": "run.sh", "mode": "100755", "type": "blob", "sha": "bbb" },
+                { "path": "link.yaml", "mode": "120000", "type": "blob", "sha": "ccc" },
+                { "path": ".pr-agent", "mode": "040000", "type": "tree", "sha": "ddd" },
+                { "path": "submod", "mode": "160000", "type": "commit", "sha": "eee" }
+            ]
+        });
+
+        assert_eq!(
+            lookup_git_tree_segment(&tree, ".pragent.yaml", "read").unwrap(),
+            GitTreeLookup::RegularFile
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "run.sh", "read").unwrap(),
+            GitTreeLookup::RegularFile
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "link.yaml", "read").unwrap(),
+            GitTreeLookup::Symlink
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, ".pr-agent", "read").unwrap(),
+            GitTreeLookup::Directory { sha: "ddd".into() }
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "submod", "read").unwrap(),
+            GitTreeLookup::Other {
+                entry_type: "commit".into(),
+                mode: "160000".into(),
+            }
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "missing.yaml", "read").unwrap(),
+            GitTreeLookup::Missing
+        );
+
+        let truncated_tree = serde_json::json!({
+            "truncated": true,
+            "tree": []
+        });
+        let err = lookup_git_tree_segment(&truncated_tree, ".pragent.yaml", "read").unwrap_err();
+        assert!(err.contains("truncated"), "unexpected err: {}", err);
+    }
+
+    #[test]
+    fn check_commit_base_enforces_merged_baseline_and_preserves_already_up_to_date() {
+        // Already up to date takes precedence even if baseline differed (same desired content).
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Content("profile: old\n".into()),
+                Some("profile: chill\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::AlreadyUpToDate
+        );
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Absent,
+                Some("profile: chill\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::AlreadyUpToDate
+        );
+
+        // Matching baseline content -> proceed.
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Content("profile: old\n".into()),
+                Some("profile: old\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::Proceed
+        );
+        // Matching absent baseline -> proceed.
+        assert_eq!(
+            check_commit_base(&ExpectedBase::Absent, None, "profile: chill\n", ".pragent.yaml")
+                .unwrap(),
+            BaseCheckOutcome::Proceed
+        );
+        // Omitted baseline -> proceed regardless of remote state.
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Any,
+                Some("profile: other\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::Proceed
+        );
+
+        // Remote edited after preview -> conflict error.
+        let err = check_commit_base(
+            &ExpectedBase::Content("profile: old\n".into()),
+            Some("profile: other\npre_merge_checks: []\n"),
+            "profile: chill\n",
+            ".pragent.yaml",
+        )
+        .unwrap_err();
+        assert!(err.contains("changed remotely"), "unexpected err: {}", err);
+
+        // Remote created after preview (expected absent) -> conflict error.
+        let err = check_commit_base(
+            &ExpectedBase::Absent,
+            Some("profile: other\n"),
+            "profile: chill\n",
+            ".pragent.yaml",
+        )
+        .unwrap_err();
+        assert!(err.contains("created remotely"), "unexpected err: {}", err);
+
+        // Remote deleted after preview (expected content) -> conflict error.
+        let err = check_commit_base(
+            &ExpectedBase::Content("profile: old\n".into()),
+            None,
+            "profile: chill\n",
+            ".pragent.yaml",
+        )
+        .unwrap_err();
+        assert!(err.contains("deleted remotely"), "unexpected err: {}", err);
+
+        // Verify IPC body parsing distinguishes omitted vs explicit null vs string.
+        let omitted = tauri::ipc::InvokeBody::Json(serde_json::json!({ "path": ".pragent.yaml" }));
+        assert_eq!(
+            parse_expected_base_from_body(&omitted, None).unwrap(),
+            ExpectedBase::Any
+        );
+        let explicit_null = tauri::ipc::InvokeBody::Json(serde_json::json!({
+            "path": ".pragent.yaml",
+            "expectedBaseContent": null
+        }));
+        assert_eq!(
+            parse_expected_base_from_body(&explicit_null, None).unwrap(),
+            ExpectedBase::Absent
+        );
+        let explicit_str = tauri::ipc::InvokeBody::Json(serde_json::json!({
+            "path": ".pragent.yaml",
+            "expectedBaseContent": "profile: old\n"
+        }));
+        assert_eq!(
+            parse_expected_base_from_body(&explicit_str, Some("profile: old\n".into())).unwrap(),
+            ExpectedBase::Content("profile: old\n".into())
         );
     }
 }

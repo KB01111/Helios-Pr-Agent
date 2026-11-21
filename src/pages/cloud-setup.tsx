@@ -148,6 +148,13 @@ function CopyBlock({ title, code }: { title: string; code: string }) {
   );
 }
 
+function parseCanonicalPrNumber(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 export function CloudSetupPage({ active }: { active: boolean }) {
   const setTab = useApp((s) => s.setTab);
   const currentBackendUrl = useApp((s) => s.backendUrl);
@@ -221,6 +228,9 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const [existingYaml, setExistingYaml] = React.useState<string | null>(null);
   const [existingYamlFor, setExistingYamlFor] = React.useState("");
   const [yamlLoading, setYamlLoading] = React.useState(false);
+  const [yamlReadState, setYamlReadState] = React.useState<"idle" | "loading" | "loaded" | "absent" | "error">("idle");
+  const [yamlReadError, setYamlReadError] = React.useState("");
+  const [yamlReadReloadKey, setYamlReadReloadKey] = React.useState(0);
   const yamlSeqRef = React.useRef(0);
 
   // Step 5 state
@@ -237,9 +247,11 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const pullsSeqRef = React.useRef(0);
   const reviewSeqRef = React.useRef(0);
 
-  const activePrNumberStr = (manualPrNum.trim() || selectedPr).trim();
+  const rawPrInput = (manualPrNum.trim() || selectedPr).trim();
+  const activePrNumber = parseCanonicalPrNumber(rawPrInput);
+  const canonicalPrKey = activePrNumber !== null ? String(activePrNumber) : rawPrInput;
   const verifyRepoScopeKey = `${currentBackendUrl}::${verifyRepo.trim()}`;
-  const verifyTargetKey = `${verifyRepoScopeKey}::${activePrNumberStr}`;
+  const verifyTargetKey = `${verifyRepoScopeKey}::${canonicalPrKey}`;
   const verifyRepoScopeRef = React.useRef(verifyRepoScopeKey);
   verifyRepoScopeRef.current = verifyRepoScopeKey;
   const verifyTargetRef = React.useRef(verifyTargetKey);
@@ -371,7 +383,20 @@ export function CloudSetupPage({ active }: { active: boolean }) {
   const matchedPulls = pullsScopeKey === verifyRepoScopeKey ? pulls : [];
   const matchedReviewRes = reviewRes && reviewResultKey === verifyTargetKey ? reviewRes : null;
   const matchedVerifiedReadiness = verifiedReadiness && reviewResultKey === verifyTargetKey ? verifiedReadiness : null;
-  const step5Done = Boolean(matchedReviewRes && matchedReviewRes.status && !/error|fail/i.test(matchedReviewRes.status));
+  const hasReviewWalkthrough = Boolean(
+    matchedReviewRes?.walkthrough &&
+      (matchedReviewRes.walkthrough.summary?.trim() ||
+        (matchedReviewRes.walkthrough.file_table?.length ?? 0) > 0),
+  );
+  const hasPostedReviewOutput = Boolean(matchedReviewRes?.review_posted || matchedReviewRes?.pr_comment_posted);
+  const step5Done = Boolean(
+    matchedReviewRes &&
+      matchedReviewRes.status &&
+      !/error|fail/i.test(matchedReviewRes.status) &&
+      matchedReviewRes.status !== "completed_no_comment" &&
+      hasPostedReviewOutput &&
+      hasReviewWalkthrough,
+  );
 
   const stepDoneMap: Record<number, boolean> = {
     1: step1Done,
@@ -523,33 +548,59 @@ export function CloudSetupPage({ active }: { active: boolean }) {
     if (!isValidRepo(repo) || !githubToken) {
       setExistingYaml(null);
       setExistingYamlFor("");
+      setYamlReadError(
+        !isValidRepo(repo)
+          ? "Enter a valid owner/repo to load or preview .pragent.yaml."
+          : "Connect GitHub first to check for an existing .pragent.yaml before copying.",
+      );
+      setYamlReadState("idle");
       setYamlLoading(false);
       return;
     }
+    setYamlLoading(true);
+    setYamlReadState("loading");
+    setYamlReadError("");
     const timer = setTimeout(() => {
-      setYamlLoading(true);
       void githubReadRepoFile(githubToken, repo, ".pragent.yaml")
         .then((content) => {
           if (mine !== yamlSeqRef.current) return;
           setExistingYaml(content);
           setExistingYamlFor(repo);
+          setYamlReadError("");
+          setYamlReadState(content !== null ? "loaded" : "absent");
         })
-        .catch(() => {
+        .catch((e) => {
           if (mine !== yamlSeqRef.current) return;
           setExistingYaml(null);
           setExistingYamlFor("");
+          setYamlReadError(errText(e, 220));
+          setYamlReadState("error");
         })
         .finally(() => {
           if (mine === yamlSeqRef.current) setYamlLoading(false);
         });
     }, 200);
     return () => clearTimeout(timer);
-  }, [yamlDialogOpen, yamlRepoTarget, githubToken]);
+  }, [yamlDialogOpen, yamlRepoTarget, githubToken, yamlReadReloadKey]);
 
-  const yamlPreview = React.useMemo(
-    () => mergePragentYaml(existingYamlFor === yamlRepoTarget.trim() ? existingYaml : null, yamlInput),
-    [existingYaml, existingYamlFor, yamlRepoTarget, yamlInput],
-  );
+  const yamlReadyForCopy =
+    !yamlLoading &&
+    existingYamlFor === yamlRepoTarget.trim() &&
+    (yamlReadState === "loaded" || yamlReadState === "absent");
+
+  const yamlPreviewState = React.useMemo(() => {
+    if (!yamlReadyForCopy) return { yaml: "", error: null as string | null };
+    try {
+      return {
+        yaml: mergePragentYaml(yamlReadState === "loaded" ? existingYaml : null, yamlInput),
+        error: null as string | null,
+      };
+    } catch (e) {
+      return { yaml: "", error: errText(e, 260) };
+    }
+  }, [yamlReadyForCopy, yamlReadState, existingYaml, yamlInput]);
+  const yamlPreview = yamlPreviewState.yaml;
+  const yamlPreviewError = yamlPreviewState.error;
 
   const deployCloudAgent = async () => {
     if (!targetAllRepos && selectedRepos.length === 0) {
@@ -610,6 +661,7 @@ export function CloudSetupPage({ active }: { active: boolean }) {
         ".pragent.yaml",
         merged,
         "chore: configure PR Agent (.pragent.yaml)",
+        { expectedBaseContent: latestRemote },
       );
       toastOk(
         res.changed ? "Committed .pragent.yaml" : ".pragent.yaml already up to date",
@@ -683,9 +735,9 @@ export function CloudSetupPage({ active }: { active: boolean }) {
 
   const runLiveReview = async () => {
     const repo = verifyRepo.trim();
-    const prNumber = Number(manualPrNum.trim() || selectedPr);
+    const prNumber = activePrNumber;
     if (!isValidRepo(repo)) return toastErr("Verify", "Enter a valid repository (owner/name).");
-    if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    if (prNumber === null) {
       return toastErr("Verify", "Select an open PR or enter a valid PR number.");
     }
     const reqTarget = `${currentBackendUrl}::${repo}::${prNumber}`;
@@ -715,11 +767,11 @@ export function CloudSetupPage({ active }: { active: boolean }) {
     }
   };
 
-  const activePrObj = matchedPulls.find((p) => String(p.number) === activePrNumberStr);
+  const activePrObj = activePrNumber !== null ? matchedPulls.find((p) => p.number === activePrNumber) : undefined;
   const prUrl =
     activePrObj?.html_url ||
-    (isValidRepo(verifyRepo) && Number(activePrNumberStr) > 0
-      ? `https://github.com/${verifyRepo.trim()}/pull/${Number(activePrNumberStr)}`
+    (isValidRepo(verifyRepo) && activePrNumber !== null
+      ? `https://github.com/${verifyRepo.trim()}/pull/${activePrNumber}`
       : "");
 
   const filteredKnownRepos = React.useMemo(() => {
@@ -1719,9 +1771,15 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
             <div className="bg-muted/25 grid gap-4 rounded-lg border p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <CheckCircle2 className="text-success size-4" />
+                  <CheckCircle2 className={step5Done ? "text-success size-4" : "text-muted-foreground size-4"} />
                   <span className="text-sm font-semibold">Live Review Result</span>
-                  <Badge variant="success">{matchedReviewRes.status}</Badge>
+                  <Badge
+                    variant={
+                      step5Done ? "success" : /error|fail/i.test(matchedReviewRes.status) ? "danger" : "warning"
+                    }
+                  >
+                    {matchedReviewRes.status}
+                  </Badge>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {matchedReviewRes.review_posted ? <Badge variant="outline">Inline review posted</Badge> : null}
@@ -1812,26 +1870,56 @@ npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET
             </Field>
             <div className="grid gap-1">
               <div className="text-muted-foreground text-xs">
-                {yamlLoading
+                {yamlLoading || yamlReadState === "loading"
                   ? "Loading existing .pragent.yaml to preserve unmanaged sections…"
-                  : existingYaml !== null && existingYamlFor === yamlRepoTarget.trim()
+                  : yamlReadState === "loaded" && existingYamlFor === yamlRepoTarget.trim()
                     ? "Merged with existing .pragent.yaml — unmanaged sections (path_filters, pre_merge_checks, labels, tools, weights, etc.) are preserved."
-                    : "Preview to commit (.pragent.yaml)"}
+                    : yamlReadState === "absent" && existingYamlFor === yamlRepoTarget.trim()
+                      ? "No existing .pragent.yaml on default branch — previewing a new file."
+                      : yamlReadState === "error"
+                        ? "Could not check existing .pragent.yaml — Copy YAML is disabled until the existing file is read or confirmed absent."
+                        : yamlReadError || "Preview to commit (.pragent.yaml)"}
               </div>
-              <Console tall>{yamlPreview}</Console>
+              {yamlReadState === "error" ? (
+                <div className="border-destructive/40 bg-destructive/10 text-destructive flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs">
+                  <span className="min-w-0 flex-1">Failed to read existing .pragent.yaml: {yamlReadError}</span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="xs"
+                    onClick={() => setYamlReadReloadKey((k) => k + 1)}
+                  >
+                    <RefreshCw /> Retry
+                  </Button>
+                </div>
+              ) : yamlPreviewError ? (
+                <div className="border-destructive/40 bg-destructive/10 text-destructive rounded-md border px-3 py-2 text-xs">
+                  {yamlPreviewError}
+                </div>
+              ) : yamlReadyForCopy ? (
+                <Console tall>{yamlPreview}</Console>
+              ) : (
+                <div className="bg-muted/20 text-muted-foreground rounded-md border border-dashed px-3 py-6 text-center text-xs">
+                  {yamlLoading || yamlReadState === "loading"
+                    ? "Checking default branch for an existing .pragent.yaml…"
+                    : yamlReadError || "Enter a valid repository to preview .pragent.yaml."}
+                </div>
+              )}
             </div>
           </div>
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
+              disabled={!yamlReadyForCopy || Boolean(yamlPreviewError)}
               onClick={async () => {
+                if (!yamlReadyForCopy || yamlPreviewError) return;
                 if (await copyToClipboard(yamlPreview)) toastOk("Copied", ".pragent.yaml");
               }}
             >
               <ClipboardCopy /> Copy YAML
             </Button>
-            <AsyncButton onClick={commitYamlToRepo}>
+            <AsyncButton onClick={commitYamlToRepo} disabled={Boolean(yamlPreviewError)}>
               <FileCode2 /> Commit .pragent.yaml
             </AsyncButton>
           </DialogFooter>

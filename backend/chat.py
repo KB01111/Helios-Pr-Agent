@@ -217,6 +217,19 @@ def _finding_comment_ids(finding: dict[str, Any]) -> set[int]:
     return ids
 
 
+_FP_PREFIX_TOKEN_RE = re.compile(r"(?<![a-z0-9])[0-9a-f]{12,64}(?![a-z0-9])")
+_FP_LIKELY_TOKEN_RE = re.compile(r"(?<![a-z0-9])[0-9a-f]{16,64}(?![a-z0-9])")
+
+
+def _contains_fingerprint_token(text: str) -> bool:
+    s = str(text or "").strip().lower()
+    if not s:
+        return False
+    if re.fullmatch(r"[0-9a-f]{12,64}", s):
+        return True
+    return bool(_FP_LIKELY_TOKEN_RE.search(s))
+
+
 def _resolve_finding_target(
     repo: str,
     pr_number: int,
@@ -247,12 +260,21 @@ def _resolve_finding_target(
                 if tid in _finding_comment_ids(item):
                     return (fp, item), []
 
-    # 2. Exact match by explicit fingerprint in query (takes precedence over file fallback).
+    # 2. Match by explicit fingerprint or unique hex prefix in query (takes precedence over file fallback).
     clean_query = str(query or "").strip().lower()
     if clean_query:
+        prefix_tokens = _FP_PREFIX_TOKEN_RE.findall(clean_query)
+        matched_by_fp: dict[str, tuple[str, dict[str, Any]]] = {}
         for fp, item in findings:
-            if fp.lower() in clean_query:
-                return (fp, item), []
+            fp_low = fp.lower()
+            if fp_low in clean_query or any(fp_low.startswith(tok) for tok in prefix_tokens):
+                matched_by_fp.setdefault(fp_low, (fp, item))
+        if len(matched_by_fp) == 1:
+            return next(iter(matched_by_fp.values())), []
+        if len(matched_by_fp) > 1:
+            return None, list(matched_by_fp.values())
+        if _contains_fingerprint_token(clean_query):
+            return None, []
 
     # 3. Match by normalized file path (only when unambiguous — never guess by severity alone).
     norm_path = _norm_rel_path(path)
@@ -267,9 +289,17 @@ def _resolve_finding_target(
             open_matches = [pair for pair in path_matches if pair[1].get("state", "open") == "open"]
             candidates = open_matches or path_matches
 
-            if query_tokens:
+            # If a comment/thread ID was supplied and didn't match step 1, exclude findings
+            # already linked to a different GitHub comment thread before title scoring.
+            eligible = (
+                [pair for pair in candidates if not _finding_comment_ids(pair[1])]
+                if supplied_ids
+                else candidates
+            )
+
+            if query_tokens and eligible:
                 scored_path: list[tuple[int, str, dict[str, Any]]] = []
-                for fp, item in candidates:
+                for fp, item in eligible:
                     title_tokens = set(re.findall(r"[a-z0-9]{3,}", str(item.get("title") or "").lower()))
                     overlap = len(query_tokens & title_tokens)
                     if overlap > 0:
@@ -282,12 +312,9 @@ def _resolve_finding_target(
                         return top_tied[0], []
                     return None, top_tied
 
-            # If a comment/thread ID was supplied and didn't match step 1, do not fall back
-            # blindly to findings that already belong to a different GitHub comment thread.
             if supplied_ids:
-                unlinked = [pair for pair in candidates if not _finding_comment_ids(pair[1])]
-                if len(unlinked) == 1 and len(candidates) == 1:
-                    return unlinked[0], []
+                if len(eligible) == 1 and len(candidates) == 1:
+                    return eligible[0], []
                 if len(candidates) > 1:
                     return None, candidates
                 return None, []
@@ -301,6 +328,8 @@ def _resolve_finding_target(
         scored: list[tuple[int, str, dict[str, Any]]] = []
         for fp, item in findings:
             if item.get("state", "open") != "open":
+                continue
+            if supplied_ids and _finding_comment_ids(item):
                 continue
             title_tokens = set(re.findall(r"[a-z0-9]{3,}", str(item.get("title") or "").lower()))
             overlap = len(query_tokens & title_tokens)
@@ -707,14 +736,14 @@ async def handle_pr_mention(
             result["dismissal"] = None
             result["ambiguous"] = True
             opts = "\n".join(
-                f"- `{fp[:16]}` — {item.get('title') or '(untitled)'}"
+                f"- `{fp}` — {item.get('title') or '(untitled)'}"
                 for fp, item in ambiguous[:5]
             )
             reply_text = (
                 "Multiple findings match here; please reply directly on the finding's thread or "
                 "include its fingerprint:\n\n" + opts
             )
-        elif arg.strip() or path.strip():
+        elif (arg.strip() or path.strip()) and not _contains_fingerprint_token(arg):
             norm_path = _norm_rel_path(path)
             synth_title = arg.strip()[:120] or f"finding on {norm_path}"
             synth_fp = dm.finding_fingerprint(norm_path, "", "maintainability", synth_title)
@@ -766,7 +795,7 @@ async def handle_pr_mention(
             result["resolved"] = False
             result["ambiguous"] = True
             opts = "\n".join(
-                f"- `{fp[:16]}` — {item.get('title') or '(untitled)'}"
+                f"- `{fp}` — {item.get('title') or '(untitled)'}"
                 for fp, item in ambiguous[:5]
             )
             reply_text = (

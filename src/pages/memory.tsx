@@ -393,6 +393,9 @@ export function MemoryPage({ active }: { active: boolean }) {
 
   const handleExportJson = async () => {
     if (!isValidRepo(repo)) return toastErr("Export", "Select a repository first.");
+    if (loadedScope !== scopeKey) {
+      return toastErr("Export", "Wait for repository memory to finish loading before exporting.");
+    }
     const payload = JSON.stringify({ repo, exported_at: new Date().toISOString(), items: scopedItems }, null, 2);
     try {
       const blob = new Blob([payload], { type: "application/json" });
@@ -589,7 +592,13 @@ export function MemoryPage({ active }: { active: boolean }) {
           <Button type="button" variant="outline" size="sm" disabled={!isValidRepo(repo)} onClick={openSyncMarkdown}>
             <FileCode2 /> Sync .pr-agent/memory.md
           </Button>
-          <Button type="button" variant="outline" size="sm" disabled={!isValidRepo(repo)} onClick={handleExportJson}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={!isValidRepo(repo) || loadedScope !== scopeKey}
+            onClick={handleExportJson}
+          >
             <Download /> Export JSON
           </Button>
           <Button type="button" variant="outline" size="sm" disabled={!isValidRepo(repo)} onClick={() => setImportOpen(true)}>

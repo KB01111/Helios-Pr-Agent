@@ -119,11 +119,30 @@ def get_last_reviewed_sha(repo: str, pr_number: int) -> str | None:
     return val or None
 
 
-def set_last_reviewed_sha(repo: str, pr_number: int, head_sha: str) -> None:
+_UNSET = object()
+
+
+def _pr_bookmark_lock_key(repo: str, pr_number: int) -> str:
+    return f"prrevlock:{_norm_repo(repo)}:{int(pr_number)}"
+
+
+def set_last_reviewed_sha(
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    *,
+    expected_sha: Any = _UNSET,
+) -> bool:
     sha = (head_sha or "").strip()
     if not sha or not dm.valid_repo(repo) or int(pr_number) <= 0:
-        return
-    store.rset(pr_last_reviewed_key(repo, pr_number), sha, ex=dm.FINDING_TTL_S)
+        return False
+    with store.key_lock(_pr_bookmark_lock_key(repo, pr_number)):
+        if expected_sha is not _UNSET:
+            cur = get_last_reviewed_sha(repo, pr_number)
+            if (cur or "").lower() != str(expected_sha or "").strip().lower():
+                return False
+        store.rset(pr_last_reviewed_key(repo, pr_number), sha, ex=dm.FINDING_TTL_S)
+        return True
 
 
 def _read_index_fps(repo: str, pr_number: int) -> list[str]:
@@ -328,18 +347,20 @@ def set_finding_state(
 def stage_finding_updates(
     existing_findings: Sequence[dict[str, Any]],
     delta_diff: ParsedDiff | None,
-) -> tuple[list[dict[str, Any]], list[str], dict[str, tuple[int, int]]]:
-    """Compute finding invalidations and surviving line-shift remappings in memory.
+    *,
+    pr_diff: ParsedDiff | None = None,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, dict[str, Any]]]:
+    """Compute finding invalidations and surviving line-shift/rename remappings in memory.
 
     Returns ``(staged_findings, outdated_fps, remapped_spans)`` without mutating
     Redis so a discarded/failed review never prematurely marks findings outdated.
     """
-    if delta_diff is None or not delta_diff.files:
+    if (delta_diff is None or not delta_diff.files) and pr_diff is None:
         return [dict(f) for f in existing_findings], [], {}
 
     staged: list[dict[str, Any]] = []
     outdated_fps: list[str] = []
-    remapped_spans: dict[str, tuple[int, int]] = {}
+    remapped_spans: dict[str, dict[str, Any]] = {}
 
     for finding in existing_findings:
         rec = dict(finding)
@@ -347,27 +368,62 @@ def stage_finding_updates(
             staged.append(rec)
             continue
         fpath = str(rec.get("file") or "")
-        df = delta_diff.get_file(fpath)
-        if df is None:
-            staged.append(rec)
-            continue
         try:
             lo = int(rec.get("start_line") or 1)
             hi = int(rec.get("end_line") or lo)
         except (TypeError, ValueError):
             lo, hi = 1, 1
         side = str(rec.get("side") or "RIGHT").upper()
-        was_mod, new_lo, new_hi = df.span_modified_or_remapped(lo, hi, side)
+
+        df = delta_diff.get_file(fpath, exact=True) if delta_diff is not None else None
+        renamed = False
+        if df is None and delta_diff is not None:
+            df = delta_diff.get_file_by_old_path(fpath)
+            renamed = df is not None
+
+        if side == "LEFT":
+            new_file = df.path if renamed and df is not None else fpath
+            if pr_diff is not None:
+                pr_df = pr_diff.get_file(new_file, exact=True)
+                if pr_df is None:
+                    pr_df = pr_diff.get_file_by_old_path(fpath)
+                if pr_df is None:
+                    # File no longer differs from merge base -> deleted line was restored.
+                    was_mod, new_lo, new_hi = True, lo, hi
+                else:
+                    was_mod, new_lo, new_hi = pr_df.span_modified_or_remapped(
+                        lo, hi, "LEFT", pr_file=pr_df
+                    )
+                    if not renamed and pr_df.path != fpath:
+                        new_file = pr_df.path
+            else:
+                was_mod, new_lo, new_hi = False, lo, hi
+        else:
+            if df is None:
+                staged.append(rec)
+                continue
+            was_mod, new_lo, new_hi = df.span_modified_or_remapped(lo, hi, side)
+            new_file = df.path if renamed else fpath
+
         fp = str(rec.get("fingerprint") or "").strip()
         if was_mod:
             rec["state"] = "outdated"
             if fp:
                 outdated_fps.append(fp)
-        elif (new_lo, new_hi) != (lo, hi):
+        elif (new_file, new_lo, new_hi) != (fpath, lo, hi):
+            rec["file"] = new_file
             rec["start_line"] = new_lo
             rec["end_line"] = new_hi
             if fp:
-                remapped_spans[fp] = (new_lo, new_hi)
+                remapped_spans[fp] = {
+                    "file": new_file,
+                    "start_line": new_lo,
+                    "end_line": new_hi,
+                    "expected_file": fpath,
+                    "expected_start_line": lo,
+                    "expected_end_line": hi,
+                    "expected_head_sha": str(rec.get("head_sha") or ""),
+                }
         staged.append(rec)
 
     return staged, outdated_fps, remapped_spans
@@ -377,16 +433,16 @@ def commit_staged_finding_updates(
     repo: str,
     pr_number: int,
     outdated_fps: Sequence[str],
-    remapped_spans: dict[str, tuple[int, int]],
+    remapped_spans: dict[str, Any],
     *,
     head_sha: str = "",
 ) -> list[str]:
-    """Commit staged outdated transitions and line-shift remappings to Redis."""
+    """Commit staged outdated transitions and line-shift/rename remappings to Redis."""
     committed_outdated: list[str] = []
     for fp in outdated_fps:
         if set_finding_state(repo, pr_number, fp, "outdated", expected_states=("open",)) is not None:
             committed_outdated.append(fp)
-    for fp, (new_lo, new_hi) in remapped_spans.items():
+    for fp, remap_info in remapped_spans.items():
         if not fp or not dm.valid_repo(repo) or int(pr_number) <= 0:
             continue
         fkey = dm.finding_key(repo, pr_number, fp)
@@ -395,8 +451,22 @@ def commit_staged_finding_updates(
             if not isinstance(existing, dict) or str(existing.get("state") or "open").lower() != "open":
                 continue
             rec = dict(existing)
-            rec["start_line"] = int(new_lo)
-            rec["end_line"] = int(new_hi)
+            if isinstance(remap_info, dict):
+                if (
+                    str(existing.get("file") or "") != str(remap_info.get("expected_file") or "")
+                    or int(existing.get("start_line") or 1) != int(remap_info.get("expected_start_line") or 1)
+                    or int(existing.get("end_line") or 1) != int(remap_info.get("expected_end_line") or 1)
+                    or str(existing.get("head_sha") or "").lower()
+                    != str(remap_info.get("expected_head_sha") or "").lower()
+                ):
+                    continue
+                rec["file"] = str(remap_info["file"])
+                rec["start_line"] = int(remap_info["start_line"])
+                rec["end_line"] = int(remap_info["end_line"])
+            else:
+                new_lo, new_hi = remap_info
+                rec["start_line"] = int(new_lo)
+                rec["end_line"] = int(new_hi)
             if head_sha:
                 rec["head_sha"] = head_sha
             rec["updated_at"] = _now_iso()
@@ -730,6 +800,7 @@ async def publish_review(
     cut_notes: Sequence[str] | None = None,
     all_open_findings: Sequence[dict[str, Any]] | None = None,
     persist_comment_ids: bool = True,
+    allow_inline: bool = True,
     client: Any = None,
 ) -> dict[str, Any]:
     """Publish ONE GitHub PR review with inline comments + ONE upserted sticky summary comment.
@@ -753,12 +824,15 @@ async def publish_review(
     fallback_findings: list[dict[str, Any]] = []
     pr_comment_posted = False
     summary_comment_id: int | None = None
+    summary_error: str | None = None
 
     own = client is None
     http_client = client or httpx.AsyncClient(timeout=30.0)
     try:
         # 1. Post ONE PR review with inline comments when there are new findings
-        if findings_list:
+        if findings_list and not allow_inline:
+            fallback_findings = list(findings_list)
+        elif findings_list:
             reviews_url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_int}/reviews"
             has_multiline = any(
                 int(f.get("start_line") or 1) < int(f.get("end_line") or 1) for f in findings_list
@@ -853,30 +927,42 @@ async def publish_review(
         )
         marker = review_marker(agent_key)
         comments_url = f"{GITHUB_API}/repos/{repo}/issues/{pr_int}/comments"
-        existing_id = await _find_previous_review(http_client, comments_url, headers, marker)
-        if existing_id:
-            sresp = await http_client.patch(
-                f"{GITHUB_API}/repos/{repo}/issues/comments/{existing_id}",
-                headers=headers,
-                json={"body": summary_body},
+        try:
+            existing_id = await _find_previous_review(http_client, comments_url, headers, marker)
+            if existing_id:
+                sresp = await http_client.patch(
+                    f"{GITHUB_API}/repos/{repo}/issues/comments/{existing_id}",
+                    headers=headers,
+                    json={"body": summary_body},
+                )
+                summary_comment_id = existing_id
+            else:
+                sresp = await http_client.post(
+                    comments_url,
+                    headers=headers,
+                    json={"body": summary_body},
+                )
+                if sresp.status_code in (200, 201):
+                    sdata = sresp.json() if hasattr(sresp, "json") else {}
+                    if isinstance(sdata, dict) and sdata.get("id") is not None:
+                        summary_comment_id = int(sdata["id"])
+            pr_comment_posted = sresp.status_code in (200, 201)
+        except Exception as exc:
+            if not review_posted:
+                raise
+            summary_error = type(exc).__name__
+            pr_comment_posted = False
+            log.warning(
+                "review.publisher: sticky summary upsert raised %s after inline review was accepted for %s#%s",
+                summary_error,
+                repo,
+                pr_int,
             )
-            summary_comment_id = existing_id
-        else:
-            sresp = await http_client.post(
-                comments_url,
-                headers=headers,
-                json={"body": summary_body},
-            )
-            if sresp.status_code in (200, 201):
-                sdata = sresp.json() if hasattr(sresp, "json") else {}
-                if isinstance(sdata, dict) and sdata.get("id") is not None:
-                    summary_comment_id = int(sdata["id"])
-        pr_comment_posted = sresp.status_code in (200, 201)
     finally:
         if own and hasattr(http_client, "aclose"):
             await http_client.aclose()
 
-    return {
+    result = {
         "review_posted": review_posted,
         "review_id": review_id,
         "pr_comment_posted": pr_comment_posted,
@@ -886,6 +972,9 @@ async def publish_review(
         "inline_fallback": bool(fallback_findings),
         "findings": findings_list,
     }
+    if summary_error is not None:
+        result["summary_error"] = summary_error
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1190,14 @@ async def run_structured_review(
                 if "draft" not in pr_context:
                     draft = bool(pr_meta_api.get("draft", False))
 
+        if not head_sha:
+            logs.append("review_only: missing PR head SHA after metadata hydration; aborting.")
+            return _review_result(
+                status="failed",
+                logs=logs,
+                last_reviewed_sha=get_last_reviewed_sha(repo, pr_number),
+            )
+
         # 1. Load .pragent.yaml from base branch only & merge with AgentConfig v2
         if base_ref:
             repo_cfg = await load_repo_config(repo, base_ref, github_token, client=gh)
@@ -1160,15 +1257,20 @@ async def run_structured_review(
 
         parsed_diff = parse_unified_diff(fetched.diff)
 
-        # 3. Stage outdated invalidations & line-shift remappings in memory using ONLY
+        # 3. Stage outdated invalidations & line-shift/rename remappings in memory using ONLY
         #    the delta from prior_reviewed_sha -> head_sha (never the full PR diff on a
         #    force_full re-review of the same head, and never mutating Redis before the
         #    review is accepted and published).
         raw_existing_findings = list_pr_findings(repo, pr_number)
-        has_open_existing = any(
-            str(f.get("state") or "open").lower() == "open" for f in raw_existing_findings
-        )
+        open_existing = [
+            f for f in raw_existing_findings if str(f.get("state") or "open").lower() == "open"
+        ]
+        has_open_existing = bool(open_existing)
+        has_open_left = any(str(f.get("side") or "RIGHT").upper() == "LEFT" for f in open_existing)
         invalidation_diff: ParsedDiff | None = None
+        pr_diff_for_anchors: ParsedDiff | None = None if fetched.is_incremental else parsed_diff
+        findings_reconciled = True
+
         if fetched.is_incremental and parsed_diff.files:
             invalidation_diff = parsed_diff
         elif (
@@ -1188,13 +1290,44 @@ async def run_structured_review(
                     prior_reviewed_sha,
                     github_token,
                 )
-                if delta_fetched.is_incremental and delta_fetched.diff.strip():
-                    invalidation_diff = parse_unified_diff(delta_fetched.diff)
+                if delta_fetched.is_incremental:
+                    if delta_fetched.diff.strip():
+                        invalidation_diff = parse_unified_diff(delta_fetched.diff)
+                else:
+                    invalidation_diff = None
+                    findings_reconciled = False
+                    logs.append(
+                        "review_only: incremental delta unavailable to reconcile existing findings; retaining prior reviewed SHA."
+                    )
             except Exception:
                 invalidation_diff = None
+                findings_reconciled = False
+                logs.append(
+                    "review_only: failed fetching incremental delta to reconcile existing findings; retaining prior reviewed SHA."
+                )
+
+        if has_open_left and pr_diff_for_anchors is None:
+            try:
+                pr_left_fetched = await fetch_incremental_diff(
+                    gh,
+                    repo,
+                    pr_number,
+                    base_sha,
+                    head_sha,
+                    None,
+                    github_token,
+                )
+                if pr_left_fetched.diff.strip():
+                    pr_diff_for_anchors = parse_unified_diff(pr_left_fetched.diff)
+                else:
+                    findings_reconciled = False
+            except Exception:
+                findings_reconciled = False
 
         existing_findings, staged_outdated_fps, staged_remaps = stage_finding_updates(
-            raw_existing_findings, invalidation_diff
+            raw_existing_findings,
+            invalidation_diff,
+            pr_diff=pr_diff_for_anchors if has_open_left else None,
         )
         if staged_outdated_fps:
             logs.append(f"review_only: staged {len(staged_outdated_fps)} previous finding(s) as outdated.")
@@ -1216,10 +1349,50 @@ async def run_structured_review(
 
         if not parsed_diff.files or not budgeted_raw.strip():
             logs.append("review_only: no reviewable diff lines after filtering.")
+            if github_client is None:
+                head_status = await _verify_pr_head(gh, repo, pr_number, head_sha, github_token)
+                if head_status == "moved":
+                    logs.append("review_only: PR head moved on while reviewing; skipping bookmark update.")
+                    return _review_result(
+                        status="completed_no_comment",
+                        logs=logs,
+                        diff=budgeted_raw,
+                        findings=list_pr_findings(repo, pr_number, state="open"),
+                        new_findings=[],
+                        last_reviewed_sha=prior_reviewed_sha,
+                        merged_config=merged_cfg,
+                        stale_head=True,
+                    )
+                if head_status != "match":
+                    logs.append("review_only: could not verify PR head SHA on GitHub; aborting bookmark update.")
+                    return _review_result(
+                        status="failed",
+                        logs=logs,
+                        diff=budgeted_raw,
+                        findings=list_pr_findings(repo, pr_number, state="open"),
+                        new_findings=[],
+                        last_reviewed_sha=prior_reviewed_sha,
+                        merged_config=merged_cfg,
+                    )
+            staged_committed = True
+            if staged_outdated_fps or staged_remaps:
+                try:
+                    committed = commit_staged_finding_updates(
+                        repo, pr_number, staged_outdated_fps, staged_remaps, head_sha=head_sha
+                    )
+                    if committed:
+                        logs.append(f"review_only: marked {len(committed)} previous finding(s) outdated.")
+                except Exception as exc:
+                    staged_committed = False
+                    logs.append(
+                        f"review_only: failed committing staged finding updates ({type(exc).__name__}); retaining prior reviewed SHA."
+                    )
             final_no_diff_sha = prior_reviewed_sha
-            if head_sha:
-                set_last_reviewed_sha(repo, pr_number, head_sha)
-                final_no_diff_sha = head_sha
+            if staged_committed and findings_reconciled and head_sha:
+                if set_last_reviewed_sha(repo, pr_number, head_sha, expected_sha=prior_reviewed_sha):
+                    final_no_diff_sha = head_sha
+                else:
+                    final_no_diff_sha = get_last_reviewed_sha(repo, pr_number)
             return _review_result(
                 status="completed_no_comment",
                 logs=logs,
@@ -1294,22 +1467,35 @@ async def run_structured_review(
 
         # 5b. When reviewing an incremental diff with candidate findings, fetch the full
         #     PR diff so Pass C validates inline anchors against GitHub's PR diff.
+        #     If the full PR diff cannot be fetched (or is blank), never send unvalidated
+        #     incremental anchors inline — keep them in the sticky summary only.
         anchor_diff: ParsedDiff | None = None
+        anchor_diff_unavailable = False
         if fetched.is_incremental and raw_findings:
-            try:
-                pr_diff_fetched = await fetch_incremental_diff(
-                    gh,
-                    repo,
-                    pr_number,
-                    base_sha,
-                    head_sha,
-                    None,
-                    github_token,
-                )
-                if pr_diff_fetched.diff.strip():
-                    anchor_diff = parse_unified_diff(pr_diff_fetched.diff)
-            except Exception as exc:
-                log.warning("review_only: PR diff anchor fetch failed (%s)", type(exc).__name__)
+            if pr_diff_for_anchors is not None:
+                anchor_diff = pr_diff_for_anchors
+            else:
+                for _attempt in range(2):
+                    try:
+                        pr_diff_fetched = await fetch_incremental_diff(
+                            gh,
+                            repo,
+                            pr_number,
+                            base_sha,
+                            head_sha,
+                            None,
+                            github_token,
+                        )
+                        if pr_diff_fetched.diff.strip():
+                            anchor_diff = parse_unified_diff(pr_diff_fetched.diff)
+                            break
+                    except Exception as exc:
+                        log.warning("review_only: PR diff anchor fetch failed (%s)", type(exc).__name__)
+                if anchor_diff is None:
+                    anchor_diff_unavailable = True
+                    logs.append(
+                        "review_only: full PR diff unavailable for inline anchor validation; keeping findings in sticky summary."
+                    )
 
         # 6. Pass C (Deterministic Verifier & Dedupe)
         verify_stats: dict[str, int] = {}
@@ -1334,7 +1520,7 @@ async def run_structured_review(
         # 7. Head verification guard before committing invalidations or publishing.
         #    Treat lookup failure/empty SHA as unknown and refuse to publish stale or
         #    unverified reviews.
-        if github_client is None and head_sha:
+        if github_client is None:
             head_status = await _verify_pr_head(gh, repo, pr_number, head_sha, github_token)
             if head_status == "moved":
                 logs.append("review_only: PR head moved on while reviewing; skipping stale comment.")
@@ -1383,6 +1569,7 @@ async def run_structured_review(
             cut_notes=budget_notes,
             all_open_findings=all_open_preview,
             persist_comment_ids=False,
+            allow_inline=not anchor_diff_unavailable,
             client=gh,
         )
         if pub["review_posted"]:
@@ -1410,9 +1597,11 @@ async def run_structured_review(
                     logs.append(f"review_only: marked {len(committed)} previous finding(s) outdated.")
             delivered_items = [{**f, "delivered": True} for f in pub["findings"]]
             saved_new_updated = save_pr_findings(repo, pr_number, delivered_items, head_sha=head_sha)
-            if head_sha:
-                set_last_reviewed_sha(repo, pr_number, head_sha)
-                final_sha = head_sha
+            if head_sha and findings_reconciled:
+                if set_last_reviewed_sha(repo, pr_number, head_sha, expected_sha=prior_reviewed_sha):
+                    final_sha = head_sha
+                else:
+                    final_sha = get_last_reviewed_sha(repo, pr_number)
         else:
             logs.append("review_only: both GitHub writes failed; keeping findings unpublished for retry.")
 

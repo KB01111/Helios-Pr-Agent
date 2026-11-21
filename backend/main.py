@@ -380,8 +380,14 @@ def _allow_unsigned_webhooks() -> bool:
 _APP_ONLY_WEBHOOK_EVENTS = frozenset({"installation", "installation_repositories"})
 
 
-def _verify_signature(raw: bytes, signature: str | None, *, event: str = "") -> bool:
-    """Verify X-Hub-Signature-256.
+def _verify_signature(raw: bytes, signature: str | None, *, event: str = "") -> str | None:
+    """Verify X-Hub-Signature-256 and return which credential authenticated it.
+
+    Returns:
+      - ``"app"`` when authenticated with ``GITHUB_APP_WEBHOOK_SECRET``
+      - ``"repo"`` when authenticated with the repository webhook secret
+      - ``"unsigned"`` when no webhook secrets are configured in dev mode
+      - ``None`` when verification fails
 
     Fails closed whenever a webhook secret is unreadable OR when
     ``BACKEND_API_TOKEN`` is configured in production (unless explicitly opted
@@ -390,30 +396,37 @@ def _verify_signature(raw: bytes, signature: str | None, *, event: str = "") -> 
     require ``GITHUB_APP_WEBHOOK_SECRET`` whenever any webhook secret is set,
     preventing a repo-secret holder from forging installation cache entries.
     """
-    secrets = _webhook_secrets()
+    repo_secret = _get_webhook_secret()
+    app_secret = (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip()
+    secrets = [s for s in (repo_secret, app_secret) if s]
     if not secrets and runtime_settings.webhook_secret_locked():
         # A secret is stored but cannot be decrypted: never fall back to accepting unsigned.
         log.error("webhook: stored webhook secret is unreadable; rejecting until it is re-saved")
-        return False
+        return None
     if not secrets:
         if _get_api_token() and not _allow_unsigned_webhooks():
             log.error("webhook: BACKEND_API_TOKEN is set without a webhook secret; rejecting unsigned delivery")
-            return False
+            return None
         log.warning("webhook: no GITHUB_WEBHOOK_SECRET set — accepting unsigned (dev mode)")
-        return True
+        return "unsigned"
     if not signature:
-        return False
+        return None
+
+    app_ok = False
+    repo_ok = False
+    if app_secret:
+        app_mac = hmac.new(app_secret.encode(), raw, hashlib.sha256).hexdigest()
+        app_ok = _constant_time_equal(f"sha256={app_mac}", signature)
     if event in _APP_ONLY_WEBHOOK_EVENTS:
-        app_secret = (os.getenv("GITHUB_APP_WEBHOOK_SECRET") or "").strip()
-        if not app_secret:
-            return False
-        mac = hmac.new(app_secret.encode(), raw, hashlib.sha256).hexdigest()
-        return _constant_time_equal(f"sha256={mac}", signature)
-    ok = False
-    for secret in secrets:  # check every secret: no early exit on a match
-        mac = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-        ok = _constant_time_equal(f"sha256={mac}", signature) or ok
-    return ok
+        return "app" if app_ok else None
+    if repo_secret:
+        repo_mac = hmac.new(repo_secret.encode(), raw, hashlib.sha256).hexdigest()
+        repo_ok = _constant_time_equal(f"sha256={repo_mac}", signature)
+    if app_ok:
+        return "app"
+    if repo_ok:
+        return "repo"
+    return None
 
 
 async def _read_bounded_body(request: Request, max_bytes: int = _MAX_WEBHOOK_BODY_BYTES) -> bytes:
@@ -586,10 +599,10 @@ async def _find_repo_agent(repo: str) -> dict[str, Any] | None:
     return None
 
 
-async def _resolve_pr_base_ref(repo: str, pr_number: int) -> str:
-    """Resolve a PR's target base branch ref via GitHub API (best-effort)."""
+async def _fetch_pr_snapshot(repo: str, pr_number: int) -> dict[str, Any] | None:
+    """Fetch a PR's metadata snapshot once via GitHub API for consistent policy & signal evaluation."""
     if not dm.valid_repo(repo) or pr_number <= 0:
-        return ""
+        return None
     if github_app.auth_mode() != "none":
         try:
             import httpx
@@ -607,11 +620,19 @@ async def _resolve_pr_base_ref(repo: str, pr_number: int) -> str:
                     )
                 if resp.status_code == 200:
                     data = resp.json()
-                    base = data.get("base") if isinstance(data, dict) else None
-                    if isinstance(base, dict) and isinstance(base.get("ref"), str) and base["ref"].strip():
-                        return base["ref"].strip()
+                    if isinstance(data, dict):
+                        return data
         except Exception as exc:
-            log.debug("base_ref lookup failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+            log.debug("PR snapshot lookup failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+    return None
+
+
+async def _resolve_pr_base_ref(repo: str, pr_number: int) -> str:
+    """Resolve a PR's target base branch ref via GitHub API (best-effort)."""
+    data = await _fetch_pr_snapshot(repo, pr_number)
+    base = data.get("base") if isinstance(data, dict) else None
+    if isinstance(base, dict) and isinstance(base.get("ref"), str) and base["ref"].strip():
+        return base["ref"].strip()
     return ""
 
 
@@ -621,22 +642,33 @@ async def _effective_readiness_config(
     base_ref: str = "",
     *,
     pr_number: int | None = None,
+    pr_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge the repo's agent v2 config with the PR base-branch `.pragent.yaml`.
 
-    Cached repo configuration is only reused when the PR's base branch is known
-    and matches the cached ``ref``; otherwise the base branch's config is loaded
-    so a PR targeting a non-default branch (e.g. ``release``) never inherits
-    ``main``'s policy.
+    For PR evaluations, always resolve the base ref from the live PR snapshot
+    (``pr_data`` when provided, or a single GitHub API fetch) rather than
+    trusting a potentially stale webhook ref. If the base ref or matching
+    policy cannot be established, marks ``_policy_incomplete = True`` so a
+    required gate never publishes ``success`` using fallback settings.
     """
     base_agent = (
         _agent_v2(agent_cfg)
         if isinstance(agent_cfg, dict)
         else (await _find_repo_agent(repo) or dict(AGENT_V2_DEFAULTS))
     )
-    resolved_base = (base_ref or "").strip()
-    if not resolved_base and pr_number and pr_number > 0:
-        resolved_base = await _resolve_pr_base_ref(repo, int(pr_number))
+    resolved_base = ""
+    policy_incomplete = False
+    if pr_number and pr_number > 0:
+        snapshot = pr_data if isinstance(pr_data, dict) else await _fetch_pr_snapshot(repo, int(pr_number))
+        base_obj = snapshot.get("base") if isinstance(snapshot, dict) else None
+        if isinstance(base_obj, dict) and isinstance(base_obj.get("ref"), str):
+            resolved_base = base_obj["ref"].strip()
+        if not resolved_base:
+            policy_incomplete = True
+    else:
+        resolved_base = (base_ref or "").strip()
+
     repo_cfg: review_mod.RepoConfig | None = None
     try:
         cached = await store.arget_json(dm.repo_config_key(repo))
@@ -651,22 +683,44 @@ async def _effective_readiness_config(
             token, _ = await github_app.token_for_repo(repo)
             if token:
                 repo_cfg = await review_mod.load_repo_config(repo, resolved_base, token)
+            elif pr_number and pr_number > 0:
+                policy_incomplete = True
+        elif resolved_base and pr_number and pr_number > 0:
+            policy_incomplete = True
         elif not pr_number and isinstance(cached, dict) and isinstance(cached.get("config"), dict):
             # Non-PR caller with no explicit base_ref: use cached repo config as before.
             repo_cfg = review_mod.RepoConfig.model_validate(cached["config"])
     except Exception as exc:
         log.debug("readiness repo config merge skipped for %s (%s)", repo, type(exc).__name__)
-    return review_mod.merge_agent_and_repo_config(base_agent, repo_cfg)
+        if pr_number and pr_number > 0:
+            policy_incomplete = True
+    merged = review_mod.merge_agent_and_repo_config(base_agent, repo_cfg)
+    if policy_incomplete:
+        merged["_policy_incomplete"] = True
+    return merged
+
+
+async def _resolve_readiness_inputs(
+    repo: str,
+    pr_number: int,
+    agent_cfg: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Fetch one PR snapshot and derive the effective readiness config from that same snapshot."""
+    pr_snapshot = await _fetch_pr_snapshot(repo, pr_number)
+    merged_cfg = await _effective_readiness_config(
+        repo, agent_cfg, pr_number=pr_number, pr_data=pr_snapshot
+    )
+    return merged_cfg, pr_snapshot
 
 
 async def _bg_recompute_readiness(repo: str, pr_number: int, base_ref: str = "") -> None:
     """Best-effort background merge-readiness recomputation for one PR."""
     try:
-        merged_cfg = await _effective_readiness_config(repo, base_ref=base_ref, pr_number=pr_number)
+        merged_cfg, pr_snapshot = await _resolve_readiness_inputs(repo, pr_number)
         raw_weights = merged_cfg.get("weights")
         weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
         await merge_mod.recompute_pr_readiness(
-            repo, pr_number, agent_config=merged_cfg, weights=weights
+            repo, pr_number, agent_config=merged_cfg, weights=weights, pr_data=pr_snapshot
         )
         # If a newer event marked the PR dirty while this recompute was in flight,
         # publish_readiness preserved the newer dirty marker via compare-and-delete.
@@ -704,7 +758,11 @@ async def _schedule_readiness_recompute(
 
 
 async def _sweep_dirty_prs() -> None:
-    """Background sweeper for PRs marked dirty (`prdirty:{repo}:{pr}`) that missed immediate recompute."""
+    """Background sweeper for PRs marked dirty (`prdirty:{repo}:{pr}`) and deferred close markers."""
+    try:
+        await asyncio.to_thread(merge_mod.publisher.flush_pending_closes)
+    except Exception as exc:
+        log.warning("pending close sweep failed: %s", exc)
     if github_app.auth_mode() == "none":
         return
     try:
@@ -943,10 +1001,12 @@ async def _bg_handle_chat_mention(
         return await _run_manual_review_for_pr(r, pr_n, force_full=True, agent_cfg=agent_cfg)
 
     async def _recompute_readiness(r: str, pr_n: int) -> dict[str, Any] | None:
-        merged_cfg = await _effective_readiness_config(r, agent_cfg, pr_number=pr_n)
+        merged_cfg, pr_snapshot = await _resolve_readiness_inputs(r, pr_n, agent_cfg)
         raw_weights = merged_cfg.get("weights")
         weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
-        out = await merge_mod.recompute_pr_readiness(r, pr_n, agent_config=merged_cfg, weights=weights)
+        out = await merge_mod.recompute_pr_readiness(
+            r, pr_n, agent_config=merged_cfg, weights=weights, pr_data=pr_snapshot
+        )
         return out.get("report") if isinstance(out, dict) else None
 
     try:
@@ -1288,7 +1348,8 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     await asyncio.to_thread(runtime_settings.refresh)
     event = (request.headers.get("X-GitHub-Event") or "").strip()
     delivery = (request.headers.get("X-GitHub-Delivery") or "").strip()
-    if not _verify_signature(raw, sig, event=event):
+    sig_source = _verify_signature(raw, sig, event=event)
+    if not sig_source:
         raise HTTPException(status_code=401, detail="bad webhook signature")
 
     try:
@@ -1303,7 +1364,7 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     if event and event != "pull_request":
         # Reviews, threads, comments, CI results, pushes, App installs: recorded
         # by the event router (activity log, readiness marker, installations).
-        res = await events.route(event, payload, delivery)
+        res = await events.route(event, payload, delivery, auth_source=sig_source)
         if event == "issue_comment":
             comment_obj = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
             comment_body = str(comment_obj.get("body") or "")
@@ -1335,14 +1396,14 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
     action = raw_action if isinstance(raw_action, str) else ""
     repository_obj = payload.get("repository")
     repo_raw = (repository_obj.get("full_name") if isinstance(repository_obj, dict) else "") or ""
-    if isinstance(repo_raw, str) and _REPO_RE.fullmatch(repo_raw):
+    if sig_source in ("app", "unsigned") and isinstance(repo_raw, str) and _REPO_RE.fullmatch(repo_raw):
         await asyncio.to_thread(events.note_installation, payload, repo_raw)
     activity: dict[str, Any] = {}
     if isinstance(pr, dict) and pr:
         # Every PR action (closed, ready_for_review, ...) feeds the activity log,
         # including bot-authored PRs; failures never block the review path.
         try:
-            activity = await events.route("pull_request", payload, delivery)
+            activity = await events.route("pull_request", payload, delivery, auth_source=sig_source)
         except Exception as exc:
             log.warning("webhook: activity recording failed (%s)", type(exc).__name__)
 
@@ -1353,10 +1414,31 @@ async def github_webhook(request: Request, tasks: BackgroundTasks) -> JSONRespon
             closed_pr_num = 0
         if closed_pr_num > 0:
             merged = bool(pr.get("merged"))
+            head_obj_closed = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+            closed_sha = str(head_obj_closed.get("sha") or "").strip()
             try:
-                await asyncio.to_thread(merge_mod.mark_pr_closed, repo_raw, closed_pr_num, merged=merged)
+                await asyncio.to_thread(
+                    merge_mod.mark_pr_closed,
+                    repo_raw,
+                    closed_pr_num,
+                    merged=merged,
+                    head_sha=closed_sha,
+                )
             except Exception as exc:
                 log.warning("webhook: mark_pr_closed failed for %s#%d (%s)", repo_raw, closed_pr_num, type(exc).__name__)
+            sibling_prs: set[int] = {
+                int(p) for p in (activity.get("sibling_prs") or []) if isinstance(p, int) and p > 0
+            }
+            if closed_sha:
+                sibling_prs.update(
+                    await asyncio.to_thread(
+                        merge_mod.publisher.open_siblings_for_head, repo_raw, closed_sha, closed_pr_num
+                    )
+                )
+            for sib_pr in sorted(sibling_prs):
+                await _schedule_readiness_recompute(
+                    repo_raw, sib_pr, tasks, bypass_debounce=True
+                )
             if merged:
                 base_obj_closed = pr.get("base") if isinstance(pr.get("base"), dict) else {}
                 base_ref_closed = str(base_obj_closed.get("ref") or "")
@@ -2491,10 +2573,12 @@ async def recompute_pull_readiness(owner: str, name: str, pr_number: int, reques
     repo = _require_repo(owner, name)
     pr_num = _require_pr_number(pr_number)
     await asyncio.to_thread(runtime_settings.refresh)
-    merged_cfg = await _effective_readiness_config(repo, pr_number=pr_num)
+    merged_cfg, pr_snapshot = await _resolve_readiness_inputs(repo, pr_num)
     raw_weights = merged_cfg.get("weights")
     weights = raw_weights if isinstance(raw_weights, dict) and raw_weights else None
-    res = await merge_mod.recompute_pr_readiness(repo, pr_num, agent_config=merged_cfg, weights=weights)
+    res = await merge_mod.recompute_pr_readiness(
+        repo, pr_num, agent_config=merged_cfg, weights=weights, pr_data=pr_snapshot
+    )
     return {
         "report": res["report"],
         "published": {

@@ -248,6 +248,8 @@ export function PrInboxPage({ active }: { active: boolean }) {
 
   const currentBackendRef = React.useRef(backend);
   currentBackendRef.current = backend;
+  const currentFiltersRef = React.useRef({ repoFilter, stateFilter });
+  currentFiltersRef.current = { repoFilter, stateFilter };
 
   const listSeq = React.useRef(0);
   const detailSeq = React.useRef(0);
@@ -272,21 +274,29 @@ export function PrInboxPage({ active }: { active: boolean }) {
     async (expectedBackend?: string) => {
       const reqBackend = expectedBackend ?? useApp.getState().backendUrl;
       if (reqBackend !== currentBackendRef.current) return;
+      const reqRepoFilter = currentFiltersRef.current.repoFilter;
+      const reqStateFilter = currentFiltersRef.current.stateFilter;
       const mine = ++listSeq.current;
+      const isCurrentSelection = () =>
+        mine === listSeq.current &&
+        currentBackendRef.current === reqBackend &&
+        currentFiltersRef.current.repoFilter === reqRepoFilter &&
+        currentFiltersRef.current.stateFilter === reqStateFilter;
+
       setLoading(true);
       setErr("");
       try {
         const res = await listPrInbox({
-          repo: repoFilter !== "__all__" ? repoFilter : undefined,
-          state: stateFilter,
+          repo: reqRepoFilter !== "__all__" ? reqRepoFilter : undefined,
+          state: reqStateFilter,
         });
-        if (mine !== listSeq.current || currentBackendRef.current !== reqBackend) return;
+        if (!isCurrentSelection()) return;
         const sorted = [...res.items].sort((a, b) => {
           if (a.score !== b.score) return a.score - b.score;
           return (Date.parse(b.updated_at || "") || 0) - (Date.parse(a.updated_at || "") || 0);
         });
         setItems(sorted);
-        if (repoFilter === "__all__" && stateFilter === "open") {
+        if (reqRepoFilter === "__all__" && reqStateFilter === "open") {
           setBlockedPrCount(sorted.filter((p) => p.band === "blocked").length);
         }
         setSelectedKey((prev) => {
@@ -294,18 +304,18 @@ export function PrInboxPage({ active }: { active: boolean }) {
           return sorted.length ? prKey(sorted[0]) : "";
         });
       } catch (e) {
-        if (mine !== listSeq.current || currentBackendRef.current !== reqBackend) return;
+        if (!isCurrentSelection()) return;
         setErr(errText(e, 260));
       } finally {
-        if (mine === listSeq.current && currentBackendRef.current === reqBackend) setLoading(false);
+        if (isCurrentSelection()) setLoading(false);
       }
     },
-    [repoFilter, stateFilter, setBlockedPrCount],
+    [setBlockedPrCount],
   );
 
   React.useEffect(() => {
     if (active && vaultLoaded) void loadInbox(backend);
-  }, [active, vaultLoaded, backend, loadInbox]);
+  }, [active, vaultLoaded, backend, repoFilter, stateFilter, loadInbox]);
 
   const filteredItems = React.useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -520,8 +530,12 @@ export function PrInboxPage({ active }: { active: boolean }) {
   };
 
   const activeReport = matchedDetail?.report ?? null;
-  const activeScore = activeReport?.score ?? selectedPr?.score ?? 0;
-  const activeBand = activeReport?.band ?? selectedPr?.band ?? "needs_work";
+  const reportMatchesHead = Boolean(
+    activeReport && selectedPr?.head_sha && activeReport.head_sha === selectedPr.head_sha,
+  );
+  const currentHeadReport = reportMatchesHead ? activeReport : null;
+  const activeScore = currentHeadReport?.score ?? selectedPr?.score ?? 0;
+  const activeBand = currentHeadReport?.band ?? selectedPr?.band ?? "needs_work";
   const allFindings = matchedDetail?.findings || [];
   const filteredFindings = React.useMemo(() => {
     if (findingFilter === "all") return allFindings;
@@ -529,9 +543,9 @@ export function PrInboxPage({ active }: { active: boolean }) {
     return allFindings.filter((f) => f.state !== "open");
   }, [allFindings, findingFilter]);
 
-  const checklistBlockers = (activeReport?.items || []).filter((i) => i.kind === "blocker");
-  const checklistShouldFix = (activeReport?.items || []).filter((i) => i.kind === "should_fix");
-  const checklistNiceToHave = (activeReport?.items || []).filter((i) => i.kind === "nice_to_have");
+  const checklistBlockers = (currentHeadReport?.items || []).filter((i) => i.kind === "blocker");
+  const checklistShouldFix = (currentHeadReport?.items || []).filter((i) => i.kind === "should_fix");
+  const checklistNiceToHave = (currentHeadReport?.items || []).filter((i) => i.kind === "nice_to_have");
 
   return (
     <Page active={active} className="max-w-7xl">
@@ -856,7 +870,7 @@ export function PrInboxPage({ active }: { active: boolean }) {
                   <div className="text-sm font-semibold">Before you merge</div>
                   {detailLoading && !matchedDetail ? (
                     <Skeleton className="h-24 rounded-md" />
-                  ) : !matchedDetail || !activeReport || detailErr ? (
+                  ) : !matchedDetail || !currentHeadReport || detailErr ? (
                     <div className="bg-muted/30 text-muted-foreground flex items-center gap-2 rounded-md border border-dashed px-3 py-2.5 text-xs">
                       <AlertTriangle className="size-4 shrink-0" />
                       <span>
@@ -865,7 +879,7 @@ export function PrInboxPage({ active }: { active: boolean }) {
                           : "Readiness report not computed yet for this PR head. Click Recompute Score or Re-review PR."}
                       </span>
                     </div>
-                  ) : activeReport.items?.length ? (
+                  ) : currentHeadReport.items?.length ? (
                     <div className="grid gap-3">
                       <ChecklistGroup title="Blockers" items={checklistBlockers} tone="blocker" />
                       <ChecklistGroup title="Should fix" items={checklistShouldFix} tone="should_fix" />

@@ -13,13 +13,16 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import re
 import threading
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -126,8 +129,21 @@ def _pr_state_lock_key(repo: str, pr_number: int) -> str:
     return f"prstate:{repo.lower()}:{int(pr_number)}"
 
 
-def _publish_retry_key(repo: str, pr_number: int) -> str:
-    return f"mergretry:{repo.lower()}:{int(pr_number)}"
+def _pr_publish_lock_key(repo: str, pr_number: int) -> str:
+    return f"prpub:{repo.lower()}:{int(pr_number)}"
+
+
+def _pending_close_key(repo: str, pr_number: int) -> str:
+    return f"prclose:{repo.lower()}:{int(pr_number)}"
+
+
+def _publish_retry_key(repo: str, pr_number: int, dirty_token: str | None = None) -> str:
+    base = f"mergretry:{repo.lower()}:{int(pr_number)}"
+    tok = str(dirty_token or "").strip()
+    if not tok:
+        return base
+    digest = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16]
+    return f"{base}:{digest}"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -171,17 +187,36 @@ def get_stored_readiness(repo: str, pr_number: int) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def render_readiness_comment(report: dm.ReadinessReport) -> str:
+def render_readiness_comment(
+    report: dm.ReadinessReport,
+    *,
+    incomplete_signals: list[str] | None = None,
+) -> str:
     """Render a sticky CodeRabbit/Macroscope-style 'Before you merge' checklist."""
     band_label = _BAND_LABELS.get(report.band, report.band.replace("_", " ").title())
+    incomplete = [str(s).strip() for s in (incomplete_signals or []) if str(s).strip()]
     lines: list[str] = [
         READINESS_MARKER,
         f"## PR Agent Merge Readiness: {report.score}/100 · {band_label}",
         "",
     ]
 
+    if incomplete:
+        missing = ", ".join(incomplete)
+        lines.append(
+            f"> **Incomplete signals:** Some GitHub signals could not be fetched (`{missing}`). "
+            "Readiness is partial until all signals succeed."
+        )
+        lines.append("")
+
     if not report.items:
-        lines.append("All pre-merge checks passed — no open blockers or issues found.")
+        if not incomplete:
+            lines.append("All pre-merge checks passed — no open blockers or issues found.")
+        else:
+            lines.append(
+                "No open blockers were detected in the available signals, "
+                "but readiness cannot be confirmed until missing signals are fetched."
+            )
     else:
         for kind, heading in _SECTION_META:
             bucket = [item for item in report.items if item.kind == kind]
@@ -230,7 +265,7 @@ def _render_check_summary(
             summary += f" Incomplete signals ({missing}) — required gate withheld."
         else:
             summary += f" Partial data (incomplete signals: {missing})."
-    body = render_readiness_comment(report)
+    body = render_readiness_comment(report, incomplete_signals=incomplete_signals)
     if body.startswith(READINESS_MARKER):
         body = body[len(READINESS_MARKER):].lstrip("\n")
     return title, summary, body
@@ -339,6 +374,27 @@ async def _publish_check_run(
         return {"action": "error", "conclusion": conclusion, "error": type(exc).__name__}
 
 
+def open_siblings_for_head(repo: str, head_sha: str, exclude_pr: int) -> list[int]:
+    """Return open sibling PR numbers sharing ``head_sha`` (excluding ``exclude_pr``)."""
+    sha_low = str(head_sha or "").strip().lower()
+    if not sha_low or not dm.valid_repo(repo):
+        return []
+    siblings: list[int] = []
+    for sib_pr in events.prs_for_head(repo, head_sha):
+        if sib_pr == int(exclude_pr):
+            continue
+        sib_inbox = store.rget_json(inbox_key(repo, sib_pr))
+        if isinstance(sib_inbox, dict):
+            sib_state = str(sib_inbox.get("state") or "open").strip().lower()
+            if sib_state in ("closed", "merged"):
+                continue
+            sib_sha = str(sib_inbox.get("head_sha") or "").strip().lower()
+            if sib_sha and sib_sha != sha_low:
+                continue
+        siblings.append(sib_pr)
+    return siblings
+
+
 def _aggregate_shared_head_status(
     repo: str,
     head_sha: str,
@@ -352,24 +408,9 @@ def _aggregate_shared_head_status(
         ex=_CHECK_CACHE_TTL_S,
     )
 
-    candidate_prs = list(events.prs_for_head(repo, head_sha))
-    if pr_number not in candidate_prs:
-        candidate_prs.append(pr_number)
-
-    active: list[dict[str, Any]] = []
-    sha_low = head_sha.strip().lower()
-    for sib_pr in candidate_prs:
-        if sib_pr == pr_number:
-            active.append(own_decision)
-            continue
+    active: list[dict[str, Any]] = [own_decision]
+    for sib_pr in open_siblings_for_head(repo, head_sha, pr_number):
         sib_inbox = store.rget_json(inbox_key(repo, sib_pr))
-        if isinstance(sib_inbox, dict):
-            sib_state = str(sib_inbox.get("state") or "open").strip().lower()
-            if sib_state in ("closed", "merged"):
-                continue
-            sib_sha = str(sib_inbox.get("head_sha") or "").strip().lower()
-            if sib_sha and sib_sha != sha_low:
-                continue
 
         dec = store.rget_json(_status_pr_decision_key(repo, head_sha, sib_pr))
         if isinstance(dec, dict) and dec.get("state"):
@@ -604,6 +645,7 @@ async def _find_readiness_comment(
     found: int | None = None
     own_app_slug = github_app.app_slug().strip().lower()
     own_app_id = _safe_int(github_app.app_id(), 0)
+    identity_verified = (auth_kind == "app") or bool(authenticated_login.strip())
     try:
         for page in range(1, _MAX_COMMENT_PAGES + 1):
             resp = await client.get(
@@ -641,9 +683,9 @@ async def _find_readiness_comment(
                             found = cid
             has_next = _has_next_link(resp)
             if has_next is False:
-                return found, True
+                return found, identity_verified
             if has_next is None and len(batch) < 100:
-                return found, True
+                return found, identity_verified
             if page == _MAX_COMMENT_PAGES:
                 log.warning(
                     "merge.publisher: comment lookup hit page cap (%d) for %s",
@@ -666,8 +708,9 @@ async def _upsert_readiness_comment(
     headers: dict[str, str],
     auth_kind: str = "",
     token: str = "",
+    incomplete_signals: list[str] | None = None,
 ) -> dict[str, Any]:
-    body = render_readiness_comment(report)
+    body = render_readiness_comment(report, incomplete_signals=incomplete_signals)
     comments_url = f"{GITHUB_API}/repos/{repo}/issues/{int(pr_number)}/comments"
     cache_key = _comment_cache_key(repo, pr_number)
 
@@ -770,19 +813,18 @@ def _derive_findings_counts(
     return counts
 
 
-def _upsert_inbox_record(
+def _build_inbox_record(
     repo: str,
     pr_number: int,
     report: dm.ReadinessReport,
     *,
+    existing: Any,
     merge_gate: str,
     score_threshold: int,
     pr_meta: dict[str, Any] | None = None,
     findings_summary: dict[str, Any] | None = None,
     snapshot_at: str = "",
 ) -> dict[str, Any]:
-    key = inbox_key(repo, pr_number)
-    existing = store.rget_json(key)
     prev = existing if isinstance(existing, dict) else {}
     meta = pr_meta if isinstance(pr_meta, dict) else {}
 
@@ -825,6 +867,33 @@ def _upsert_inbox_record(
         record["closed_at"] = prev["closed_at"]
     if prev.get("merged") and state == "merged":
         record["merged"] = True
+    return record
+
+
+def _upsert_inbox_record(
+    repo: str,
+    pr_number: int,
+    report: dm.ReadinessReport,
+    *,
+    merge_gate: str,
+    score_threshold: int,
+    pr_meta: dict[str, Any] | None = None,
+    findings_summary: dict[str, Any] | None = None,
+    snapshot_at: str = "",
+) -> dict[str, Any]:
+    key = inbox_key(repo, pr_number)
+    existing = store.rget_json(key)
+    record = _build_inbox_record(
+        repo,
+        pr_number,
+        report,
+        existing=existing,
+        merge_gate=merge_gate,
+        score_threshold=score_threshold,
+        pr_meta=pr_meta,
+        findings_summary=findings_summary,
+        snapshot_at=snapshot_at,
+    )
     store.rset_json(key, record, ex=dm.MERGE_REPORT_TTL_S)
     return record
 
@@ -879,6 +948,10 @@ def list_inbox_prs(
     else:
         pattern = "prinbox:*"
 
+    # Best-effort drain of any deferred close markers so lock contention never leaves stale open rows.
+    with contextlib.suppress(Exception):
+        flush_pending_closes(repo=repo)
+
     keys = store.rkeys(pattern)
     if not keys:
         return []
@@ -913,30 +986,139 @@ def list_inbox_prs(
     return out
 
 
-def mark_pr_closed(repo: str, pr_number: int, merged: bool = False) -> dict[str, Any] | None:
-    """Mark a tracked PR closed/merged in the PR Inbox and clear its dirty flag."""
+def _schedule_open_siblings_for_head(repo: str, head_sha: str, exclude_pr: int) -> list[int]:
+    """Mark open siblings sharing ``head_sha`` dirty and clear their debounce keys."""
+    siblings = open_siblings_for_head(repo, head_sha, exclude_pr)
+    for sib_pr in siblings:
+        events.mark_dirty(repo, sib_pr)
+        store.rdelete(f"readinessdebounce:{repo.lower()}:{sib_pr}")
+    return siblings
+
+
+def mark_pr_closed(
+    repo: str,
+    pr_number: int,
+    merged: bool = False,
+    *,
+    head_sha: str = "",
+    closed_at: str = "",
+    lock_wait_s: float = 5.0,
+    max_attempts: int = 3,
+) -> dict[str, Any] | None:
+    """Mark a tracked PR closed/merged in the PR Inbox, clear its dirty flag,
+    and schedule open sibling PRs sharing its head SHA for recomputation.
+
+    Retries on transient lock contention / lease loss and persists a durable
+    pending-close marker (``prclose:{repo}:{pr}``) if the lock remains busy so
+    the close update is never permanently dropped.
+    """
     if not dm.valid_repo(repo):
         raise ValueError("invalid repository name")
     pr_num = int(pr_number)
     if pr_num <= 0:
         raise ValueError("invalid pull request number")
 
-    with store.key_lock(_pr_state_lock_key(repo, pr_num)):
-        store.rdelete(dm.dirty_key(repo, pr_num))
-        store.rdelete(_publish_retry_key(repo, pr_num))
-        key = inbox_key(repo, pr_num)
-        existing = store.rget_json(key)
-        if not isinstance(existing, dict):
+    now = closed_at or _now_iso()
+    lock_key = _pr_state_lock_key(repo, pr_num)
+    close_key = _pending_close_key(repo, pr_num)
+    dkey = dm.dirty_key(repo, pr_num)
+    ikey = inbox_key(repo, pr_num)
+
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            with store.key_lock(lock_key, wait_s=lock_wait_s) as lock_token:
+                cur_dirty = store.rget(dkey)
+                existing = store.rget_json(ikey)
+                ops: list[tuple[str, str | None, int | None]] = [
+                    (dkey, None, None),
+                    (_publish_retry_key(repo, pr_num), None, None),
+                    (close_key, None, None),
+                ]
+                if cur_dirty:
+                    ops.append((_publish_retry_key(repo, pr_num, cur_dirty), None, None))
+
+                updated: dict[str, Any] | None = None
+                resolved_sha = str(head_sha or "").strip()
+                if isinstance(existing, dict):
+                    updated = dict(existing)
+                    updated["state"] = "merged" if merged else "closed"
+                    updated["merged"] = bool(merged)
+                    updated["closed_at"] = now
+                    updated["updated_at"] = now
+                    updated["snapshot_at"] = now
+                    if not resolved_sha:
+                        resolved_sha = str(existing.get("head_sha") or "").strip()
+                    ops.append((ikey, json.dumps(updated), dm.MERGE_REPORT_TTL_S))
+                elif not resolved_sha:
+                    stored_rep = store.rget_json(dm.merge_report_key(repo, pr_num))
+                    if isinstance(stored_rep, dict):
+                        resolved_sha = str(stored_rep.get("head_sha") or "").strip()
+
+                if not store.rcommit_if_lock_held(lock_key, lock_token, ops):
+                    raise store.LockLostError(f"lease lost while closing {repo}#{pr_num}")
+
+                if resolved_sha:
+                    _schedule_open_siblings_for_head(repo, resolved_sha, pr_num)
+                return updated
+        except (TimeoutError, store.LockLostError) as exc:
+            if attempt + 1 < max(1, int(max_attempts)):
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            log.warning(
+                "merge.publisher: mark_pr_closed lock busy for %s#%d (%s); persisting pending close marker",
+                repo,
+                pr_num,
+                type(exc).__name__,
+            )
+            store.rset_json(
+                close_key,
+                {
+                    "repo": repo,
+                    "pr_number": pr_num,
+                    "merged": bool(merged),
+                    "closed_at": now,
+                    "head_sha": str(head_sha or "").strip(),
+                },
+                ex=dm.MERGE_REPORT_TTL_S,
+            )
+            if head_sha:
+                _schedule_open_siblings_for_head(repo, head_sha, pr_num)
             return None
-        now = _now_iso()
-        updated = dict(existing)
-        updated["state"] = "merged" if merged else "closed"
-        updated["merged"] = bool(merged)
-        updated["closed_at"] = now
-        updated["updated_at"] = now
-        updated["snapshot_at"] = now
-        store.rset_json(key, updated, ex=dm.MERGE_REPORT_TTL_S)
-        return updated
+    return None
+
+
+def flush_pending_closes(repo: str | None = None) -> int:
+    """Drain durable ``prclose:*`` markers left behind by lock contention."""
+    if repo:
+        if not dm.valid_repo(repo):
+            return 0
+        pattern = f"prclose:{repo.lower()}:*"
+    else:
+        pattern = "prclose:*"
+    keys = store.rkeys(pattern)
+    if not keys:
+        return 0
+    applied = 0
+    for key, raw in zip(keys[:50], store.rget_json_many(keys[:50])):
+        if not isinstance(raw, dict):
+            continue
+        rec_repo = str(raw.get("repo") or "").strip()
+        rec_pr = _safe_int(raw.get("pr_number"), 0)
+        if not dm.valid_repo(rec_repo) or rec_pr <= 0:
+            store.rdelete(key)
+            continue
+        res = mark_pr_closed(
+            rec_repo,
+            rec_pr,
+            merged=bool(raw.get("merged")),
+            head_sha=str(raw.get("head_sha") or ""),
+            closed_at=str(raw.get("closed_at") or ""),
+            lock_wait_s=0.2,
+            max_attempts=1,
+        )
+        if res is not None or store.rget(key) is None:
+            applied += 1
+    return applied
 
 
 # ---------------------------------------------------------------------------
@@ -951,19 +1133,27 @@ def _finalize_dirty_flag(
     *,
     retry_needed: bool,
 ) -> None:
-    """Clear ``prdirty`` atomically on clean completion, or keep it set with bounded retries."""
+    """Clear ``prdirty`` atomically on clean completion, or keep it set with bounded per-token retries."""
     dkey = dm.dirty_key(repo, pr_num)
-    rkey = _publish_retry_key(repo, pr_num)
     if not retry_needed:
-        store.rdelete(rkey)
         if captured_dirty_token is not None:
+            store.rdelete(_publish_retry_key(repo, pr_num, captured_dirty_token))
             store.rdelete_if_equal(dkey, captured_dirty_token)
+        else:
+            store.rdelete(_publish_retry_key(repo, pr_num))
         return
 
+    token_for_retry = captured_dirty_token
+    if token_for_retry is None:
+        new_tok = f"{_now_iso()}:{uuid.uuid4().hex[:8]}"
+        store.rset(dkey, new_tok, ex=dm.DIRTY_TTL_S, nx=True)
+        token_for_retry = store.rget(dkey) or new_tok
+
+    rkey = _publish_retry_key(repo, pr_num, token_for_retry)
     attempts = store.rincr(rkey, 1, ex=_PUBLISH_RETRY_TTL_S)
     if attempts <= _MAX_PUBLISH_RETRIES:
-        # Keep existing dirty marker intact, or mark dirty so the sweeper retries.
-        store.rset(dkey, _now_iso(), ex=dm.DIRTY_TTL_S, nx=True)
+        # Keep existing dirty marker intact, or restore it if cleared.
+        store.rset(dkey, token_for_retry, ex=dm.DIRTY_TTL_S, nx=True)
         return
 
     log.warning(
@@ -972,8 +1162,101 @@ def _finalize_dirty_flag(
         repo,
         pr_num,
     )
-    if captured_dirty_token is not None:
-        store.rdelete_if_equal(dkey, captured_dirty_token)
+    store.rdelete(rkey)
+    store.rdelete_if_equal(dkey, token_for_retry)
+
+
+def _persist_pr_state_locked(
+    repo: str,
+    pr_num: int,
+    report: dm.ReadinessReport,
+    *,
+    gate: str,
+    threshold: int,
+    pr_meta: dict[str, Any] | None,
+    findings_summary: dict[str, Any] | None,
+    incoming_state: str,
+    effective_snapshot_at: str,
+) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
+    """Acquire PR state lock, validate snapshot freshness + pending closes, and commit atomically.
+
+    Runs inside a worker thread via ``asyncio.to_thread`` so lock waits never
+    block the asyncio event loop. Uses ``store.rcommit_if_lock_held`` so an
+    expired lease holder cannot overwrite state written by a newer owner.
+    """
+    lock_key = _pr_state_lock_key(repo, pr_num)
+    close_key = _pending_close_key(repo, pr_num)
+    rep_key = dm.merge_report_key(repo, pr_num)
+    ikey = inbox_key(repo, pr_num)
+
+    with store.key_lock(lock_key) as lock_token:
+        existing_report = store.rget_json(rep_key)
+        existing_inbox = store.rget_json(ikey)
+        pending_close = store.rget_json(close_key)
+
+        # Apply any pending close marker durably before evaluating snapshot freshness.
+        pending_close_applied = False
+        if isinstance(pending_close, dict):
+            closed_ts = str(pending_close.get("closed_at") or _now_iso())
+            closed_merged = bool(pending_close.get("merged"))
+            base_inbox = dict(existing_inbox) if isinstance(existing_inbox, dict) else {
+                "repo": repo,
+                "pr_number": pr_num,
+                "head_sha": str(pending_close.get("head_sha") or report.head_sha or ""),
+            }
+            base_inbox["state"] = "merged" if closed_merged else "closed"
+            base_inbox["merged"] = closed_merged
+            base_inbox["closed_at"] = closed_ts
+            base_inbox["updated_at"] = closed_ts
+            base_inbox["snapshot_at"] = closed_ts
+            existing_inbox = base_inbox
+            pending_close_applied = True
+
+        if _is_stale_snapshot(
+            existing_report,
+            existing_inbox,
+            head_sha=report.head_sha,
+            incoming_state=incoming_state,
+            snapshot_at=effective_snapshot_at,
+        ):
+            if pending_close_applied and isinstance(existing_inbox, dict):
+                close_ops: list[tuple[str, str | None, int | None]] = [
+                    (ikey, json.dumps(existing_inbox), dm.MERGE_REPORT_TTL_S),
+                    (close_key, None, None),
+                    (dm.dirty_key(repo, pr_num), None, None),
+                ]
+                if not store.rcommit_if_lock_held(lock_key, lock_token, close_ops):
+                    raise store.LockLostError(f"lease lost while applying pending close for {repo}#{pr_num}")
+            return (
+                True,
+                existing_report if isinstance(existing_report, dict) else report.model_dump(),
+                existing_inbox if isinstance(existing_inbox, dict) else None,
+            )
+
+        report_dump = report.model_dump()
+        inbox_record = _build_inbox_record(
+            repo,
+            pr_num,
+            report,
+            existing=existing_inbox,
+            merge_gate=gate,
+            score_threshold=threshold,
+            pr_meta=pr_meta,
+            findings_summary=findings_summary,
+            snapshot_at=effective_snapshot_at,
+        )
+        ops: list[tuple[str, str | None, int | None]] = [
+            (rep_key, json.dumps(report_dump), dm.MERGE_REPORT_TTL_S),
+            (ikey, json.dumps(inbox_record), dm.MERGE_REPORT_TTL_S),
+        ]
+        if pending_close_applied:
+            ops.append((close_key, None, None))
+        if not store.rcommit_if_lock_held(lock_key, lock_token, ops):
+            raise store.LockLostError(f"lease lost while committing PR state for {repo}#{pr_num}")
+
+        if report.head_sha:
+            events.remember_head(repo, pr_num, report.head_sha)
+        return False, report_dump, inbox_record
 
 
 async def publish_readiness(
@@ -1007,27 +1290,36 @@ async def publish_readiness(
 
     dkey = dm.dirty_key(repo, pr_num)
     captured_dirty_token: str | None = (
-        store.rget(dkey) if dirty_token is _UNSET else (str(dirty_token) if dirty_token is not None else None)
+        await asyncio.to_thread(store.rget, dkey)
+        if dirty_token is _UNSET
+        else (str(dirty_token) if dirty_token is not None else None)
     )
     effective_snapshot_at = str(snapshot_at or report.computed_at or _now_iso())
     meta = pr_meta if isinstance(pr_meta, dict) else {}
     incoming_state = str(meta.get("state") or meta.get("pr_state") or "")
 
-    # 1. Guard report + PR inbox persistence against stale snapshots and close races.
-    with store.key_lock(_pr_state_lock_key(repo, pr_num)):
-        existing_report = store.rget_json(dm.merge_report_key(repo, pr_num))
-        existing_inbox = store.rget_json(inbox_key(repo, pr_num))
-        if _is_stale_snapshot(
-            existing_report,
-            existing_inbox,
-            head_sha=report.head_sha,
+    # Serialize local state updates and GitHub writes (Check Run / Commit Status /
+    # sticky comment) per PR without blocking the event loop so a superseded
+    # refresh can never overwrite a newer refresh's GitHub publication.
+    async with store.akey_lock(_pr_publish_lock_key(repo, pr_num), lease_s=60, wait_s=15.0):
+        # 1. Guard report + PR inbox persistence in a worker thread (no event-loop lock waits).
+        is_stale, report_dump, inbox_record = await asyncio.to_thread(
+            _persist_pr_state_locked,
+            repo,
+            pr_num,
+            report,
+            gate=gate,
+            threshold=threshold,
+            pr_meta=pr_meta,
+            findings_summary=findings_summary,
             incoming_state=incoming_state,
-            snapshot_at=effective_snapshot_at,
-        ):
+            effective_snapshot_at=effective_snapshot_at,
+        )
+        if is_stale:
             log.info("merge.publisher: ignoring stale readiness snapshot for %s#%d", repo, pr_num)
             return {
-                "report": existing_report if isinstance(existing_report, dict) else report.model_dump(),
-                "inbox": existing_inbox if isinstance(existing_inbox, dict) else None,
+                "report": report_dump if isinstance(report_dump, dict) else report.model_dump(),
+                "inbox": inbox_record,
                 "published": False,
                 "gate_published": False,
                 "stale": True,
@@ -1038,128 +1330,111 @@ async def publish_readiness(
                 "comment": None,
             }
 
-        store.rset_json(
-            dm.merge_report_key(repo, pr_num),
-            report.model_dump(),
-            ex=dm.MERGE_REPORT_TTL_S,
-        )
-        inbox_record = _upsert_inbox_record(
-            repo,
-            pr_num,
-            report,
-            merge_gate=gate,
-            score_threshold=threshold,
-            pr_meta=pr_meta,
-            findings_summary=findings_summary,
-            snapshot_at=effective_snapshot_at,
-        )
-        if report.head_sha:
-            events.remember_head(repo, pr_num, report.head_sha)
+        check_result: dict[str, Any] | None = None
+        status_result: dict[str, Any] | None = None
+        comment_result: dict[str, Any] | None = None
+        resolved_kind = auth_kind or "none"
+        token = ""
 
-    check_result: dict[str, Any] | None = None
-    status_result: dict[str, Any] | None = None
-    comment_result: dict[str, Any] | None = None
-    resolved_kind = auth_kind or "none"
-    token = ""
-
-    # 2. Publish to GitHub when enabled, head SHA is verified, and credentials exist.
-    if gate != "off" and report.head_sha:
-        if github_token is None:
-            token, detected_kind = await github_app.token_for_repo(repo)
-            resolved_kind = auth_kind or detected_kind
-        else:
-            token = github_token
-            if auth_kind:
-                resolved_kind = auth_kind
-            elif token:
-                resolved_kind = "app" if github_app.app_configured() else "pat"
+        # 2. Publish to GitHub when enabled, head SHA is verified, and credentials exist.
+        if gate != "off" and report.head_sha:
+            if github_token is None:
+                token, detected_kind = await github_app.token_for_repo(repo)
+                resolved_kind = auth_kind or detected_kind
             else:
-                resolved_kind = "none"
-
-        if token:
-            headers = _gh_headers(token)
-            has_open_blockers = any(i.kind == "blocker" and not i.done for i in report.items)
-            passes_gate = (
-                (report.score >= threshold)
-                and not has_open_blockers
-                and report.band != "blocked"
-                and not incomplete
-            )
-
-            own_client = client is None
-            http = client or httpx.AsyncClient(timeout=20.0)
-            try:
-                if resolved_kind == "app":
-                    check_result = await _publish_check_run(
-                        http,
-                        repo,
-                        pr_num,
-                        report,
-                        headers=headers,
-                        passes_gate=passes_gate,
-                        merge_gate=gate,
-                        score_threshold=threshold,
-                        incomplete_signals=incomplete or None,
-                    )
+                token = github_token
+                if auth_kind:
+                    resolved_kind = auth_kind
+                elif token:
+                    resolved_kind = "app" if github_app.app_configured() else "pat"
                 else:
-                    status_result = await _publish_commit_status(
+                    resolved_kind = "none"
+
+            if token:
+                headers = _gh_headers(token)
+                has_open_blockers = any(i.kind == "blocker" and not i.done for i in report.items)
+                passes_gate = (
+                    (report.score >= threshold)
+                    and not has_open_blockers
+                    and report.band != "blocked"
+                    and not incomplete
+                )
+
+                own_client = client is None
+                http = client or httpx.AsyncClient(timeout=20.0)
+                try:
+                    if resolved_kind == "app":
+                        check_result = await _publish_check_run(
+                            http,
+                            repo,
+                            pr_num,
+                            report,
+                            headers=headers,
+                            passes_gate=passes_gate,
+                            merge_gate=gate,
+                            score_threshold=threshold,
+                            incomplete_signals=incomplete or None,
+                        )
+                    else:
+                        status_result = await _publish_commit_status(
+                            http,
+                            repo,
+                            pr_num,
+                            report,
+                            headers=headers,
+                            passes_gate=passes_gate,
+                            merge_gate=gate,
+                            score_threshold=threshold,
+                            target_url=inbox_record.get("url") if isinstance(inbox_record, dict) else None,
+                            incomplete_signals=incomplete or None,
+                        )
+
+                    comment_result = await _upsert_readiness_comment(
                         http,
                         repo,
                         pr_num,
                         report,
                         headers=headers,
-                        passes_gate=passes_gate,
-                        merge_gate=gate,
-                        score_threshold=threshold,
-                        target_url=inbox_record.get("url"),
+                        auth_kind=resolved_kind,
+                        token=token,
                         incomplete_signals=incomplete or None,
                     )
+                finally:
+                    if own_client:
+                        await http.aclose()
 
-                comment_result = await _upsert_readiness_comment(
-                    http,
-                    repo,
-                    pr_num,
-                    report,
-                    headers=headers,
-                    auth_kind=resolved_kind,
-                    token=token,
-                )
-            finally:
-                if own_client:
-                    await http.aclose()
+        gate_result = check_result if resolved_kind == "app" else status_result
+        gate_published = isinstance(gate_result, dict) and gate_result.get("action") in _GATE_OK_ACTIONS
+        comment_published = isinstance(comment_result, dict) and comment_result.get("action") in (
+            "created",
+            "updated",
+        )
 
-    gate_result = check_result if resolved_kind == "app" else status_result
-    gate_published = isinstance(gate_result, dict) and gate_result.get("action") in _GATE_OK_ACTIONS
-    comment_published = isinstance(comment_result, dict) and comment_result.get("action") in (
-        "created",
-        "updated",
-    )
+        if gate == "off":
+            published = False
+            retry_needed = False
+        elif gate == "required":
+            # A required gate is only considered published when the Check Run / Commit Status succeeded.
+            published = gate_published
+            retry_needed = bool(token and (not gate_published or bool(incomplete)))
+        else:
+            published = gate_published or comment_published
+            retry_needed = bool(token and not published)
 
-    if gate == "off":
-        published = False
-        retry_needed = False
-    elif gate == "required":
-        # A required gate is only considered published when the Check Run / Commit Status succeeded.
-        published = gate_published
-        retry_needed = bool(token and (not gate_published or bool(incomplete)))
-    else:
-        published = gate_published or comment_published
-        retry_needed = bool(token and not published)
+        # 3. Clear dirty marker ONLY after publishing finishes cleanly (or keep set for bounded retry).
+        await asyncio.to_thread(_finalize_dirty_flag, repo, pr_num, captured_dirty_token, retry_needed=retry_needed)
 
-    # 3. Clear dirty marker ONLY after publishing finishes cleanly (or keep set for bounded retry).
-    _finalize_dirty_flag(repo, pr_num, captured_dirty_token, retry_needed=retry_needed)
-
-    return {
-        "report": report.model_dump(),
-        "inbox": inbox_record,
-        "published": published,
-        "gate_published": gate_published,
-        "merge_gate": gate,
-        "auth_kind": resolved_kind,
-        "check_run": check_result,
-        "commit_status": status_result,
-        "comment": comment_result,
-    }
+        return {
+            "report": report_dump,
+            "inbox": inbox_record,
+            "published": published,
+            "gate_published": gate_published,
+            "merge_gate": gate,
+            "auth_kind": resolved_kind,
+            "check_run": check_result,
+            "commit_status": status_result,
+            "comment": comment_result,
+        }
 
 
 async def recompute_pr_readiness(
@@ -1269,6 +1544,10 @@ async def recompute_pr_readiness(
         "head_ref": signals.head_ref,
     }
 
+    combined_incomplete = list(signals.incomplete_signals)
+    if cfg.get("_policy_incomplete") and "repo_policy" not in combined_incomplete:
+        combined_incomplete.append("repo_policy")
+
     result = await publish_readiness(
         repo,
         pr_num,
@@ -1282,7 +1561,7 @@ async def recompute_pr_readiness(
         client=client,
         dirty_token=dirty_token,
         snapshot_at=snapshot_at,
-        incomplete_signals=signals.incomplete_signals,
+        incomplete_signals=combined_incomplete,
     )
     result["signals"] = signals.model_dump()
     return result

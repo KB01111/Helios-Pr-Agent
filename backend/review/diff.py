@@ -196,39 +196,55 @@ class DiffFile:
         return False, max(1, old_line + delta)
 
     def span_modified_or_remapped(
-        self, start_line: int, end_line: int, side: str = "RIGHT"
+        self,
+        start_line: int,
+        end_line: int,
+        side: str = "RIGHT",
+        *,
+        pr_file: DiffFile | None = None,
+        prev_pr_file: DiffFile | None = None,
     ) -> tuple[bool, int, int]:
         """Evaluate whether a finding span ``[start_line, end_line]`` on ``side``
         was invalidated by this incremental diff, or else return its remapped
         ``(False, new_start, new_end)``.
+
+        For ``LEFT`` findings (which use PR merge-base coordinates rather than
+        push-delta coordinates), invalidation is evaluated against ``pr_file``
+        (and optionally ``prev_pr_file``) in merge-base coordinates instead of
+        comparing merge-base line numbers against push-delta line numbers.
         """
         lo, hi = min(int(start_line), int(end_line)), max(int(start_line), int(end_line))
+        side_up = (side or "RIGHT").upper()
+        if side_up == "LEFT":
+            if pr_file is None:
+                # Push-delta coordinates are in prev_head/head, not merge-base;
+                # without merge-base diff context, preserve the LEFT finding.
+                return False, lo, hi
+            if pr_file.is_binary:
+                return True, lo, hi
+            span = set(range(lo, hi + 1))
+            if any(ln not in pr_file.deleted_lines for ln in span):
+                return True, lo, hi
+            if prev_pr_file is not None and (prev_pr_file.deleted_lines & span) != (pr_file.deleted_lines & span):
+                return True, lo, hi
+            return False, lo, hi
+
         if self.is_binary or self.status == "deleted":
             return True, lo, hi
         if not self.hunks:
             # Metadata-only or empty hunk change does not alter lines.
             return False, lo, hi
-        side_up = (side or "RIGHT").upper()
-        if side_up == "LEFT":
-            # A LEFT finding targets a deleted line from the PR merge base; if the
-            # incremental diff re-adds or modifies lines in that region, treat it as touched.
-            for ln in range(lo, hi + 1):
-                if ln in self.deleted_lines or ln in self.added_lines:
-                    return True, lo, hi
-            return False, lo, hi
-        # RIGHT finding: check every line in [lo, hi] against old-side deletions, plus
-        # any pure insertion strictly inside a multi-line span.
+        # RIGHT finding: check every line in [lo, hi] against old-side deletions, then
+        # remap endpoints and invalidate if any insertion (with or without context)
+        # occurred strictly inside a multi-line span.
         for ln in range(lo, hi + 1):
             if ln in self.deleted_lines:
                 return True, lo, hi
-        if hi > lo:
-            for h in self.hunks:
-                # Pure insertion strictly between lo and hi alters the span.
-                if h.old_count == 0 and lo <= h.old_start < hi:
-                    return True, lo, hi
         mod_lo, new_lo = self.remap_old_line(lo)
         mod_hi, new_hi = self.remap_old_line(hi)
         if mod_lo or mod_hi:
+            return True, lo, hi
+        if hi > lo and (new_hi - new_lo) != (hi - lo):
             return True, lo, hi
         return False, new_lo, max(new_lo, new_hi)
 
@@ -261,14 +277,24 @@ class ParsedDiff:
     def total_deletions(self) -> int:
         return sum(f.deletions for f in self.files)
 
-    def get_file(self, path: str) -> DiffFile | None:
+    def get_file(self, path: str, *, exact: bool = False) -> DiffFile | None:
         if path in self.files_by_path:
             return self.files_by_path[path]
         cleaned = _clean_repo_path(path)
         if cleaned in self.files_by_path:
             return self.files_by_path[cleaned]
+        if exact:
+            return None
         norm = _normalize_path(path)
         return self.files_by_path.get(norm)
+
+    def get_file_by_old_path(self, old_path: str) -> DiffFile | None:
+        """Exact lookup for a renamed file by its pre-rename repository path."""
+        cleaned = _clean_repo_path(old_path)
+        for df in self.files:
+            if df.old_path != df.path and (df.old_path == old_path or df.old_path == cleaned):
+                return df
+        return None
 
     def has_line(self, path: str, line: int, side: str = "RIGHT") -> bool:
         df = self.get_file(path)
@@ -696,13 +722,32 @@ def select_budgeted_files(
     if not kept:
         if not noisy_candidates:
             return [], notes
-        # Lockfile/binary-only PR (among files that passed path_filters): return
-        # truncated raw snippet built strictly from those permitted files.
-        first = noisy_candidates[0]
-        permitted_raw = "".join(df.raw for df in noisy_candidates if df.raw) or first.raw
-        raw_cut = permitted_raw[:budget]
-        notes.append(f"diff contains only generated/binary files; truncated to {budget} chars")
-        return [(first, raw_cut)], notes
+        # Lockfile/binary-only PR (among files that passed path_filters): render each
+        # retained file in the requested format and keep each chunk paired with its own DiffFile.
+        fallback_selected: list[tuple[DiffFile, str]] = []
+        remaining_fb = budget
+        truncated_any = False
+        for df in noisy_candidates:
+            if remaining_fb <= 0:
+                truncated_any = True
+                break
+            text = df.render_numbered() if numbered else df.raw
+            if text and not text.endswith("\n"):
+                text += "\n"
+            if not text:
+                continue
+            if len(text) <= remaining_fb:
+                fallback_selected.append((df, text))
+                remaining_fb -= len(text)
+            else:
+                fallback_selected.append((df, text[:remaining_fb]))
+                remaining_fb = 0
+                truncated_any = True
+        if truncated_any:
+            notes.append(f"diff contains only generated/binary files; truncated to {budget} chars")
+        else:
+            notes.append("diff contains only generated/binary files")
+        return fallback_selected, notes
 
     # Fast path: everything fits within budget -> return in priority order
     # (highest risk first, preserving original order within the same risk score)

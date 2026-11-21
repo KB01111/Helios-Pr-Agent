@@ -202,7 +202,13 @@ def release_delivery(delivery: str) -> None:
         store.rdelete(key)
 
 
-async def route(event: str, payload: dict[str, Any], delivery: str = "") -> dict[str, Any]:
+async def route(
+    event: str,
+    payload: dict[str, Any],
+    delivery: str = "",
+    *,
+    auth_source: str = "",
+) -> dict[str, Any]:
     action = payload.get("action") if isinstance(payload.get("action"), str) else ""
     repo = _str(payload, "repository", "full_name")
     ctx = EventContext(
@@ -214,7 +220,7 @@ async def route(event: str, payload: dict[str, Any], delivery: str = "") -> dict
         sender_is_bot=_str(payload, "sender", "type") == "Bot",
     )
     base = {"event": event, "action": action}
-    if ctx.repo:
+    if ctx.repo and auth_source in ("app", "unsigned"):
         await asyncio.to_thread(note_installation, payload, ctx.repo)
     handlers = _HANDLERS.get(event)
     if not handlers:
@@ -281,6 +287,26 @@ async def _pull_request(ctx: EventContext) -> dict[str, Any]:
     await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=ctx.action != "closed")
     if ctx.action == "closed":
         await asyncio.to_thread(store.rdelete, dm.dirty_key(ctx.repo, number))
+        sibling_prs: list[int] = []
+        if sha:
+            sha_low = sha.strip().lower()
+            for sib_pr in await asyncio.to_thread(prs_for_head, ctx.repo, sha):
+                if sib_pr == number:
+                    continue
+                sib_inbox = await asyncio.to_thread(store.rget_json, f"prinbox:{ctx.repo.lower()}:{sib_pr}")
+                if isinstance(sib_inbox, dict):
+                    sib_state = str(sib_inbox.get("state") or "open").strip().lower()
+                    if sib_state in ("closed", "merged"):
+                        continue
+                    sib_sha = str(sib_inbox.get("head_sha") or "").strip().lower()
+                    if sib_sha and sib_sha != sha_low:
+                        continue
+                await asyncio.to_thread(mark_dirty, ctx.repo, sib_pr)
+                sibling_prs.append(sib_pr)
+        out_closed: dict[str, Any] = {"recorded": 1, "prs": [number]}
+        if sibling_prs:
+            out_closed["sibling_prs"] = sibling_prs
+        return out_closed
     return {"recorded": 1, "prs": [number]}
 
 
@@ -391,12 +417,29 @@ async def _actor_has_write_permission(repo: str, actor: str) -> bool:
         return False
 
 
-def _sync_thread_finding_state(repo: str, pr_number: int, comment_id: int, action: str, actor: str) -> dict[str, Any] | None:
+def _thread_event_version_key(repo: str, pr_number: int, comment_id: int) -> str:
+    return f"threadver:{repo.lower()}:{int(pr_number)}:{int(comment_id)}"
+
+
+def _thread_state_lock_key(repo: str, pr_number: int, comment_id: int) -> str:
+    return f"threadlock:{repo.lower()}:{int(pr_number)}:{int(comment_id)}"
+
+
+def _sync_thread_finding_state(
+    repo: str,
+    pr_number: int,
+    comment_id: int,
+    action: str,
+    actor: str,
+    *,
+    event_version: int | None = None,
+) -> dict[str, Any] | None:
     """Keep stored finding lifecycle in sync when a PR review thread is resolved/unresolved.
 
     Only transitions ``open -> resolved`` on resolve and ``resolved -> open`` on
     unresolve using an atomic expected-state check so ``outdated`` and
-    ``dismissed`` findings stay out of the active lifecycle.
+    ``dismissed`` findings stay out of the active lifecycle. Rejects stale
+    updates when ``event_version`` has been superseded by a newer thread event.
     """
     if comment_id <= 0 or action not in ("resolved", "unresolved"):
         return None
@@ -405,22 +448,40 @@ def _sync_thread_finding_state(repo: str, pr_number: int, comment_id: int, actio
             from review import find_finding_by_comment_id, set_finding_state
         except ImportError:  # pragma: no cover
             from backend.review import find_finding_by_comment_id, set_finding_state  # type: ignore[no-redef]
-        found = find_finding_by_comment_id(repo, pr_number, comment_id)
-        if not isinstance(found, dict):
-            return None
-        fp = str(found.get("fingerprint") or "").strip()
-        if not fp:
-            return None
-        if action == "resolved":
-            updated = set_finding_state(
-                repo, pr_number, fp, "resolved", by=actor or None, expected_states=("open",)
-            )
-            return {"fingerprint": fp, "state": "resolved"} if updated else None
-        if action == "unresolved":
-            updated = set_finding_state(
-                repo, pr_number, fp, "open", by=actor or None, expected_states=("resolved",)
-            )
-            return {"fingerprint": fp, "state": "open"} if updated else None
+        with store.key_lock(_thread_state_lock_key(repo, pr_number, comment_id)):
+            if event_version is not None:
+                latest_raw = store.rget(_thread_event_version_key(repo, pr_number, comment_id))
+                if latest_raw is not None:
+                    try:
+                        if int(latest_raw) > int(event_version):
+                            log.debug(
+                                "events: ignoring stale thread %s (v%d < v%s) for %s#%d comment %d",
+                                action,
+                                event_version,
+                                latest_raw,
+                                repo,
+                                pr_number,
+                                comment_id,
+                            )
+                            return None
+                    except (TypeError, ValueError):
+                        pass
+            found = find_finding_by_comment_id(repo, pr_number, comment_id)
+            if not isinstance(found, dict):
+                return None
+            fp = str(found.get("fingerprint") or "").strip()
+            if not fp:
+                return None
+            if action == "resolved":
+                updated = set_finding_state(
+                    repo, pr_number, fp, "resolved", by=actor or None, expected_states=("open",)
+                )
+                return {"fingerprint": fp, "state": "resolved"} if updated else None
+            if action == "unresolved":
+                updated = set_finding_state(
+                    repo, pr_number, fp, "open", by=actor or None, expected_states=("resolved",)
+                )
+                return {"fingerprint": fp, "state": "open"} if updated else None
     except Exception as exc:
         log.warning("events: thread finding sync failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
     return None
@@ -445,6 +506,18 @@ async def _pull_request_review_thread(ctx: EventContext) -> dict[str, Any]:
         "first_comment_id": first_comment_id,
         "by": actor,
     }
+    # Record a monotonic event version BEFORE any async GitHub permission lookup
+    # so an older `resolved` event cannot override a later `unresolved` event.
+    event_version: int | None = None
+    if first_comment_id > 0 and (
+        ctx.action == "unresolved" or (ctx.action == "resolved" and not ctx.sender_is_bot)
+    ):
+        event_version = await asyncio.to_thread(
+            store.rincr,
+            _thread_event_version_key(ctx.repo, number, first_comment_id),
+            1,
+            ex=dm.FINDING_TTL_S,
+        )
     # Record activity first without marking dirty yet so a concurrent dirty sweep
     # cannot read pre-update finding state and clear the only dirty marker.
     await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=False)
@@ -452,11 +525,23 @@ async def _pull_request_review_thread(ctx: EventContext) -> dict[str, Any]:
     if ctx.action == "resolved":
         if not ctx.sender_is_bot and await _actor_has_write_permission(ctx.repo, actor):
             finding_updated = await asyncio.to_thread(
-                _sync_thread_finding_state, ctx.repo, number, first_comment_id, ctx.action, actor
+                _sync_thread_finding_state,
+                ctx.repo,
+                number,
+                first_comment_id,
+                ctx.action,
+                actor,
+                event_version=event_version,
             )
     elif ctx.action == "unresolved":
         finding_updated = await asyncio.to_thread(
-            _sync_thread_finding_state, ctx.repo, number, first_comment_id, ctx.action, actor
+            _sync_thread_finding_state,
+            ctx.repo,
+            number,
+            first_comment_id,
+            ctx.action,
+            actor,
+            event_version=event_version,
         )
     # Mark dirty AFTER the finding update completes so subsequent recomputes observe it.
     await asyncio.to_thread(mark_dirty, ctx.repo, number)

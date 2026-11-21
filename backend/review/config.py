@@ -397,6 +397,10 @@ def parse_yaml_subset(text: str) -> dict[str, Any]:
         stripped = line[indent:]
         if stripped == "-" or stripped.startswith("- "):
             return _parse_list(idx, indent)
+        if stripped.startswith("{") and stripped.endswith("}"):
+            val = _parse_scalar(stripped)
+            if isinstance(val, dict):
+                return val, idx + 1
         return _parse_mapping(idx, indent)
 
     def _parse_list(idx: int, list_indent: int) -> tuple[list[Any], int]:
@@ -501,7 +505,10 @@ def parse_yaml_subset(text: str) -> dict[str, Any]:
                 idx += 1
         return out, idx
 
-    root, _ = _parse_node(0, 0)
+    root, next_idx = _parse_node(0, 0)
+    trailing = _next_significant(next_idx)
+    if trailing < n:
+        raise ValueError(f"unexpected trailing YAML content at line {trailing + 1}")
     if root is None:
         return {}
     if not isinstance(root, dict):
@@ -531,17 +538,30 @@ def _load_with_pyyaml(text: str) -> Any:
         )
 
     def _construct_unique_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
-        mapping: dict[Any, Any] = {}
-        for key_node, value_node in node.value:
+        if not isinstance(node, yaml.MappingNode):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"expected a mapping node, but found {node.id}",
+                node.start_mark,
+            )
+        seen_explicit: set[Any] = set()
+        for key_node, _ in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
             key = loader.construct_object(key_node, deep=deep)
             try:
-                dup = key in mapping
+                dup = key in seen_explicit
             except TypeError:
                 dup = False
             if dup:
                 raise ValueError(f"duplicate YAML key: {key!r}")
-            mapping[key] = loader.construct_object(value_node, deep=deep)
-        return mapping
+            try:
+                seen_explicit.add(key)
+            except TypeError:
+                pass
+        loader.flatten_mapping(node)
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
 
     _StrictConfigLoader.add_constructor(
         yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping

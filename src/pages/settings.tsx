@@ -165,8 +165,10 @@ export function SettingsPage({ active }: { active: boolean }) {
                     size="xs"
                     onClick={async () => {
                       try {
-                        const n = await syncAllSecretsToVault();
-                        toastOk("Vault synced", `Saved ${n} active secret(s) to Windows DPAPI vault.`);
+                        const res = await syncAllSecretsToVault();
+                        if (!res.canceled) {
+                          toastOk("Vault synced", `Saved ${res.saved} active secret(s) to Windows DPAPI vault.`);
+                        }
                       } catch (e) {
                         toastErr("Vault sync failed", errText(e, 220));
                       }
