@@ -466,14 +466,17 @@ fn create_blocking(
         }
         Ok(env_path)
     })();
-    let cloud = match settings_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-        Some(url) => Some(push_to_cloud(
-            url,
-            api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()),
-            &cloud_settings_body(id, &slug, pem, webhook_secret.as_deref()),
-        )),
-        None => None,
-    };
+    let cloud = settings_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(|url| {
+            push_to_cloud(
+                url,
+                api_token.as_deref().map(str::trim).filter(|t| !t.is_empty()),
+                &cloud_settings_body(id, &slug, pem, webhook_secret.as_deref()),
+            )
+        });
     if local.is_err() && !matches!(cloud, Some(Ok(()))) {
         return Err(format!(
             "the App was created on GitHub (id {}) but its credentials could not be saved (local: {}; cloud: {}). \

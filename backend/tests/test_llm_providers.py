@@ -11,7 +11,7 @@ from sandboxes import providers_review as pr
 KEY_ENVS = (
     "LLM_PROVIDER", "LLM_MODEL", "OPENROUTER_API_KEY", "COMMANDCODE_API_KEY",
     "CMD_API_KEY", "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "GITHUB_TOKEN",
-    "BACKEND_API_TOKEN",
+    "BACKEND_API_TOKEN", "REVIEW_ENGINE_MODE",
 )
 FAKE_KEY = "test-key-1234567890"
 DIFF = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -0,0 +1 @@\n+print(1)\n"
@@ -35,6 +35,7 @@ class _Resp:
 
 def _install_fake_httpx(monkeypatch, calls, *, llm_status=200):
     """Replace httpx.AsyncClient with a recorder. Every request is appended to `calls`."""
+    structured_reply = '{"summary":"LGTM","effort":1,"file_table":[{"file":"src/app.py","change_summary":"Prints 1"}],"sequence_diagram":null,"findings":[]}'
 
     class _FakeClient:
         def __init__(self, *args, **kwargs):
@@ -46,18 +47,29 @@ def _install_fake_httpx(monkeypatch, calls, *, llm_status=200):
         async def __aexit__(self, *exc):
             return False
 
+        async def aclose(self):
+            return None
+
         async def get(self, url, headers=None, params=None):
             calls.append({"method": "GET", "url": url, "headers": headers or {}})
+            if "/contents/" in url:
+                return _Resp(404, data={"message": "Not Found"})
             if url.endswith("/comments"):
                 return _Resp(200, data=[])
             if url.endswith("/models"):
                 return _Resp(llm_status)
-            return _Resp(200, text=DIFF, data={"head": {"sha": "abc"}})
+            if url.endswith("/check-runs"):
+                return _Resp(200, data={"check_runs": []})
+            if url.endswith("/status"):
+                return _Resp(200, data={"statuses": []})
+            if url.endswith("/reviews"):
+                return _Resp(200, data=[])
+            return _Resp(200, text=DIFF, data={"head": {"sha": "abc"}, "base": {"ref": "main", "sha": "base0"}})
 
         async def post(self, url, headers=None, json=None):
             calls.append({"method": "POST", "url": url, "headers": headers or {}, "json": json})
             if url.endswith("/chat/completions"):
-                return _Resp(llm_status, data={"choices": [{"message": {"content": "LGTM"}}]})
+                return _Resp(llm_status, data={"choices": [{"message": {"content": structured_reply}}]})
             return _Resp(201, data={})
 
     import httpx
@@ -275,19 +287,52 @@ def test_review_normalizes_openrouter_model_uses_default_prompt_and_formats_head
     ctx = {"repo": "owner/repo", "pr_number": 7, "sha": "abc", "action": "opened", "title": "T"}
     result = asyncio.run(pr.ReviewOnlyProvider().run(agent, ctx))
     assert result["status"] == "completed"  # nosec B101
+    llm_posts = [c for c in calls if c["method"] == "POST" and c["url"].endswith("/chat/completions")]
+    assert len(llm_posts) == 2  # Pass A walkthrough + Pass B findings  # nosec B101
+    for post in llm_posts:
+        assert post["json"]["model"] == "thinkingmachines/inkling-2-small:free"  # nosec B101
+    pass_b_sys = llm_posts[1]["json"]["messages"][0]["content"]
+    assert pr.DEFAULT_SYSTEM_PROMPT in pass_b_sys  # nosec B101
+    assert "assertive" in pass_b_sys  # nosec B101
+    assert "Always validate inputs." in pass_b_sys  # nosec B101
+    assert "Ignore me." not in pass_b_sys  # nosec B101
+    review_comment_post = next(
+        c for c in calls
+        if c["method"] == "POST" and c["url"].endswith("/comments") and pr.review_marker("agent-a") in c["json"]["body"]
+    )
+    assert "## 🤖 Agent A — Code Review" in review_comment_post["json"]["body"]  # nosec B101
+
+
+def test_review_legacy_single_pass_compatibility(monkeypatch):
+    calls = []
+    _install_fake_httpx(monkeypatch, calls)
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("LLM_MODEL", "openrouter/thinkingmachines/inkling-2-small:free")
+    agent = {
+        "id": "agent-a",
+        "name": "Agent A",
+        "system_prompt": "",
+        "profile": "assertive",
+        "legacy_single_pass": True,
+        "path_instructions": [
+            {"path": "src/**/*.py", "instructions": "Always validate inputs."},
+            {"path": "docs/**", "instructions": "Ignore me."},
+        ],
+    }
+    ctx = {"repo": "owner/repo", "pr_number": 7, "sha": "abc", "action": "opened", "title": "T"}
+    result = asyncio.run(pr.ReviewOnlyProvider().run(agent, ctx))
+    assert result["status"] == "completed"  # nosec B101
     post = _llm_post(calls)
-    assert post["json"]["model"] == "thinkingmachines/inkling-2-small:free"  # nosec B101
     assert post["json"]["messages"][0]["content"] == pr.DEFAULT_SYSTEM_PROMPT  # nosec B101
     user_msg = post["json"]["messages"][1]["content"]
-    assert "assertive" in user_msg  # nosec B101
-    assert "Always validate inputs." in user_msg  # nosec B101
-    assert "Ignore me." not in user_msg  # nosec B101
+    assert "assertive" in user_msg and "Always validate inputs." in user_msg and "Ignore me." not in user_msg  # nosec B101
     comment_post = next(c for c in calls if c["method"] == "POST" and c["url"].endswith("/comments"))
     assert "\n## 🤖 Agent A (review_only, 0 CPU-sec)\n" in comment_post["json"]["body"]  # nosec B101
 
 
 def test_review_openrouter_retries_with_free_router_on_429(monkeypatch):
     calls = []
+    structured_reply = '{"summary":"Looks good","effort":1,"file_table":[],"sequence_diagram":null,"findings":[]}'
 
     class _FallbackClient:
         def __init__(self, *args, **kwargs):
@@ -299,18 +344,23 @@ def test_review_openrouter_retries_with_free_router_on_429(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
+        async def aclose(self):
+            return None
+
         async def get(self, url, headers=None, params=None):
             calls.append(("GET", url, headers or {}))
+            if "/contents/" in url:
+                return _Resp(404, data={})
             if url.endswith("/comments"):
                 return _Resp(200, data=[])
-            return _Resp(200, text=DIFF, data={"head": {"sha": "abc"}})
+            return _Resp(200, text=DIFF, data={"head": {"sha": "abc"}, "base": {"ref": "main"}})
 
         async def post(self, url, headers=None, json=None):
             calls.append(("POST", url, json))
             if url.endswith("/chat/completions"):
                 if json["model"] != pr.OPENROUTER_FALLBACK_MODEL:
                     return _Resp(429, text='{"error":{"message":"rate limited"}}', data={"error": {"message": "rate limited"}})
-                return _Resp(200, data={"choices": [{"message": {"content": "Looks good"}}]})
+                return _Resp(200, data={"choices": [{"message": {"content": structured_reply}}]})
             return _Resp(201, data={})
 
     import httpx
@@ -321,7 +371,12 @@ def test_review_openrouter_retries_with_free_router_on_429(monkeypatch):
     result = _review()
     assert result["status"] == "completed"  # nosec B101
     llm_posts = [c[2]["model"] for c in calls if c[0] == "POST" and c[1].endswith("/chat/completions")]
-    assert llm_posts == ["thinkingmachines/inkling-2-small:free", "openrouter/free"]  # nosec B101
+    assert llm_posts == [
+        "thinkingmachines/inkling-2-small:free",
+        "openrouter/free",
+        "thinkingmachines/inkling-2-small:free",
+        "openrouter/free",
+    ]  # nosec B101
 
 
 def test_review_falls_back_to_pr_files_on_406_large_diff(monkeypatch):
@@ -350,7 +405,18 @@ def test_review_falls_back_to_pr_files_on_406_large_diff(monkeypatch):
         async def post(self, url, headers=None, json=None):
             calls.append(("POST", url, json))
             if url.endswith("/chat/completions"):
-                return _Resp(200, data={"choices": [{"message": {"content": "Reviewed files"}}]})
+                return _Resp(
+                    200,
+                    data={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"summary":"Reviewed files","effort":1,"file_table":[],"sequence_diagram":null,"findings":[]}'
+                                }
+                            }
+                        ]
+                    },
+                )
             return _Resp(201, data={})
 
     import httpx

@@ -19,6 +19,7 @@ every worker can resolve them without an extra API call.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -44,6 +45,7 @@ _TOKEN_SKEW_S = 300
 
 _token_cache: dict[int, tuple[str, float]] = {}
 _token_lock = threading.Lock()
+_discovered_slug: str = ""
 
 
 class GitHubAppError(RuntimeError):
@@ -60,7 +62,20 @@ def app_id() -> str:
 
 
 def app_slug() -> str:
-    return (os.getenv("GITHUB_APP_SLUG") or "").strip()
+    env_slug = (os.getenv("GITHUB_APP_SLUG") or "").strip()
+    if env_slug:
+        return env_slug
+    with _token_lock:
+        return _discovered_slug
+
+
+def remember_app_slug(slug: Any) -> None:
+    """Cache the live App slug discovered from ``GET /app`` when ``GITHUB_APP_SLUG`` is unset."""
+    global _discovered_slug
+    clean = str(slug or "").strip()
+    if clean:
+        with _token_lock:
+            _discovered_slug = clean
 
 
 def _private_key() -> str:
@@ -155,7 +170,7 @@ def cached_installation(repo: str) -> int | None:
 
 async def installation_id_for(repo: str, client: httpx.AsyncClient | None = None) -> int | None:
     """Installation id for ``owner/name``: cache first, then ``GET /repos/{repo}/installation``."""
-    cached = cached_installation(repo)
+    cached = await asyncio.to_thread(cached_installation, repo)
     if cached:
         return cached
     own = client is None
@@ -167,10 +182,10 @@ async def installation_id_for(repo: str, client: httpx.AsyncClient | None = None
         if resp.status_code != 200:
             raise GitHubAppError(f"installation lookup HTTP {resp.status_code}")
         inst = resp.json().get("id")
-        remember_installation(repo, inst)
+        await asyncio.to_thread(remember_installation, repo, inst)
         return int(inst) if inst else None
     finally:
-        if own:
+        if own and hasattr(client, "aclose"):
             await client.aclose()
 
 
@@ -236,8 +251,10 @@ async def token_for_repo(repo: str) -> tuple[str, str]:
 
 
 def clear_token_cache() -> None:
+    global _discovered_slug
     with _token_lock:
         _token_cache.clear()
+        _discovered_slug = ""
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +317,10 @@ def _permission_gaps(granted: dict[str, Any]) -> list[str]:
 
 
 def _check_app_info(data: dict[str, Any], out: dict[str, Any], problems: list[str]) -> None:
-    out.update(slug=data.get("slug"), name=data.get("name"), html_url=data.get("html_url"))
+    slug = data.get("slug")
+    if isinstance(slug, str) and slug.strip():
+        remember_app_slug(slug)
+    out.update(slug=slug, name=data.get("name"), html_url=data.get("html_url"))
     problems.extend(_permission_gaps(data.get("permissions") or {}))
     events = set(data.get("events") or [])
     missing = [e for e in REQUIRED_EVENTS if e not in events]

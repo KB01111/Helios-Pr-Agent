@@ -2,7 +2,10 @@ import * as React from "react";
 import {
   Activity,
   Bot,
+  Brain,
+  CloudCog,
   Gauge,
+  Inbox,
   KeyRound,
   Moon,
   Plug,
@@ -38,14 +41,20 @@ import {
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { checkBackend, fetchQuota, loadConfig, refreshAgents, syncRuns } from "@/lib/actions";
+import { fetchAppHealth } from "@/lib/cloud";
+import { listPrInbox } from "@/lib/cloud-agent";
 import { useGh, loadRepos } from "@/lib/github";
 import { refreshOAuthStatus } from "@/lib/oauth";
-import { forgetSecrets } from "@/lib/session";
+import { forgetSecrets, hydrateFromVault, useVaultHydrated } from "@/lib/session";
 import { useApp, type TabId } from "@/lib/store";
+import { tauriInvoke } from "@/lib/tauri";
 import { AgentsPage } from "@/pages/agents";
 import { AutoReviewPage } from "@/pages/auto-review";
 import { AutonomyPage } from "@/pages/autonomy";
+import { CloudSetupPage } from "@/pages/cloud-setup";
 import { IntegrationsPage } from "@/pages/integrations";
+import { MemoryPage } from "@/pages/memory";
+import { PrInboxPage } from "@/pages/pr-inbox";
 import { ProvidersPage } from "@/pages/providers";
 import { QuotaPage } from "@/pages/quota";
 import { ReviewPage } from "@/pages/review";
@@ -63,12 +72,36 @@ interface TabDef {
 
 const TABS: TabDef[] = [
   {
+    id: "setup",
+    label: "Cloud setup",
+    title: "Cloud PR Agent setup",
+    icon: CloudCog,
+    group: "Workspace",
+    sub: "5-step guided setup for your always-on Cloud PR Agent, GitHub App, repo memory, and merge gate.",
+  },
+  {
+    id: "inbox",
+    label: "PR inbox",
+    title: "PR inbox & merge readiness",
+    icon: Inbox,
+    group: "Workspace",
+    sub: "Live mergeability scores, before-you-merge checklists, and inline findings across your open pull requests.",
+  },
+  {
+    id: "memory",
+    label: "Memory",
+    title: "Repository memory",
+    icon: Brain,
+    group: "Workspace",
+    sub: "Repo-specific learnings, architecture facts, and dismissed false-positive patterns.",
+  },
+  {
     id: "autoreview",
     label: "Auto review",
-    title: "Auto review",
+    title: "Auto review (Actions Lite)",
     icon: Rocket,
     group: "Workspace",
-    sub: "Deploy PR Agent to your GitHub repositories and review every pull request automatically.",
+    sub: "Zero-host GitHub Actions mode: deploy PR Agent workflows and .pr-agent/memory.md directly to repositories.",
   },
   {
     id: "review",
@@ -78,7 +111,7 @@ const TABS: TabDef[] = [
     group: "Workspace",
     sub: (
       <>
-        Model and provider are set in the Review tab · secrets live in memory/session only
+        Model and provider are set in the Review tab · secrets live in memory/session or optional DPAPI vault
       </>
     ),
   },
@@ -88,7 +121,7 @@ const TABS: TabDef[] = [
     title: "Agents & repo sync",
     icon: Bot,
     group: "Workspace",
-    sub: "Backend agents decide which repos, triggers and runtimes handle each pull request.",
+    sub: "Configure Agent v2 profiles, merge gates, path instructions, and .pragent.yaml.",
   },
   {
     id: "runs",
@@ -136,7 +169,7 @@ const TABS: TabDef[] = [
     title: "Settings",
     icon: SettingsIcon,
     group: "System",
-    sub: "Backend connection, GitHub sign-in and session keys.",
+    sub: "Backend connection, GitHub sign-in, session keys, and Windows DPAPI vault.",
   },
 ];
 
@@ -147,6 +180,7 @@ function AppSidebar() {
   const setTab = useApp((s) => s.setTab);
   const backend = useApp((s) => s.backend);
   const escCount = useApp((s) => s.escCount);
+  const blockedPrCount = useApp((s) => s.blockedPrCount);
   const theme = useApp((s) => s.theme);
   const setTheme = useApp((s) => s.setTheme);
 
@@ -159,7 +193,7 @@ function AppSidebar() {
           </div>
           <div className="grid leading-tight group-data-[collapsible=icon]:hidden">
             <span className="text-sm font-semibold">PR Agent</span>
-            <span className="text-muted-foreground text-[11px]">Control · v0.1</span>
+            <span className="text-muted-foreground text-[11px]">Cloud Control · v0.3</span>
           </div>
         </div>
       </SidebarHeader>
@@ -179,6 +213,9 @@ function AppSidebar() {
                       <t.icon />
                       <span>{t.label}</span>
                     </SidebarMenuButton>
+                    {t.id === "inbox" && blockedPrCount > 0 ? (
+                      <SidebarMenuBadge aria-label="blocked pull requests">{blockedPrCount}</SidebarMenuBadge>
+                    ) : null}
                     {t.id === "autonomy" && escCount > 0 ? (
                       <SidebarMenuBadge aria-label="escalations waiting">{escCount}</SidebarMenuBadge>
                     ) : null}
@@ -231,14 +268,23 @@ function Topbar() {
   const githubConnected = useApp((s) => !!s.secrets.github);
   const openrouterConnected = useApp((s) => !!s.secrets.openrouter);
   const ghLogin = useGh((s) => s.login);
-  const def = TABS.find((t) => t.id === tab) as TabDef;
+  const def = TABS.find((t) => t.id === tab) ?? TABS[0];
   const [busy, setBusy] = React.useState(false);
 
   const reloadAll = async () => {
     setBusy(true);
     try {
       await checkBackend(false);
-      await Promise.all([loadConfig(), refreshAgents(), syncRuns(), fetchQuota(), refreshOAuthStatus()]);
+      await Promise.all([
+        loadConfig(),
+        refreshAgents(),
+        syncRuns(),
+        fetchQuota(),
+        refreshOAuthStatus(),
+        listPrInbox({ state: "open" })
+          .then((r) => useApp.getState().setBlockedPrCount(r.items.filter((p) => p.band === "blocked").length))
+          .catch(() => {}),
+      ]);
     } finally {
       setBusy(false);
     }
@@ -260,7 +306,7 @@ function Topbar() {
       <div className="hidden items-center gap-1.5 md:flex">
         <button
           type="button"
-          onClick={() => setTab("integrations")}
+          onClick={() => setTab("setup")}
           className="focus-visible:ring-ring inline-flex cursor-pointer rounded-full focus-visible:ring-2 focus-visible:outline-none"
         >
           <Badge variant={githubConnected ? "success" : "outline"} className="hover:opacity-90">
@@ -280,7 +326,7 @@ function Topbar() {
         ) : null}
         <button
           type="button"
-          onClick={() => setTab("settings")}
+          onClick={() => setTab(backend.ok === true ? "settings" : "setup")}
           className="focus-visible:ring-ring inline-flex cursor-pointer rounded-full focus-visible:ring-2 focus-visible:outline-none"
         >
           <Badge
@@ -303,6 +349,7 @@ export function App() {
   const tab = useApp((s) => s.tab);
   const theme = useApp((s) => s.theme);
   const githubToken = useApp((s) => s.secrets.github);
+  const vaultHydrated = useVaultHydrated();
 
   // Theme: the `dark` class drives shadcn's CSS variables.
   React.useEffect(() => {
@@ -311,15 +358,51 @@ export function App() {
     root.style.colorScheme = theme;
   }, [theme]);
 
-  // Boot: pull everything the pages show.
+  // Boot: hydrate Windows DPAPI vault first so BACKEND_API_TOKEN is present before backend requests fire.
   React.useEffect(() => {
-    void checkBackend(false);
-    void loadConfig();
-    void refreshAgents();
-    void syncRuns();
-    void fetchQuota();
-    void refreshOAuthStatus();
-    if (useApp.getState().secrets.github) void loadRepos();
+    let cancelled = false;
+    void (async () => {
+      await hydrateFromVault();
+      if (cancelled) return;
+      const backendOk = await checkBackend(false);
+      void loadConfig();
+      void refreshAgents();
+      void syncRuns();
+      void fetchQuota();
+      void refreshOAuthStatus();
+      const ghTok = useApp.getState().secrets.github;
+      if (ghTok) {
+        void loadRepos();
+        if (!useGh.getState().login) {
+          void tauriInvoke<string>("github_login", { token: ghTok })
+            .then((login) => {
+              if (!cancelled && login && useApp.getState().secrets.github === ghTok) {
+                useGh.setState({ login });
+              }
+            })
+            .catch(() => {});
+        }
+      }
+
+      if (backendOk) {
+        const [health] = await Promise.all([
+          fetchAppHealth(),
+          listPrInbox({ state: "open" })
+            .then((r) => {
+              if (!cancelled) {
+                useApp.getState().setBlockedPrCount(r.items.filter((p) => p.band === "blocked").length);
+              }
+            })
+            .catch(() => {}),
+        ]);
+        if (!cancelled && health?.configured && health.ok) {
+          useApp.getState().setDefaultTab("inbox");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Keep the GitHub login badge honest if the token disappears.
@@ -334,15 +417,26 @@ export function App() {
         <SidebarInset className="h-svh min-w-0 overflow-hidden">
           <Topbar />
           <main className="flex-1 overflow-y-auto p-4 sm:p-6">
-            <AutoReviewPage active={tab === "autoreview"} />
-            <ReviewPage active={tab === "review"} />
-            <AgentsPage active={tab === "agents"} />
-            <RunsPage active={tab === "runs"} />
-            <AutonomyPage active={tab === "autonomy"} />
-            <QuotaPage active={tab === "quota"} />
-            <ProvidersPage active={tab === "providers"} />
-            <IntegrationsPage active={tab === "integrations"} />
-            <SettingsPage active={tab === "settings"} />
+            {vaultHydrated ? (
+              <>
+                <CloudSetupPage active={tab === "setup"} />
+                <PrInboxPage active={tab === "inbox"} />
+                <MemoryPage active={tab === "memory"} />
+                <AutoReviewPage active={tab === "autoreview"} />
+                <ReviewPage active={tab === "review"} />
+                <AgentsPage active={tab === "agents"} />
+                <RunsPage active={tab === "runs"} />
+                <AutonomyPage active={tab === "autonomy"} />
+                <QuotaPage active={tab === "quota"} />
+                <ProvidersPage active={tab === "providers"} />
+                <IntegrationsPage active={tab === "integrations"} />
+                <SettingsPage active={tab === "settings"} />
+              </>
+            ) : (
+              <div className="text-muted-foreground flex h-40 items-center justify-center text-xs">
+                Loading local session…
+              </div>
+            )}
           </main>
         </SidebarInset>
       </SidebarProvider>

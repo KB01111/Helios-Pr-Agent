@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -35,6 +38,8 @@ except ImportError:  # pragma: no cover - `uvicorn backend.main:app` from repo r
 log = logging.getLogger("pr-agent.events")
 
 CONFIG_FILES = (".pragent.yaml", ".pragent.yml")
+OWN_CHECK_RUN_NAME = "PR Agent · Merge readiness"
+OWN_STATUS_CONTEXT = "pr-agent/merge-readiness"
 # Bot senders are ignored for conversational events (no reply loops), but not
 # for CI results: check suites and statuses are usually posted by bots.
 _BOT_SENSITIVE = {"issue_comment", "pull_request_review_comment", "pull_request_review"}
@@ -98,13 +103,23 @@ def _int(obj: Any, *path: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def mark_dirty(repo: str, pr_number: int) -> str | None:
+    """Stamp `prdirty:{repo}:{pr}` with a unique token so compare-and-delete
+    after recomputation never clears a newer invalidation."""
+    if not dm.valid_repo(repo) or pr_number <= 0:
+        return None
+    token = f"{_now()}:{uuid.uuid4().hex[:8]}"
+    store.rset(dm.dirty_key(repo, pr_number), token, ex=dm.DIRTY_TTL_S)
+    return token
+
+
 def record_pr_activity(repo: str, pr_number: int, entry: dict[str, Any], *, dirty: bool = True) -> None:
     if not dm.valid_repo(repo) or pr_number <= 0:
         return
     entry = {"at": _now(), **entry}
     store.rlpush_json_capped(dm.activity_key(repo, pr_number), entry, dm.ACTIVITY_CAP, ex=dm.ACTIVITY_TTL_S)
     if dirty:
-        store.rset(dm.dirty_key(repo, pr_number), entry["at"], ex=dm.DIRTY_TTL_S)
+        mark_dirty(repo, pr_number)
 
 
 def pr_activity(repo: str, pr_number: int, limit: int = 50) -> list[dict[str, Any]]:
@@ -187,7 +202,13 @@ def release_delivery(delivery: str) -> None:
         store.rdelete(key)
 
 
-async def route(event: str, payload: dict[str, Any], delivery: str = "") -> dict[str, Any]:
+async def route(
+    event: str,
+    payload: dict[str, Any],
+    delivery: str = "",
+    *,
+    auth_source: str = "",
+) -> dict[str, Any]:
     action = payload.get("action") if isinstance(payload.get("action"), str) else ""
     repo = _str(payload, "repository", "full_name")
     ctx = EventContext(
@@ -199,7 +220,7 @@ async def route(event: str, payload: dict[str, Any], delivery: str = "") -> dict
         sender_is_bot=_str(payload, "sender", "type") == "Bot",
     )
     base = {"event": event, "action": action}
-    if ctx.repo:
+    if ctx.repo and auth_source in ("app", "unsigned"):
         await asyncio.to_thread(note_installation, payload, ctx.repo)
     handlers = _HANDLERS.get(event)
     if not handlers:
@@ -266,6 +287,26 @@ async def _pull_request(ctx: EventContext) -> dict[str, Any]:
     await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=ctx.action != "closed")
     if ctx.action == "closed":
         await asyncio.to_thread(store.rdelete, dm.dirty_key(ctx.repo, number))
+        sibling_prs: list[int] = []
+        if sha:
+            sha_low = sha.strip().lower()
+            for sib_pr in await asyncio.to_thread(prs_for_head, ctx.repo, sha):
+                if sib_pr == number:
+                    continue
+                sib_inbox = await asyncio.to_thread(store.rget_json, f"prinbox:{ctx.repo.lower()}:{sib_pr}")
+                if isinstance(sib_inbox, dict):
+                    sib_state = str(sib_inbox.get("state") or "open").strip().lower()
+                    if sib_state in ("closed", "merged"):
+                        continue
+                    sib_sha = str(sib_inbox.get("head_sha") or "").strip().lower()
+                    if sib_sha and sib_sha != sha_low:
+                        continue
+                await asyncio.to_thread(mark_dirty, ctx.repo, sib_pr)
+                sibling_prs.append(sib_pr)
+        out_closed: dict[str, Any] = {"recorded": 1, "prs": [number]}
+        if sibling_prs:
+            out_closed["sibling_prs"] = sibling_prs
+        return out_closed
     return {"recorded": 1, "prs": [number]}
 
 
@@ -327,10 +368,123 @@ async def _pull_request_review_comment(ctx: EventContext) -> dict[str, Any]:
         "in_reply_to": _int(comment, "in_reply_to_id") or None,
         "path": _str(comment, "path"),
         "author": _str(comment, "user", "login"),
+        "association": _str(comment, "author_association"),
         "mentions_agent": mentions_agent(_str(comment, "body")),
     }
     await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=False)
     return {"recorded": 1, "prs": [number], "mentions_agent": entry["mentions_agent"]}
+
+
+_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+_GITHUB_API = "https://api.github.com"
+
+
+async def _actor_has_write_permission(repo: str, actor: str) -> bool:
+    """Verify ``actor`` holds write/maintain/admin permission on ``repo`` via GitHub API.
+
+    Fails closed when no GitHub token is configured, the actor is empty/bot,
+    or the permission lookup fails.
+    """
+    clean_actor = str(actor or "").strip()
+    if not clean_actor or clean_actor.lower().endswith("[bot]") or not dm.valid_repo(repo):
+        return False
+    try:
+        token, _ = await github_app.token_for_repo(repo)
+    except Exception:
+        return False
+    if not token:
+        return False
+    try:
+        import httpx
+
+        url = f"{_GITHUB_API}/repos/{repo}/collaborators/{urllib.parse.quote(clean_actor, safe='')}/permission"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+        perm = str(data.get("permission") or "").strip().lower() if isinstance(data, dict) else ""
+        return perm in _WRITE_PERMISSIONS
+    except Exception as exc:
+        log.warning("events: collaborator permission check failed for %s on %s (%s)", clean_actor, repo, type(exc).__name__)
+        return False
+
+
+def _thread_event_version_key(repo: str, pr_number: int, comment_id: int) -> str:
+    return f"threadver:{repo.lower()}:{int(pr_number)}:{int(comment_id)}"
+
+
+def _thread_state_lock_key(repo: str, pr_number: int, comment_id: int) -> str:
+    return f"threadlock:{repo.lower()}:{int(pr_number)}:{int(comment_id)}"
+
+
+def _sync_thread_finding_state(
+    repo: str,
+    pr_number: int,
+    comment_id: int,
+    action: str,
+    actor: str,
+    *,
+    event_version: int | None = None,
+) -> dict[str, Any] | None:
+    """Keep stored finding lifecycle in sync when a PR review thread is resolved/unresolved.
+
+    Only transitions ``open -> resolved`` on resolve and ``resolved -> open`` on
+    unresolve using an atomic expected-state check so ``outdated`` and
+    ``dismissed`` findings stay out of the active lifecycle. Rejects stale
+    updates when ``event_version`` has been superseded by a newer thread event.
+    """
+    if comment_id <= 0 or action not in ("resolved", "unresolved"):
+        return None
+    try:
+        try:
+            from review import find_finding_by_comment_id, set_finding_state
+        except ImportError:  # pragma: no cover
+            from backend.review import find_finding_by_comment_id, set_finding_state  # type: ignore[no-redef]
+        with store.key_lock(_thread_state_lock_key(repo, pr_number, comment_id)):
+            if event_version is not None:
+                latest_raw = store.rget(_thread_event_version_key(repo, pr_number, comment_id))
+                if latest_raw is not None:
+                    try:
+                        if int(latest_raw) > int(event_version):
+                            log.debug(
+                                "events: ignoring stale thread %s (v%d < v%s) for %s#%d comment %d",
+                                action,
+                                event_version,
+                                latest_raw,
+                                repo,
+                                pr_number,
+                                comment_id,
+                            )
+                            return None
+                    except (TypeError, ValueError):
+                        pass
+            found = find_finding_by_comment_id(repo, pr_number, comment_id)
+            if not isinstance(found, dict):
+                return None
+            fp = str(found.get("fingerprint") or "").strip()
+            if not fp:
+                return None
+            if action == "resolved":
+                updated = set_finding_state(
+                    repo, pr_number, fp, "resolved", by=actor or None, expected_states=("open",)
+                )
+                return {"fingerprint": fp, "state": "resolved"} if updated else None
+            if action == "unresolved":
+                updated = set_finding_state(
+                    repo, pr_number, fp, "open", by=actor or None, expected_states=("resolved",)
+                )
+                return {"fingerprint": fp, "state": "open"} if updated else None
+    except Exception as exc:
+        log.warning("events: thread finding sync failed for %s#%d (%s)", repo, pr_number, type(exc).__name__)
+    return None
 
 
 @on("pull_request_review_thread")
@@ -342,16 +496,59 @@ async def _pull_request_review_thread(ctx: EventContext) -> dict[str, Any]:
         return {"recorded": 0}
     comments = thread.get("comments") if isinstance(thread.get("comments"), list) else []
     first = comments[0] if comments and isinstance(comments[0], dict) else {}
+    first_comment_id = _int(first, "id")
+    actor = _str(ctx.payload, "sender", "login")
     entry = {
         "kind": "thread",
         "action": ctx.action,  # resolved | unresolved
         "thread_node_id": _str(thread, "node_id"),
         "path": _str(first, "path"),
-        "first_comment_id": _int(first, "id"),
-        "by": _str(ctx.payload, "sender", "login"),
+        "first_comment_id": first_comment_id,
+        "by": actor,
     }
-    await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry)
-    return {"recorded": 1, "prs": [number]}
+    # Record a monotonic event version BEFORE any async GitHub permission lookup
+    # so an older `resolved` event cannot override a later `unresolved` event.
+    event_version: int | None = None
+    if first_comment_id > 0 and (
+        ctx.action == "unresolved" or (ctx.action == "resolved" and not ctx.sender_is_bot)
+    ):
+        event_version = await asyncio.to_thread(
+            store.rincr,
+            _thread_event_version_key(ctx.repo, number, first_comment_id),
+            1,
+            ex=dm.FINDING_TTL_S,
+        )
+    # Record activity first without marking dirty yet so a concurrent dirty sweep
+    # cannot read pre-update finding state and clear the only dirty marker.
+    await asyncio.to_thread(record_pr_activity, ctx.repo, number, entry, dirty=False)
+    finding_updated: dict[str, Any] | None = None
+    if ctx.action == "resolved":
+        if not ctx.sender_is_bot and await _actor_has_write_permission(ctx.repo, actor):
+            finding_updated = await asyncio.to_thread(
+                _sync_thread_finding_state,
+                ctx.repo,
+                number,
+                first_comment_id,
+                ctx.action,
+                actor,
+                event_version=event_version,
+            )
+    elif ctx.action == "unresolved":
+        finding_updated = await asyncio.to_thread(
+            _sync_thread_finding_state,
+            ctx.repo,
+            number,
+            first_comment_id,
+            ctx.action,
+            actor,
+            event_version=event_version,
+        )
+    # Mark dirty AFTER the finding update completes so subsequent recomputes observe it.
+    await asyncio.to_thread(mark_dirty, ctx.repo, number)
+    out: dict[str, Any] = {"recorded": 1, "prs": [number]}
+    if finding_updated:
+        out["finding_updated"] = finding_updated
+    return out
 
 
 def _check_prs(obj: dict[str, Any]) -> list[int]:
@@ -360,9 +557,23 @@ def _check_prs(obj: dict[str, Any]) -> list[int]:
 
 
 def _is_own_check(obj: dict[str, Any]) -> bool:
-    """Our own merge-readiness check must not mark the PR dirty again (loop)."""
+    """Our own merge-readiness check must not mark the PR dirty again (loop).
+
+    When our GitHub App identity (slug or id) is known, require the check's
+    publishing app to match so an external app reusing OWN_CHECK_RUN_NAME is
+    never dropped.
+    """
     slug = github_app.app_slug()
-    return bool(slug) and _str(obj, "app", "slug") == slug
+    app_id = (os.getenv("GITHUB_APP_ID") or "").strip()
+    run_slug = _str(obj, "app", "slug")
+    run_app_id = _int(obj, "app", "id")
+    if slug:
+        if run_slug:
+            return run_slug == slug
+        return _str(obj, "name") == OWN_CHECK_RUN_NAME
+    if app_id.isdigit() and run_app_id > 0:
+        return str(run_app_id) == app_id
+    return _str(obj, "name") == OWN_CHECK_RUN_NAME
 
 
 @on("check_suite")
@@ -403,6 +614,9 @@ async def _check_run(ctx: EventContext) -> dict[str, Any]:
 
 @on("status")
 async def _status(ctx: EventContext) -> dict[str, Any]:
+    context = _str(ctx.payload, "context")
+    if context == OWN_STATUS_CONTEXT:
+        return {"recorded": 0, "skipped": "own-status"}
     sha = _str(ctx.payload, "sha")
     if not ctx.repo or not sha:
         return {"recorded": 0}
@@ -411,7 +625,7 @@ async def _status(ctx: EventContext) -> dict[str, Any]:
         return {"recorded": 0, "skipped": "unknown-head"}
     entry = {
         "kind": "status",
-        "context": _str(ctx.payload, "context"),
+        "context": context,
         "state": _str(ctx.payload, "state"),
         "sha": sha,
         "url": _str(ctx.payload, "target_url"),

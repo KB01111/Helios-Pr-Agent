@@ -17,5 +17,6 @@ BACKEND_URL = "https://your-backend.example.com"
 # id = "<kv-namespace-id>"
 
 # Secrets (never put these in this file):
-#   wrangler secret put GITHUB_WEBHOOK_SECRET   # same value as the GitHub webhook secret
-#   wrangler secret put BACKEND_API_TOKEN       # only if the backend sets BACKEND_API_TOKEN
+#   wrangler secret put GITHUB_WEBHOOK_SECRET      # same value as the repo webhook secret
+#   wrangler secret put GITHUB_APP_WEBHOOK_SECRET  # GitHub App webhook secret (when using a GitHub App)
+#   wrangler secret put BACKEND_API_TOKEN          # only if the backend sets BACKEND_API_TOKEN

@@ -7,13 +7,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the rendered template changes in a way existing repos should pick up.
-pub const TEMPLATE_VERSION: u32 = 6;
+pub const TEMPLATE_VERSION: u32 = 8;
 /// First-line marker of a workflow this app manages.
 pub const MANAGED_MARKER: &str = "# pr-agent-control: ";
 /// Pinned so a compromised upstream branch cannot receive repository secrets.
 const PR_AGENT_ACTION: &str = "the-pr-agent/pr-agent@dec3e88c029c0a32957bd95aa694cb34d2b256e0";
 pub const DEFAULT_MODEL: &str = "openrouter/thinkingmachines/inkling-2-small:free";
 const MAX_INSTRUCTIONS: usize = 2000;
+/// Cap for `.pr-agent/memory.md` injected in Actions Lite mode.
+const MAX_REPO_MEMORY_CHARS: usize = 6000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -157,18 +159,15 @@ pub fn render_pr_agent_workflow(opts: &WorkflowOptions) -> String {
             "${{ github.event.action == 'opened' }}".to_string()
         }
     };
-    let instructions = if opts.extra_instructions.is_empty() {
+    let base_instructions_env = if opts.extra_instructions.is_empty() {
         String::new()
     } else {
         let quoted = serde_json::to_string(&opts.extra_instructions).unwrap_or_default();
-        format!(
-            "          PR_REVIEWER__EXTRA_INSTRUCTIONS: {q}\n          PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS: {q}\n",
-            q = quoted
-        )
+        format!("          BASE_EXTRA_INSTRUCTIONS: {}\n", quoted)
     };
 
     format!(
-        r#"{marker}{header}
+        r###"{marker}{header}
 # Managed by PR Agent Control (Auto review). Change the settings in the app and
 # click Update; edits made here are replaced on the next update.
 name: PR Agent
@@ -212,6 +211,74 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Load repo memory
+        if: steps.key-check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
+          REPO: ${{{{ github.repository }}}}
+          EVENT_NAME: ${{{{ github.event_name }}}}
+          PR_NUMBER: ${{{{ github.event.pull_request.number || github.event.issue.number }}}}
+          BASE_REF: ${{{{ github.event.pull_request.base.ref }}}}
+          DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+{base_instructions_env}        run: |
+          python3 - <<'PY'
+          import json, os, secrets, urllib.error, urllib.parse, urllib.request
+          base = os.environ.get("BASE_EXTRA_INSTRUCTIONS", "").strip()
+          repo = os.environ.get("REPO", "").strip()
+          event_name = os.environ.get("EVENT_NAME", "").strip()
+          pr_number = os.environ.get("PR_NUMBER", "").strip()
+          ref = os.environ.get("BASE_REF", "").strip()
+          default_branch = os.environ.get("DEFAULT_BRANCH", "").strip()
+          token = os.environ.get("GH_TOKEN", "")
+          api_headers = {{
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "pr-agent-control-workflow",
+          }}
+          if token:
+              api_headers["Authorization"] = f"Bearer {{token}}"
+          if not ref and event_name == "issue_comment" and repo and pr_number.isdigit():
+              pr_url = f"https://api.github.com/repos/{{repo}}/pulls/{{pr_number}}"
+              pr_req = urllib.request.Request(
+                  pr_url,
+                  headers={{**api_headers, "Accept": "application/vnd.github+json"}},
+              )
+              try:
+                  with urllib.request.urlopen(pr_req, timeout=10) as resp:
+                      pr_data = json.loads(resp.read(262144).decode("utf-8", errors="replace"))
+                      ref = str((pr_data.get("base") or {{}}).get("ref") or "").strip()
+              except Exception as e:
+                  print(f"::warning::Could not resolve PR #{{pr_number}} base branch ({{type(e).__name__}}); falling back to default branch.")
+          if not ref:
+              ref = default_branch
+          mem = ""
+          if repo and ref:
+              qs = urllib.parse.urlencode({{"ref": ref}})
+              url = f"https://api.github.com/repos/{{repo}}/contents/.pr-agent/memory.md?{{qs}}"
+              req = urllib.request.Request(
+                  url,
+                  headers={{**api_headers, "Accept": "application/vnd.github.raw+json"}},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      raw = resp.read(65536).decode("utf-8", errors="replace")
+                      mem = raw.replace("\x00", "").replace("\r\n", "\n").strip()[:{max_mem}].strip()
+              except urllib.error.HTTPError as e:
+                  if e.code != 404:
+                      print(f"::warning::Could not load .pr-agent/memory.md (HTTP {{e.code}}); continuing without repo memory.")
+              except Exception as e:
+                  print(f"::warning::Could not load .pr-agent/memory.md ({{type(e).__name__}}); continuing without repo memory.")
+          parts = []
+          if base:
+              parts.append(base)
+          if mem:
+              parts.append("## Repository Memory (.pr-agent/memory.md)\n" + mem)
+          combined = "\n\n".join(parts)
+          if combined:
+              delim = f"PR_AGENT_EOF_{{secrets.token_hex(12)}}"
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+                  for var in ("PR_REVIEWER__EXTRA_INSTRUCTIONS", "PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS"):
+                      fh.write(f"{{var}}<<{{delim}}\n{{combined}}\n{{delim}}\n")
+          PY
       - name: PR Agent
         if: steps.key-check.outputs.skip != 'true'
         uses: {action}
@@ -230,21 +297,22 @@ jobs:
           # One review comment per PR, edited in place on every new push.
           PR_REVIEWER__PERSISTENT_COMMENT: "true"
           PR_REVIEWER__INLINE_CODE_COMMENTS: "true"
-{instructions}          github_action_config.pr_actions: '{pr_actions}'
+          github_action_config.pr_actions: '{pr_actions}'
           github_action_config.auto_review: {auto_review}
           github_action_config.auto_describe: {auto_describe}
           github_action_config.auto_improve: {auto_improve}
-"#,
+"###,
         marker = MANAGED_MARKER,
         header = header,
         types = types.join(", "),
         draft_guard = draft_guard,
+        base_instructions_env = base_instructions_env,
+        max_mem = MAX_REPO_MEMORY_CHARS,
         action = PR_AGENT_ACTION,
         model = opts.model,
         fallbacks = fallbacks,
         max_tokens = opts.max_tokens,
         effort = opts.reasoning_effort,
-        instructions = instructions,
         pr_actions = pr_actions,
         auto_review = yaml_bool(opts.auto_review),
         auto_describe = on_open_only(opts.auto_describe),
@@ -325,7 +393,18 @@ mod tests {
         assert!(yaml.contains(r#"group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)) || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.sender.type != 'Bot' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && (github.event.comment.body == '/review' || startsWith(github.event.comment.body, '/review ') || startsWith(github.event.comment.body, fromJSON('"/review\n"')) || startsWith(github.event.comment.body, fromJSON('"/review\r"')) || startsWith(github.event.comment.body, fromJSON('"/review\t"'))) && format('pr-{0}', github.event.issue.number))"#));
         assert!(yaml.contains("queue: max"));
         assert!(yaml.contains("cancel-in-progress: false"));
-        assert!(!yaml.contains("EXTRA_INSTRUCTIONS"));
+        // Memory bridge loads .pr-agent/memory.md from the PR's base branch (resolving via API on issue_comment) and caps to 6000 chars.
+        assert!(yaml.contains("name: Load repo memory"));
+        assert!(yaml.contains("contents/.pr-agent/memory.md"));
+        assert!(yaml.contains("EVENT_NAME: ${{ github.event_name }}"));
+        assert!(yaml.contains("PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}"));
+        assert!(yaml.contains("BASE_REF: ${{ github.event.pull_request.base.ref }}"));
+        assert!(yaml.contains("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}"));
+        assert!(yaml.contains("pr_url = f\"https://api.github.com/repos/{repo}/pulls/{pr_number}\""));
+        assert!(yaml.contains("if not ref and event_name == \"issue_comment\""));
+        assert!(yaml.contains("[:6000]"));
+        assert!(yaml.contains("PR_REVIEWER__EXTRA_INSTRUCTIONS"));
+        assert!(!yaml.contains("BASE_EXTRA_INSTRUCTIONS:"));
     }
 
     #[test]
@@ -357,8 +436,10 @@ mod tests {
         .unwrap();
         let yaml = render_pr_agent_workflow(&o);
         assert!(yaml.contains(
-            "PR_REVIEWER__EXTRA_INSTRUCTIONS: \"Focus on \\\"security\\\".\\nIgnore docs: #1\""
+            "BASE_EXTRA_INSTRUCTIONS: \"Focus on \\\"security\\\".\\nIgnore docs: #1\""
         ));
+        assert!(yaml.contains("PR_REVIEWER__EXTRA_INSTRUCTIONS"));
+        assert!(yaml.contains("PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS"));
         // The settings header stays on the first line (newlines are escaped).
         assert!(yaml.lines().next().unwrap().contains("Ignore docs: #1"));
         assert_eq!(parse_managed(&yaml).unwrap(), o);
@@ -368,6 +449,16 @@ mod tests {
             ..WorkflowOptions::default()
         };
         assert!(bad.normalized().is_err());
+    }
+
+    #[test]
+    fn memory_bridge_uses_safe_python_and_random_delimiter() {
+        let yaml = default_pr_agent_workflow();
+        assert!(yaml.contains("PR_AGENT_EOF_{secrets.token_hex(12)}"));
+        assert!(yaml.contains("qs = urllib.parse.urlencode({\"ref\": ref})"));
+        assert!(yaml.contains("url = f\"https://api.github.com/repos/{repo}/contents/.pr-agent/memory.md?{qs}\""));
+        assert!(yaml.contains("fh.write(f\"{var}<<{delim}\\n{combined}\\n{delim}\\n\")"));
+        assert!(!yaml.contains("{{repo}}"));
     }
 
     #[test]

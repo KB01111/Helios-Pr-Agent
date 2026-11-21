@@ -11,6 +11,7 @@ mod daemon;
 mod decider;
 mod github_app;
 mod oauth;
+mod vault;
 
 use autoreview::WorkflowOptions;
 
@@ -501,7 +502,7 @@ fn strip_ansi(input: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
             chars.next();
-            while let Some(code) = chars.next() {
+            for code in chars.by_ref() {
                 if ('@'..='~').contains(&code) {
                     break;
                 }
@@ -1014,7 +1015,12 @@ fn github_login_inner(
     let status = res.status();
     let body: serde_json::Value = res.json().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("GitHub rejected the token (HTTP {}): {}", status, body));
+        let msg = body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("invalid credentials");
+        return Err(format!("GitHub rejected the token (HTTP {}): {}", status, msg));
     }
     let login = body
         .get("login")
@@ -1433,7 +1439,7 @@ fn save_backend_env_var_blocking(key: String, value: String) -> Result<String, S
     Ok(path.to_string_lossy().to_string())
 }
 
-/// `owner/name`, each part 1-100 chars of [A-Za-z0-9_.-].
+/// `owner/name`, each part 1-100 chars of [A-Za-z0-9_.-] (excluding `.` and `..`).
 fn valid_repo_name(repo: &str) -> bool {
     let mut parts = repo.split('/');
     match (parts.next(), parts.next(), parts.next()) {
@@ -1441,6 +1447,8 @@ fn valid_repo_name(repo: &str) -> bool {
             let valid = |part: &str| {
                 !part.is_empty()
                     && part.len() <= 100
+                    && part != "."
+                    && part != ".."
                     && part
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
@@ -2191,6 +2199,7 @@ fn gh_commit_workflow(
 /// Each step runs independently and reports its own status. The token,
 /// webhook secret and API key are never returned or logged.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn github_setup_repo(
     token: String,
     repo: String,
@@ -2217,6 +2226,7 @@ async fn github_setup_repo(
     .map_err(|e| e.to_string())?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn github_setup_repo_blocking(
     token: String,
     repo: String,
@@ -2258,10 +2268,8 @@ fn github_setup_repo_blocking(
     // An empty key is allowed: the secrets step then keeps the repo's existing
     // secret (and fails for that repo if there is none), so settings can be
     // updated without pasting the key again.
-    if plan.actions {
-        if openrouter_key.contains('\r') || openrouter_key.contains('\n') {
-            return Err("openrouter_key must be a single line".into());
-        }
+    if plan.actions && (openrouter_key.contains('\r') || openrouter_key.contains('\n')) {
+        return Err("openrouter_key must be a single line".into());
     }
     let provider = workflow_provider.trim();
     let workflow_path = match provider {
@@ -2682,6 +2690,651 @@ fn github_pr_command_blocking(
         .unwrap_or_default())
 }
 
+const ALLOWED_COMMIT_REPO_FILES: &[&str] = &[
+    ".pragent.yaml",
+    ".pragent.yml",
+    ".pr-agent/memory.md",
+];
+const MAX_REPO_FILE_BYTES: usize = 512 * 1024;
+const MAX_READ_REPO_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Validate a repository-relative path for reading via the GitHub Contents API.
+fn validate_read_repo_path(path: &str) -> Result<String, String> {
+    let p = path.trim();
+    if p.is_empty() || p.len() > 256 {
+        return Err("path must be 1-256 characters".into());
+    }
+    if p.starts_with('/') || p.ends_with('/') || p.contains('\\') || p.contains("//") {
+        return Err("path must be a normalized repository-relative path".into());
+    }
+    if !p
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
+        return Err("path contains unsupported characters".into());
+    }
+    for seg in p.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err("path must not contain '.' or '..' segments".into());
+        }
+    }
+    Ok(p.to_string())
+}
+
+/// Strict allowlist for files the desktop app is permitted to commit via `github_commit_repo_file`.
+fn validate_commit_repo_path(path: &str) -> Result<&'static str, String> {
+    let p = path.trim();
+    ALLOWED_COMMIT_REPO_FILES
+        .iter()
+        .copied()
+        .find(|&allowed| allowed == p)
+        .ok_or_else(|| {
+            format!(
+                "refusing to commit unsupported path {:?} (allowed: {})",
+                p,
+                ALLOWED_COMMIT_REPO_FILES.join(", ")
+            )
+        })
+}
+
+fn validate_commit_message(path: &str, message: &str) -> Result<String, String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        return Ok(format!("chore: update {} (PR Agent Control)", path));
+    }
+    if msg.contains('\r') || msg.contains('\n') || msg.contains('\0') {
+        return Err("commit message must be a single line".into());
+    }
+    if msg.chars().count() > 500 {
+        return Err("commit message is too long (max 500 characters)".into());
+    }
+    Ok(msg.to_string())
+}
+
+fn read_bounded_utf8<R: std::io::Read>(
+    reader: R,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: failed to read response body: {}", label, e))?;
+    if buf.len() > max_bytes {
+        return Err(format!(
+            "{}: file exceeds maximum allowed size ({} bytes)",
+            label, max_bytes
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| format!("{}: file content was not valid UTF-8", label))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CommitConflictResolution {
+    AlreadyUpToDate { sha: String },
+    RetryUnchangedSha { sha: String },
+    CompetingEdit,
+}
+
+fn resolve_commit_conflict(
+    initial_sha: Option<&str>,
+    fresh_file_json: &serde_json::Value,
+    desired_content: &str,
+    path: &str,
+) -> Result<CommitConflictResolution, String> {
+    if fresh_file_json.get("type").and_then(|t| t.as_str()) != Some("file") {
+        return Err(format!("{}: existing path is not a regular file", path));
+    }
+    let fresh_sha = fresh_file_json
+        .get("sha")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: conflict re-read returned no sha", path))?;
+    if gh_file_text(fresh_file_json).is_ok_and(|current| current == desired_content) {
+        return Ok(CommitConflictResolution::AlreadyUpToDate { sha: fresh_sha });
+    }
+    if initial_sha.is_some_and(|orig| orig == fresh_sha) {
+        return Ok(CommitConflictResolution::RetryUnchangedSha { sha: fresh_sha });
+    }
+    Ok(CommitConflictResolution::CompetingEdit)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GitTreeLookup {
+    RegularFile,
+    Directory { sha: String },
+    Symlink,
+    Other { entry_type: String, mode: String },
+    Missing,
+}
+
+fn lookup_git_tree_segment(
+    tree_json: &serde_json::Value,
+    segment: &str,
+    label: &str,
+) -> Result<GitTreeLookup, String> {
+    let entries = tree_json
+        .get("tree")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| format!("{}: GitHub tree response missing entries", label))?;
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.get("path").and_then(|p| p.as_str()) == Some(segment))
+    else {
+        if tree_json
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "{}: GitHub tree listing was truncated; cannot verify file type",
+                label
+            ));
+        }
+        return Ok(GitTreeLookup::Missing);
+    };
+    let mode = entry.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match (mode, entry_type) {
+        ("100644" | "100755", "blob") => Ok(GitTreeLookup::RegularFile),
+        ("120000", _) => Ok(GitTreeLookup::Symlink),
+        ("040000", "tree") => {
+            let sha = entry
+                .get("sha")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("{}: GitHub tree directory entry missing sha", label))?;
+            Ok(GitTreeLookup::Directory {
+                sha: sha.to_string(),
+            })
+        }
+        _ => Ok(GitTreeLookup::Other {
+            entry_type: entry_type.to_string(),
+            mode: mode.to_string(),
+        }),
+    }
+}
+
+fn gh_branch_head_commit_and_tree(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    branch: &str,
+    label: &str,
+) -> Result<Option<(String, String)>, String> {
+    let url = format!("{}/commits", repo_api);
+    let (status, body) = gh_request_json(
+        client,
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("sha", branch), ("per_page", "1")],
+        None,
+    )?;
+    match status {
+        404 | 409 => return Ok(None),
+        200 => {}
+        _ => return Err(format!("{}: {}", label, gh_error_text(status, &body))),
+    }
+    let commits: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| format!("{}: GitHub commits response was not JSON", label))?;
+    let Some(head) = commits.as_array().and_then(|arr| arr.first()) else {
+        return Ok(None);
+    };
+    let commit_sha = head
+        .get("sha")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{}: GitHub head commit missing sha", label))?;
+    let tree_sha = head
+        .get("commit")
+        .and_then(|c| c.get("tree"))
+        .and_then(|t| t.get("sha"))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{}: GitHub head commit missing tree sha", label))?;
+    Ok(Some((commit_sha.to_string(), tree_sha.to_string())))
+}
+
+/// Walk the Git tree rooted at `root_tree_sha` along `rel_path` to verify that
+/// every parent component is a directory (`040000` tree) and the leaf is a
+/// regular file (`100644` or `100755` blob). Returns `Ok(false)` when absent.
+fn gh_verify_regular_file_at_tree(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    repo_api: &str,
+    root_tree_sha: &str,
+    rel_path: &str,
+    label: &str,
+) -> Result<bool, String> {
+    let segments: Vec<&str> = rel_path.split('/').collect();
+    let mut current_tree = root_tree_sha.to_string();
+    for (idx, seg) in segments.iter().enumerate() {
+        let tree_url = format!("{}/git/trees/{}", repo_api, current_tree);
+        let (status, body) =
+            gh_request_json(client, token, reqwest::Method::GET, &tree_url, &[], None)?;
+        match status {
+            404 => return Ok(false),
+            200 => {}
+            _ => return Err(format!("{}: {}", label, gh_error_text(status, &body))),
+        }
+        let tree_json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| format!("{}: GitHub tree response was not JSON", label))?;
+        let is_last = idx + 1 == segments.len();
+        match lookup_git_tree_segment(&tree_json, seg, label)? {
+            GitTreeLookup::Missing => return Ok(false),
+            GitTreeLookup::RegularFile if is_last => return Ok(true),
+            GitTreeLookup::Directory { sha } if !is_last => current_tree = sha,
+            GitTreeLookup::Symlink => {
+                return Err(format!("{}: path is a symlink, not a regular file", label));
+            }
+            _ => {
+                return Err(format!("{}: path is not a regular file", label));
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Read a UTF-8 file from a repository's default branch via the GitHub Contents API
+/// using the raw media type (`application/vnd.github.raw+json`), which supports files
+/// larger than 1 MiB (capped at 2 MiB here). Verifies the Git tree entry at the same
+/// commit before reading raw contents so symlinks, directories, and submodules are
+/// rejected instead of followed. Returns `None` on HTTP 404 or missing path.
+#[tauri::command]
+async fn github_read_repo_file(
+    token: String,
+    repo: String,
+    path: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || github_read_repo_file_blocking(token, repo, path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn github_read_repo_file_blocking(
+    token: String,
+    repo: String,
+    path: String,
+) -> Result<Option<String>, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let rel_path = validate_read_repo_path(&path)?;
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+    let branch = gh_default_branch(&client, token, &repo_api)?;
+    let label = format!("read {}", rel_path);
+
+    let Some((commit_sha, root_tree_sha)) =
+        gh_branch_head_commit_and_tree(&client, token, &repo_api, &branch, &label)?
+    else {
+        return Ok(None);
+    };
+    if !gh_verify_regular_file_at_tree(
+        &client,
+        token,
+        &repo_api,
+        &root_tree_sha,
+        &rel_path,
+        &label,
+    )? {
+        return Ok(None);
+    }
+
+    let url = format!("{}/contents/{}", repo_api, rel_path);
+    let res = client
+        .get(&url)
+        .query(&[("ref", commit_sha.as_str())])
+        .header("Accept", "application/vnd.github.raw+json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|e| format!("GitHub unreachable: {}", e))?;
+    let status = res.status().as_u16();
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_len = res.content_length();
+
+    match status {
+        404 => Ok(None),
+        200 => {
+            if let Some(len) = content_len {
+                if len > MAX_READ_REPO_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "{}: file exceeds maximum allowed size ({} bytes)",
+                        label, MAX_READ_REPO_FILE_BYTES
+                    ));
+                }
+            }
+            if content_type.starts_with("application/json") {
+                let body = read_bounded_utf8(res, MAX_READ_REPO_FILE_BYTES, &label)?;
+                let val: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|_| format!("{}: GitHub response was not JSON", label))?;
+                if val.get("type").and_then(|t| t.as_str()) != Some("file") {
+                    return Err(format!("{}: path is not a regular file", label));
+                }
+                if val.get("encoding").and_then(|e| e.as_str()) == Some("none")
+                    && val.get("size").and_then(|s| s.as_u64()).unwrap_or(0) > 0
+                {
+                    return Err(format!("{}: file is too large for GitHub Contents API", label));
+                }
+                let text = gh_file_text(&val)?;
+                return Ok(Some(text));
+            }
+            let text = read_bounded_utf8(res, MAX_READ_REPO_FILE_BYTES, &label)?;
+            Ok(Some(text))
+        }
+        _ => {
+            let err_body = read_bounded_utf8(res, 64 * 1024, &label).unwrap_or_default();
+            Err(format!("{}: {}", label, gh_error_text(status, &err_body)))
+        }
+    }
+}
+
+fn extract_commit_sha(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("commit")
+                .and_then(|c| c.get("sha"))
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    v.get("content")
+                        .and_then(|c| c.get("sha"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExpectedBase {
+    /// Caller did not supply a baseline (unconditional upsert).
+    Any,
+    /// Caller merged against an absent remote file (expects 404).
+    Absent,
+    /// Caller merged against this exact remote file content.
+    Content(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BaseCheckOutcome {
+    AlreadyUpToDate,
+    Proceed,
+}
+
+fn check_commit_base(
+    expected_base: &ExpectedBase,
+    remote_content: Option<&str>,
+    desired_content: &str,
+    path: &str,
+) -> Result<BaseCheckOutcome, String> {
+    if let Some(current) = remote_content {
+        if current == desired_content {
+            return Ok(BaseCheckOutcome::AlreadyUpToDate);
+        }
+    }
+    match (expected_base, remote_content) {
+        (ExpectedBase::Any, _) => Ok(BaseCheckOutcome::Proceed),
+        (ExpectedBase::Absent, None) => Ok(BaseCheckOutcome::Proceed),
+        (ExpectedBase::Absent, Some(_)) => Err(format!(
+            "conflict: {} was created remotely after your preview. Reload the file and try again.",
+            path
+        )),
+        (ExpectedBase::Content(expected), Some(current)) if current == expected => {
+            Ok(BaseCheckOutcome::Proceed)
+        }
+        (ExpectedBase::Content(_), Some(_)) => Err(format!(
+            "conflict: {} changed remotely after your preview. Reload the file and try again.",
+            path
+        )),
+        (ExpectedBase::Content(_), None) => Err(format!(
+            "conflict: {} was deleted remotely after your preview. Reload the file and try again.",
+            path
+        )),
+    }
+}
+
+fn parse_expected_base_from_body(
+    body: &tauri::ipc::InvokeBody,
+    expected_base_content: Option<String>,
+) -> Result<ExpectedBase, String> {
+    if let Some(s) = expected_base_content {
+        return Ok(ExpectedBase::Content(s));
+    }
+    if let tauri::ipc::InvokeBody::Json(serde_json::Value::Object(map)) = body {
+        if let Some(val) = map.get("expectedBaseContent") {
+            return match val {
+                serde_json::Value::Null => Ok(ExpectedBase::Absent),
+                serde_json::Value::String(s) => Ok(ExpectedBase::Content(s.clone())),
+                _ => Err("expectedBaseContent must be a string or null".into()),
+            };
+        }
+    }
+    Ok(ExpectedBase::Any)
+}
+
+/// Upsert an allowlisted repo config or memory file (`.pragent.yaml`, `.pragent.yml`,
+/// `.pr-agent/memory.md`) on the default branch. Skips the commit when content is
+/// unchanged. When `expectedBaseContent` is provided (`null` or string), refuses to
+/// overwrite if the remote file no longer matches that baseline.
+/// Returns `{ changed: bool, sha: String, path: String }`.
+#[tauri::command]
+async fn github_commit_repo_file(
+    token: String,
+    repo: String,
+    path: String,
+    content: String,
+    message: String,
+    expected_base_content: Option<String>,
+    req: tauri::ipc::Request<'_>,
+) -> Result<serde_json::Value, String> {
+    let expected_base = parse_expected_base_from_body(req.body(), expected_base_content)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        github_commit_repo_file_blocking(token, repo, path, content, message, expected_base)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn github_commit_repo_file_blocking(
+    token: String,
+    repo: String,
+    path: String,
+    content: String,
+    message: String,
+    expected_base: ExpectedBase,
+) -> Result<serde_json::Value, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("GitHub token is required".into());
+    }
+    let repo = repo.trim();
+    if !valid_repo_name(repo) {
+        return Err("repo must look like owner/name".into());
+    }
+    let allowed_path = validate_commit_repo_path(&path)?;
+    if content.len() > MAX_REPO_FILE_BYTES {
+        return Err("file content exceeds maximum allowed size (512 KiB)".into());
+    }
+    let commit_message = validate_commit_message(allowed_path, &message)?;
+
+    let client = gh_client()?;
+    let repo_api = format!("https://api.github.com/repos/{}", repo);
+    let branch = gh_default_branch(&client, token, &repo_api)?;
+    let url = format!("{}/contents/{}", repo_api, allowed_path);
+
+    let (status, body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::GET,
+        &url,
+        &[("ref", branch.as_str())],
+        None,
+    )?;
+    let existing_sha = match status {
+        200 => {
+            let file_json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|_| format!("{}: existing file response was not JSON", allowed_path))?;
+            if file_json.get("type").and_then(|t| t.as_str()) != Some("file") {
+                return Err(format!("{}: existing path is not a regular file", allowed_path));
+            }
+            let sha = file_json
+                .get("sha")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("{}: existing file response had no sha", allowed_path))?;
+            let current_text = match gh_file_text(&file_json) {
+                Ok(text) => Some(text),
+                Err(_) if matches!(expected_base, ExpectedBase::Any) => None,
+                Err(e) => {
+                    return Err(format!(
+                        "{}: could not decode existing file to verify baseline: {}",
+                        allowed_path, e
+                    ));
+                }
+            };
+            if let Some(ref current) = current_text {
+                if check_commit_base(&expected_base, Some(current), &content, allowed_path)?
+                    == BaseCheckOutcome::AlreadyUpToDate
+                {
+                    return Ok(serde_json::json!({
+                        "changed": false,
+                        "sha": sha,
+                        "path": allowed_path,
+                    }));
+                }
+            }
+            Some(sha)
+        }
+        404 => {
+            check_commit_base(&expected_base, None, &content, allowed_path)?;
+            None
+        }
+        _ => return Err(format!("{}: {}", allowed_path, gh_error_text(status, &body))),
+    };
+
+    let make_payload = |sha: Option<&str>| {
+        let mut payload = serde_json::json!({
+            "message": commit_message,
+            "content": STANDARD.encode(content.as_bytes()),
+            "branch": branch,
+        });
+        if let Some(s) = sha {
+            if let Some(map) = payload.as_object_mut() {
+                map.insert("sha".to_string(), serde_json::Value::String(s.to_string()));
+            }
+        }
+        payload
+    };
+
+    let (put_status, put_body) = gh_request_json(
+        &client,
+        token,
+        reqwest::Method::PUT,
+        &url,
+        &[],
+        Some(make_payload(existing_sha.as_deref())),
+    )?;
+    match put_status {
+        200 | 201 => Ok(serde_json::json!({
+            "changed": true,
+            "sha": extract_commit_sha(&put_body),
+            "path": allowed_path,
+        })),
+        status if status == 409 || (status == 422 && existing_sha.is_none()) => {
+            // Re-read the remote file to distinguish a benign race from a competing edit:
+            // - 422 without `sha` happens if another writer created the file after our 404 GET.
+            // - 409 happens on a concurrent commit or competing edit to this file.
+            // Never silently overwrite a competing edit with a different SHA/content.
+            let (re_status, re_body) = gh_request_json(
+                &client,
+                token,
+                reqwest::Method::GET,
+                &url,
+                &[("ref", branch.as_str())],
+                None,
+            )?;
+            if re_status == 404 && status == 422 {
+                return Err(format!(
+                    "commit {}: {}",
+                    allowed_path,
+                    gh_error_text(put_status, &put_body)
+                ));
+            }
+            if re_status != 200 {
+                return Err(format!(
+                    "{}: conflict and re-read failed: {}",
+                    allowed_path,
+                    gh_error_text(re_status, &re_body)
+                ));
+            }
+            let fresh_json: serde_json::Value = serde_json::from_str(&re_body)
+                .map_err(|_| format!("{}: conflict re-read was not JSON", allowed_path))?;
+            match resolve_commit_conflict(
+                existing_sha.as_deref(),
+                &fresh_json,
+                &content,
+                allowed_path,
+            )? {
+                CommitConflictResolution::AlreadyUpToDate { sha } => Ok(serde_json::json!({
+                    "changed": false,
+                    "sha": sha,
+                    "path": allowed_path,
+                })),
+                CommitConflictResolution::RetryUnchangedSha { sha } => {
+                    let (retry_status, retry_body) = gh_request_json(
+                        &client,
+                        token,
+                        reqwest::Method::PUT,
+                        &url,
+                        &[],
+                        Some(make_payload(Some(&sha))),
+                    )?;
+                    if matches!(retry_status, 200 | 201) {
+                        Ok(serde_json::json!({
+                            "changed": true,
+                            "sha": extract_commit_sha(&retry_body),
+                            "path": allowed_path,
+                        }))
+                    } else {
+                        Err(format!(
+                            "commit {}: {}",
+                            allowed_path,
+                            gh_error_text(retry_status, &retry_body)
+                        ))
+                    }
+                }
+                CommitConflictResolution::CompetingEdit => Err(format!(
+                    "commit {}: file was modified concurrently on '{}'; reload the latest version before committing again",
+                    allowed_path, branch
+                )),
+            }
+        }
+        _ => Err(format!(
+            "commit {}: {}",
+            allowed_path,
+            gh_error_text(put_status, &put_body)
+        )),
+    }
+}
+
 /// Generic backend proxy: forwards GET/POST/PUT/PATCH/DELETE to {backend_url}{path}
 /// with an optional Bearer API token. Keeps secrets out of the webview fetch path
 /// (avoids CORS/preflight issues in Tauri) and never logs tokens.
@@ -2696,6 +3349,15 @@ async fn backend_mutate(
     tauri::async_runtime::spawn_blocking(move || backend_mutate_blocking(method, backend_url, path, body_json, api_token))
         .await
         .map_err(|e| e.to_string())?
+}
+
+fn backend_http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent("pr-agent-control")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 fn backend_mutate_blocking(
@@ -2719,7 +3381,16 @@ fn backend_mutate_blocking(
     }
     let url = format!("{}{}", base, p);
     require_secure_for_token(&url, api_token.as_deref().map(str::trim).is_some_and(|t| !t.is_empty()))?;
-    let client = gh_client()?;
+    // Reviews, repo memory bootstrap, and readiness recomputes can invoke LLMs or
+    // wake a cold backend instance, so give POST requests a generous timeout.
+    let timeout_secs = if m == "POST"
+        && (p.ends_with("/review") || p.ends_with("/bootstrap") || p.ends_with("/recompute"))
+    {
+        120
+    } else {
+        30
+    };
+    let client = backend_http_client(timeout_secs)?;
     let mut req = match m.as_str() {
         "POST" => client.post(&url),
         "PUT" => client.put(&url),
@@ -2802,7 +3473,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| daemon::on_window_event(window, event))
+        .on_window_event(daemon::on_window_event)
         .invoke_handler(tauri::generate_handler![
             daemon::daemon_start,
             daemon::daemon_stop,
@@ -2836,6 +3507,13 @@ pub fn run() {
             github_disable_repo,
             github_list_pulls,
             github_pr_command,
+            github_read_repo_file,
+            github_commit_repo_file,
+            vault::vault_status,
+            vault::vault_save_secret,
+            vault::vault_load_secrets,
+            vault::vault_delete_secret,
+            vault::vault_clear_all,
             github_app::github_app_create,
             oauth::oauth_cancel,
             oauth::oauth_status,
@@ -3082,5 +3760,342 @@ mod dotenv_assignment_tests {
         let content = "'OTHER'='first\nVERCEL_TOKEN = embedded\nlast'\n export VERCEL_TOKEN = old\nVERCEL_TOKEN=duplicate\n# comment = 'ignored\nVERCEL_TOKEN = final";
         assert_eq!(dotenv_key_lines(content, "VERCEL_TOKEN"), vec![false, false, false, true, true, false, true]);
         assert_eq!(dotenv_key_lines("VERCEL_TOKEN = \"first\nsecond\"\nOTHER=value", "VERCEL_TOKEN"), vec![true, true, false]);
+    }
+}
+
+#[cfg(test)]
+mod repo_file_tests {
+    use super::*;
+
+    #[test]
+    fn commit_path_allowlist_only_permits_config_and_memory() {
+        for ok in [".pragent.yaml", ".pragent.yml", ".pr-agent/memory.md", "  .pragent.yaml  "] {
+            assert!(validate_commit_repo_path(ok).is_ok(), "expected {:?} to pass", ok);
+        }
+        assert_eq!(validate_commit_repo_path(" .pr-agent/memory.md ").unwrap(), ".pr-agent/memory.md");
+        for bad in [
+            "",
+            ".github/workflows/pr-agent.yml",
+            "./.pragent.yaml",
+            "/.pragent.yaml",
+            ".pr-agent/../.pragent.yaml",
+            ".pr-agent/other.md",
+            "README.md",
+            ".env",
+            "src/main.rs",
+            ".pragent.yaml?ref=main",
+        ] {
+            assert!(validate_commit_repo_path(bad).is_err(), "expected {:?} to be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn read_path_validation_blocks_traversal_and_url_injection() {
+        for ok in [
+            ".pragent.yaml",
+            ".pragent.yml",
+            ".pr-agent/memory.md",
+            ".github/workflows/pr-agent.yml",
+            "docs/guide_v2.md",
+        ] {
+            assert_eq!(validate_read_repo_path(ok).unwrap(), ok);
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            ".pragent.yaml/",
+            "a//b",
+            "../secret",
+            "a/../b",
+            "./.pragent.yaml",
+            "a/./b",
+            r"a\b",
+            ".pragent.yaml?ref=evil",
+            ".pragent.yaml#frag",
+            "foo%2fbar",
+            "path with spaces.md",
+        ] {
+            assert!(validate_read_repo_path(bad).is_err(), "expected {:?} to be rejected", bad);
+        }
+        assert!(validate_read_repo_path(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn repo_name_validation_rejects_dot_segments() {
+        assert!(valid_repo_name("owner/repo"));
+        assert!(valid_repo_name("my-org/my.repo_1"));
+        for bad in ["", "owner", "a/b/c", "../repo", "owner/..", "./repo", "owner/.", "owner/repo?x=1"] {
+            assert!(!valid_repo_name(bad), "expected {:?} to be invalid", bad);
+        }
+    }
+
+    #[test]
+    fn repo_file_commands_reject_bad_inputs_before_network() {
+        assert!(github_read_repo_file_blocking("".into(), "o/r".into(), ".pragent.yaml".into()).is_err());
+        assert!(github_read_repo_file_blocking("tok".into(), "../bad".into(), ".pragent.yaml".into()).is_err());
+        assert!(github_read_repo_file_blocking("tok".into(), "o/r".into(), "../secret".into()).is_err());
+
+        assert!(github_commit_repo_file_blocking(
+            "".into(),
+            "o/r".into(),
+            ".pragent.yaml".into(),
+            "profile: chill\n".into(),
+            "chore: config".into(),
+            ExpectedBase::Any,
+        )
+        .is_err());
+        assert!(github_commit_repo_file_blocking(
+            "tok".into(),
+            "o/r".into(),
+            "README.md".into(),
+            "x".into(),
+            "chore: nope".into(),
+            ExpectedBase::Any,
+        )
+        .is_err());
+        assert!(github_commit_repo_file_blocking(
+            "tok".into(),
+            "o/r".into(),
+            ".pragent.yaml".into(),
+            "x".into(),
+            "line1\nline2".into(),
+            ExpectedBase::Any,
+        )
+        .is_err());
+        assert_eq!(
+            validate_commit_message(".pragent.yaml", "   ").unwrap(),
+            "chore: update .pragent.yaml (PR Agent Control)"
+        );
+    }
+
+    #[test]
+    fn extract_commit_sha_prefers_commit_sha_over_blob_sha() {
+        let body = r#"{"content":{"sha":"blob_111"},"commit":{"sha":"commit_222"}}"#;
+        assert_eq!(extract_commit_sha(body), "commit_222");
+
+        let fallback = r#"{"content":{"sha":"blob_111"}}"#;
+        assert_eq!(extract_commit_sha(fallback), "blob_111");
+
+        let empty_commit = r#"{"content":{"sha":"blob_111"},"commit":{"sha":""}}"#;
+        assert_eq!(extract_commit_sha(empty_commit), "blob_111");
+
+        assert_eq!(extract_commit_sha("not json"), "");
+    }
+
+    #[test]
+    fn read_bounded_utf8_enforces_size_and_utf8() {
+        let two_mib = "a".repeat(MAX_READ_REPO_FILE_BYTES);
+        assert_eq!(
+            read_bounded_utf8(two_mib.as_bytes(), MAX_READ_REPO_FILE_BYTES, "read test").unwrap().len(),
+            MAX_READ_REPO_FILE_BYTES
+        );
+        let too_big = "a".repeat(MAX_READ_REPO_FILE_BYTES + 1);
+        let err = read_bounded_utf8(too_big.as_bytes(), MAX_READ_REPO_FILE_BYTES, "read test").unwrap_err();
+        assert!(err.contains("exceeds maximum allowed size"), "unexpected err: {}", err);
+
+        let invalid_utf8: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let err = read_bounded_utf8(invalid_utf8, 1024, "read test").unwrap_err();
+        assert!(err.contains("UTF-8"), "unexpected err: {}", err);
+    }
+
+    #[test]
+    fn resolve_commit_conflict_protects_competing_edits() {
+        let same_json = serde_json::json!({
+            "type": "file",
+            "sha": "sha_new",
+            "content": STANDARD.encode("profile: chill\n"),
+        });
+        // Concurrent edit/create with identical content -> safe no-op (covers both 409 and 422).
+        assert_eq!(
+            resolve_commit_conflict(Some("sha_old"), &same_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::AlreadyUpToDate { sha: "sha_new".into() }
+        );
+        assert_eq!(
+            resolve_commit_conflict(None, &same_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::AlreadyUpToDate { sha: "sha_new".into() }
+        );
+
+        let unchanged_sha_json = serde_json::json!({
+            "type": "file",
+            "sha": "sha_old",
+            "content": STANDARD.encode("profile: assertive\n"),
+        });
+        // File blob SHA did not change (e.g. concurrent commit on another file) -> safe to retry once.
+        assert_eq!(
+            resolve_commit_conflict(Some("sha_old"), &unchanged_sha_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::RetryUnchangedSha { sha: "sha_old".into() }
+        );
+
+        let competing_json = serde_json::json!({
+            "type": "file",
+            "sha": "sha_other",
+            "content": STANDARD.encode("profile: assertive\n"),
+        });
+        // Different SHA and different content -> competing edit, refuse to overwrite.
+        assert_eq!(
+            resolve_commit_conflict(Some("sha_old"), &competing_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::CompetingEdit
+        );
+        // File was missing on initial GET (422) and concurrently created with different content -> competing edit.
+        assert_eq!(
+            resolve_commit_conflict(None, &competing_json, "profile: chill\n", ".pragent.yaml").unwrap(),
+            CommitConflictResolution::CompetingEdit
+        );
+    }
+
+    #[test]
+    fn lookup_git_tree_segment_distinguishes_regular_files_symlinks_and_dirs() {
+        let tree = serde_json::json!({
+            "truncated": false,
+            "tree": [
+                { "path": ".pragent.yaml", "mode": "100644", "type": "blob", "sha": "aaa" },
+                { "path": "run.sh", "mode": "100755", "type": "blob", "sha": "bbb" },
+                { "path": "link.yaml", "mode": "120000", "type": "blob", "sha": "ccc" },
+                { "path": ".pr-agent", "mode": "040000", "type": "tree", "sha": "ddd" },
+                { "path": "submod", "mode": "160000", "type": "commit", "sha": "eee" }
+            ]
+        });
+
+        assert_eq!(
+            lookup_git_tree_segment(&tree, ".pragent.yaml", "read").unwrap(),
+            GitTreeLookup::RegularFile
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "run.sh", "read").unwrap(),
+            GitTreeLookup::RegularFile
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "link.yaml", "read").unwrap(),
+            GitTreeLookup::Symlink
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, ".pr-agent", "read").unwrap(),
+            GitTreeLookup::Directory { sha: "ddd".into() }
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "submod", "read").unwrap(),
+            GitTreeLookup::Other {
+                entry_type: "commit".into(),
+                mode: "160000".into(),
+            }
+        );
+        assert_eq!(
+            lookup_git_tree_segment(&tree, "missing.yaml", "read").unwrap(),
+            GitTreeLookup::Missing
+        );
+
+        let truncated_tree = serde_json::json!({
+            "truncated": true,
+            "tree": []
+        });
+        let err = lookup_git_tree_segment(&truncated_tree, ".pragent.yaml", "read").unwrap_err();
+        assert!(err.contains("truncated"), "unexpected err: {}", err);
+    }
+
+    #[test]
+    fn check_commit_base_enforces_merged_baseline_and_preserves_already_up_to_date() {
+        // Already up to date takes precedence even if baseline differed (same desired content).
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Content("profile: old\n".into()),
+                Some("profile: chill\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::AlreadyUpToDate
+        );
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Absent,
+                Some("profile: chill\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::AlreadyUpToDate
+        );
+
+        // Matching baseline content -> proceed.
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Content("profile: old\n".into()),
+                Some("profile: old\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::Proceed
+        );
+        // Matching absent baseline -> proceed.
+        assert_eq!(
+            check_commit_base(&ExpectedBase::Absent, None, "profile: chill\n", ".pragent.yaml")
+                .unwrap(),
+            BaseCheckOutcome::Proceed
+        );
+        // Omitted baseline -> proceed regardless of remote state.
+        assert_eq!(
+            check_commit_base(
+                &ExpectedBase::Any,
+                Some("profile: other\n"),
+                "profile: chill\n",
+                ".pragent.yaml",
+            )
+            .unwrap(),
+            BaseCheckOutcome::Proceed
+        );
+
+        // Remote edited after preview -> conflict error.
+        let err = check_commit_base(
+            &ExpectedBase::Content("profile: old\n".into()),
+            Some("profile: other\npre_merge_checks: []\n"),
+            "profile: chill\n",
+            ".pragent.yaml",
+        )
+        .unwrap_err();
+        assert!(err.contains("changed remotely"), "unexpected err: {}", err);
+
+        // Remote created after preview (expected absent) -> conflict error.
+        let err = check_commit_base(
+            &ExpectedBase::Absent,
+            Some("profile: other\n"),
+            "profile: chill\n",
+            ".pragent.yaml",
+        )
+        .unwrap_err();
+        assert!(err.contains("created remotely"), "unexpected err: {}", err);
+
+        // Remote deleted after preview (expected content) -> conflict error.
+        let err = check_commit_base(
+            &ExpectedBase::Content("profile: old\n".into()),
+            None,
+            "profile: chill\n",
+            ".pragent.yaml",
+        )
+        .unwrap_err();
+        assert!(err.contains("deleted remotely"), "unexpected err: {}", err);
+
+        // Verify IPC body parsing distinguishes omitted vs explicit null vs string.
+        let omitted = tauri::ipc::InvokeBody::Json(serde_json::json!({ "path": ".pragent.yaml" }));
+        assert_eq!(
+            parse_expected_base_from_body(&omitted, None).unwrap(),
+            ExpectedBase::Any
+        );
+        let explicit_null = tauri::ipc::InvokeBody::Json(serde_json::json!({
+            "path": ".pragent.yaml",
+            "expectedBaseContent": null
+        }));
+        assert_eq!(
+            parse_expected_base_from_body(&explicit_null, None).unwrap(),
+            ExpectedBase::Absent
+        );
+        let explicit_str = tauri::ipc::InvokeBody::Json(serde_json::json!({
+            "path": ".pragent.yaml",
+            "expectedBaseContent": "profile: old\n"
+        }));
+        assert_eq!(
+            parse_expected_base_from_body(&explicit_str, Some("profile: old\n".into())).unwrap(),
+            ExpectedBase::Content("profile: old\n".into())
+        );
     }
 }

@@ -1,31 +1,40 @@
 # PR Agent Control
 
-Tauri desktop app (Windows) that wires up a **free-tier GitHub PR review agent** for your
-repositories, plus the PR-Agent harness itself. Two review engines supported:
+Tauri desktop app (Windows) and Cloud PR Agent control plane for your GitHub
+repositories. Run a full **Cloud PR Agent** (GitHub App + FastAPI backend + Redis +
+optional Cloudflare Worker) with CodeRabbit/Macroscope-style structured reviews, repo
+memory, merge-readiness gating, and `@pr-agent` PR chat — or use the zero-host
+**Actions Lite** mode:
 
-- **PR-Agent** ([The-PR-Agent/pr-agent](https://github.com/The-PR-Agent/pr-agent)) — best
-  review quality, runs as a GitHub Action. Commands: `/review`, `/describe`, `/improve`, `/ask`.
-- **OpenRabbit** ([aryanbrite/openrabbit](https://github.com/aryanbrite/openrabbit)) — simplest
-  zero-host setup, fully automatic reviews on every PR via GitHub Actions.
+- **Cloud PR Agent (Native Structured Review Engine)** — multi-pass walkthroughs, inline
+  line comments with committable ```` ```suggestion ```` blocks, incremental reviews,
+  per-repo `.pragent.yaml` config, persistent **Repo Memory**, deterministic **Merge
+  Readiness (0–100)** Check Runs + checklists, and **`@pr-agent` PR chat**.
+- **PR-Agent Actions Lite** ([The-PR-Agent/pr-agent](https://github.com/The-PR-Agent/pr-agent)) —
+  zero-host GitHub Action with `/review`, `/describe`, `/improve`, `/ask`, plus automatic
+  `.pr-agent/memory.md` injection from the base branch.
+- **OpenRabbit** ([aryanbrite/openrabbit](https://github.com/aryanbrite/openrabbit)) —
+  simplest zero-host GitHub Action reviewer.
 
-Both run on **OpenRouter free models** by default
-(`thinkingmachines/inkling-2-small:free`). No paid API needed. The app can also use
+Both paths run on **OpenRouter free models** by default
+(`thinkingmachines/inkling-2-small:free`). No paid API needed. The app also supports
 **Command Code** and **OpenCode Go** keys for local and backend reviews.
 
 ## Download (Windows)
 
 Grab the [latest release](https://github.com/KB01111/Helios-Pr-Agent/releases/latest).
-The NSIS `...setup.exe` is the recommended installer; an MSI is also published.
+The NSIS `...setup.exe` (per-user installer, no admin prompt required) is the recommended
+installer; an MSI is also published.
 The installers are unsigned, so Windows SmartScreen may ask for confirmation.
 
 ## What's in this repo
 
 | Path | What it is |
 |---|---|
-| `src/` | Tauri frontend: React + TypeScript + Tailwind v4 + [shadcn/ui](https://ui.shadcn.com), built with Vite (sidebar UI: Auto review, Review, Agents & repo sync, Runs, Autonomy, Quota, Providers, Integrations, Settings). `src/components/ui/` holds the shadcn components; add more with `npx shadcn@latest add <name>` |
-| `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Box provisioner bridge, GitHub device-flow OAuth (desktop token kept in memory/session by default; opt-in save to `backend/.env`), the 1-click repo setup commands (`github_list_repos`, `github_repo_status`, `github_setup_repo`, `github_disable_repo`), the auto-review workflow generator (`src-tauri/src/autoreview.rs`) and PR commands (`github_list_pulls`, `github_pr_command`) |
-| `backend/` | FastAPI webhook/event brain, agent/run API, quota, and Redis-backed shared state (`REDIS_URL` on FastAPI Cloud, or Upstash REST) |
-| `cloudflare-worker/` | Free-tier edge receiver + cron for the cloud fallback (signature check, retrying forward, deferred-event sweep) |
+| `src/` | Tauri frontend: React + TypeScript + Tailwind v4 + [shadcn/ui](https://ui.shadcn.com), built with Vite (sidebar UI: Cloud setup, PR inbox, Memory, Auto review, Review, Agents & sync, Runs, Autonomy, Quota, Providers, Integrations, Settings). `src/components/ui/` holds the shadcn components; add more with `npx shadcn@latest add <name>` |
+| `src-tauri/` | Rust backend: config/workflow read-write, local review runner, Windows DPAPI encrypted local secret vault (`src-tauri/src/vault.rs`), repo config/memory commit commands (`github_read_repo_file`, `github_commit_repo_file`), 1-click repo setup & GitHub App manifest flow, auto-review workflow generator with `.pr-agent/memory.md` bridge (`src-tauri/src/autoreview.rs`), local decision daemon (`daemon.rs`), and PR commands |
+| `backend/` | FastAPI cloud control plane: native structured review engine (`backend/review/`), repo-specific memory (`backend/memory/`), deterministic merge-readiness scorer & PR inbox (`backend/merge/`), `@pr-agent` PR chat (`backend/chat.py`), GitHub App & event router, calibrated decider, sandbox runners, and Redis-backed shared state |
+| `cloudflare-worker/` | Free-tier edge receiver + cron for the cloud fallback (timing-safe dual-secret HMAC-SHA256 verification for `GITHUB_WEBHOOK_SECRET` + `GITHUB_APP_WEBHOOK_SECRET`, forwarding all 11 GitHub App events, KV retry queue, deferred-event sweep) |
 | `upstash-box/` | Node provisioner + Python cron script that auto-reviews open PRs on a schedule (runs on Upstash Box free tier) |
 | `.pr_agent.toml` | PR-Agent config for this repo (free OpenRouter model + `openrouter/free` fallback) |
 | `.github/workflows/pr-agent.yml` | PR-Agent GitHub Action for this repo |
@@ -72,10 +81,48 @@ private repos, the GitHub token needs `repo` scope.
 
 <!-- /coderabbit-ai-generated:v1 -->
 
+## Cloud PR Agent capabilities
+
+- **Cloud Setup Wizard (`Cloud setup` tab)** — 5-step guided setup from zero to live PR
+  review: (1) connect backend HTTPS URL + `BACKEND_API_TOKEN` (with opt-in Windows DPAPI
+  persistence), (2) connect AI provider/model (OpenRouter OAuth, Command Code/OpenCode Go
+  CLI import, or key), (3) 1-click Personal GitHub App creation via manifest flow + live
+  health/webhook check, (4) configure profile (`chill`/`assertive`), merge gate, repo
+  memory, `.pragent.yaml`, and doc bootstrap, (5) trigger and inspect a live Cloud PR
+  review.
+- **Native Structured Review Engine (`backend/review/`)** — Pass A walkthrough + file
+  table (+ optional Mermaid sequence diagram), Pass B strict-JSON inline findings with
+  committable ```` ```suggestion ```` blocks, and deterministic Pass C verification
+  (diff-line validation, profile confidence thresholds & nit caps, dismissed-pattern
+  suppression, and finding fingerprinting for incremental `compare` reviews without
+  duplicate comments). Reads `.pragent.yaml`/`.pragent.yml` from the PR's **base branch
+  only** (cached by blob SHA).
+- **PR Inbox & Merge Readiness (0–100) (`backend/merge/` + `PR inbox` tab)** —
+  deterministic score from conflicts, CI checks, open findings by severity, unresolved
+  human threads, approvals, safety flags, test coverage, branch freshness, and blocking
+  memory rules (hard blockers cap score at 49; bands: Ready ≥ 85, Ready with nits 70–84,
+  Needs work 50–69, Blocked < 50). Publishes a GitHub Check Run
+  (`PR Agent · Merge readiness`, with PAT commit-status fallback) plus a live-updating
+  sticky "Before you merge" checklist. Dismissing a finding in the inbox teaches the
+  agent's repo memory directly.
+- **Repo Memory & Actions-Lite Bridge (`backend/memory/` + `Memory` tab)** — stores
+  per-repo `learning`, `dismissed_pattern`, `repo_fact`, and `incident` entries scoped by
+  file globs, with approval queue, hit tracking, JSON import/export, repo doc bootstrap
+  (`CONTRIBUTING.md`, `AGENTS.md`, `CLAUDE.md`, `.editorconfig`, manifests), and 1-click
+  sync to `.pr-agent/memory.md` so Actions-lite workflows inherit the same rules.
+- **`@pr-agent` PR Chat (`backend/chat.py`)** — mention `@pr-agent` (or your GitHub App
+  slug) in PR or inline review comments (`OWNER`/`MEMBER`/`COLLABORATOR` only; bot and
+  self-reply loops guarded): `remember <rule>`, `dismiss <reason>`, `resolve`, `review`,
+  `readiness`, `ask <question>`, and `help`.
+- **Windows DPAPI Local Secret Vault (`src-tauri/src/vault.rs`)** — opt-in *"Remember
+  securely on this PC"* persists desktop session tokens (`backend_api_token`,
+  `github_token`, LLM API keys) encrypted via Windows DPAPI (current-user scope +
+  app-specific entropy) at `%APPDATA%\com.pragent.control\vault.bin`.
+
 ## Auto review: deploy PR Agent to your repos
 
-The **Auto review** page (the app's start page) is the quickest way to get every pull
-request reviewed. Reviews run in GitHub Actions, so nothing needs hosting. By default
+The **Auto review** page is the quickest zero-host way to get every pull request reviewed
+in GitHub Actions (no backend required). By default
 GitHub withholds repository secrets from pull requests that come from forks (private repos
 can opt in to sending them). Whenever `OPENROUTER_API_KEY` is unavailable to a run, the
 workflow logs a warning and skips PR Agent, so such fork PRs are not reviewed.
@@ -121,6 +168,9 @@ fixed template it also:
 - skips draft PRs until they are ready for review (optional);
 - only answers `/commands` on pull requests (not plain issues) from owners, members and
   collaborators, and skips cleanly with a warning when the secret is missing (e.g. fork PRs);
+- loads `.pr-agent/memory.md` from the trusted base/default branch via GitHub Contents API
+  (capped to 6,000 chars, written to `$GITHUB_ENV` with a randomized delimiter) and
+  appends it to `PR_REVIEWER__EXTRA_INSTRUCTIONS` so Actions-lite repos share repo memory;
 - rejects review instructions containing `${{` so they cannot inject Actions expressions.
 
 The webhook/backend modes and the OpenRabbit reviewer remain under Integrations → GitHub
@@ -128,26 +178,37 @@ The webhook/backend modes and the OpenRabbit reviewer remain under Integrations 
 
 ## Use it
 
-1. **Review** — writes the model into `.pr_agent.toml` (env pins win in CI) and can run a
+1. **Cloud setup** — 5-step wizard to connect backend, LLM provider, GitHub App, repos,
+   `.pragent.yaml`, and verify on a live PR.
+2. **PR inbox** — live open PRs ranked by Merge Readiness (0–100), "Before you merge"
+   checklist, inline findings with committable suggestion previews, and 1-click Dismiss
+   (teach agent) / Resolve / Re-review actions.
+3. **Memory** — inspect, search, add, approve, bootstrap from repo docs, import/export
+   JSON, and sync `.pr-agent/memory.md` per repository.
+4. **Auto review** — zero-host GitHub Actions deployment for PR-Agent (with `.pr-agent/memory.md`
+   memory bridge).
+5. **Review** — writes the model into `.pr_agent.toml` (env pins win in CI) and can run a
    manual review from your PC.
-2. **Agents & repo sync** — create agent configs (repo targets, trigger, runtime mode) and
-   sync repositories from GitHub.
-3. **Runs** — inspect background runs, view diffs, and approve pending runs.
-4. **Quota** — Upstash Box / Vercel Sandbox vCPU-second usage.
-5. **Providers** — write `.github/workflows/pr-agent.yml` or `openrabbit.yml` into any local
-   repo, ready to commit.
-6. **Integrations** — paste provider tokens (GitHub, Vercel, Box, Redis, OpenRouter,
-   Command Code, OpenCode Go); **Connect** writes them to `backend/.env` via
-   the Rust backend, then **Test** hits the live provider APIs. The GitHub card also
-   configures webhooks, secrets, and workflows for selected repos in one click (see below).
-7. **Settings** — backend URL/API token, GitHub OAuth (device flow or PAT), and desktop keys.
+6. **Agents & sync** — create/edit Agent v2 configs (`profile`, `memory_enabled`,
+   `merge_gate`, `score_threshold`, `chat_enabled`, `path_instructions`), preview/commit
+   `.pragent.yaml`, and sync repositories from GitHub.
+7. **Runs** — inspect background runs, view diffs, and approve pending runs.
+8. **Autonomy** — manage the local desktop decision daemon and escalations.
+9. **Quota** — Upstash Box / Vercel Sandbox vCPU-second usage.
+10. **Providers** — write `.github/workflows/pr-agent.yml` or `openrabbit.yml` into any local
+    repo, ready to commit.
+11. **Integrations** — connect provider tokens, GitHub App, Redis, and 1-click repo setup.
+12. **Settings** — backend URL/API token, opt-in Windows DPAPI local vault persistence &
+    wipe, GitHub OAuth (device flow or PAT), and desktop keys.
 
 ## Secrets & security
 
-- Tokens saved from **Integrations** are written to `backend/.env` (git-ignored) by Rust and
-  are never stored in `localStorage`.
-- GitHub OAuth/PAT tokens used by the desktop app stay in memory/sessionStorage only; the
-  1-click GitHub setup can opt in to also saving the token to `backend/.env` (see below).
+- Desktop session secrets (`BACKEND_API_TOKEN`, GitHub token, LLM keys) stay in memory by
+  default and are never stored in `localStorage`. Opting in to **Remember securely on this
+  PC** encrypts them in `%APPDATA%\com.pragent.control\vault.bin` using Windows DPAPI
+  (current-user scope, app entropy); wiping the vault deletes the file.
+- Tokens saved from **Integrations** are encrypted via Fernet on the cloud backend and
+  written to local `backend/.env` (git-ignored) by Rust.
 - The backend loads `backend/.env` (then repo-root `.env`) at startup; real process env vars
   always win over file values. On FastAPI Cloud, `REDIS_URL` is injected by the Redis Cloud
   integration and is never written to the repo.
@@ -401,10 +462,10 @@ workflow runs independently of the backend and is not covered.)
 
 **Desktop daemon (Autonomy tab).** The Rust daemon heartbeats to the backend, pulls PR
 facts the cloud deferred to it, decides locally and submits the decision. Closing the
-window keeps it running in the tray ("Stop daemon and quit" ends it); it does **not**
-start at OS login. An optional classifier sidecar on `127.0.0.1` (`POST /classify` ->
+window keeps it running in the tray ("Quit PR Agent Control" stops the daemon and exits);
+it does **not** start at OS login. An optional classifier sidecar on `127.0.0.1` (`POST /classify` ->
 `{"probs": {"static":…, "ui":…, "runtime":…}}`) is blended into the scoring branch only —
-it can never override a guardrail. The backend token is held in memory only.
+it can never override a guardrail.
 
 **Cloud fallback.** If the desktop's heartbeat lapses (asleep/offline/stopped), the cloud
 decides immediately; if it goes away mid-flight, `POST /decisions/sweep` decides deferred
@@ -414,21 +475,27 @@ asks otherwise), `auto` (acts at/above the floor). Escalations appear in the app
 
 ### Cloudflare worker (free tier)
 
-`cloudflare-worker/` is an always-on edge receiver: it verifies the GitHub signature, acks
-quickly, makes one delivery attempt to the backend and, if that fails, parks the event in
-KV (optional) for the cron to replay — without KV an outage answers 502 so GitHub shows a
-failed delivery you can redeliver. A per-minute cron calls `/decisions/sweep` to wake the
-backend and run the fallback.
+`cloudflare-worker/` is an always-on edge receiver: it performs timing-safe HMAC-SHA256
+verification against both `GITHUB_WEBHOOK_SECRET` and `GITHUB_APP_WEBHOOK_SECRET`,
+forwards all 11 GitHub App event types (`pull_request`, `pull_request_review`,
+`pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`,
+`check_suite`, `check_run`, `status`, `push`, `installation`,
+`installation_repositories`) with `x-github-event` and `x-github-delivery` preserved,
+acks quickly, and if the backend is unavailable parks the delivery in KV (optional) for
+cron replay — without KV an outage answers 502 so GitHub shows a failed delivery you can
+redeliver. A per-minute cron calls `/decisions/sweep` to wake the backend and run the
+fallback.
 
 ```bash
 cd cloudflare-worker
 # set BACKEND_URL in wrangler.toml, then:
-npx wrangler secret put GITHUB_WEBHOOK_SECRET
-npx wrangler secret put BACKEND_API_TOKEN   # only if the backend sets one
+npx wrangler secret put GITHUB_WEBHOOK_SECRET      # repo webhook secret (if using repo webhooks)
+npx wrangler secret put GITHUB_APP_WEBHOOK_SECRET  # GitHub App webhook secret (when using a GitHub App)
+npx wrangler secret put BACKEND_API_TOKEN          # only if the backend sets one
 npx wrangler deploy
 ```
 
-Point the repo webhook (pull requests, `application/json`, same secret) at
+Point the GitHub App or repo webhook (`application/json`, matching secret) at
 `https://<worker>.workers.dev/webhooks/github`. Tests: `node --test cloudflare-worker/worker.test.js`.
 
 ## Deploy the backend (FastAPI)
@@ -447,20 +514,22 @@ declared in `pyproject.toml` and `backend/requirements.txt`.
 
 Health: `GET /health` · status: `GET /config/status` (auth when a token is set) · docs: `/docs`.
 
-### GitHub events and PR activity
+### GitHub events, PR readiness, memory & chat
 
-`/webhooks/github` routes on `X-GitHub-Event`. `pull_request` opened/reopened/synchronize/labeled
-still drive reviews exactly as before. Every other PR action plus `pull_request_review`,
-`pull_request_review_comment`, `pull_request_review_thread`, `issue_comment` (on PRs),
-`check_suite`/`check_run` (completed), `status`, default-branch `push`, and App
-`installation*` events are recorded by `backend/events.py` into a capped per-PR activity log
-(redeliveries are deduped by `X-GitHub-Delivery`). That log is the input for the upcoming
-merge-readiness score: `GET /repos/{owner}/{name}/pulls/{n}/activity` returns it with a
-`readiness_stale` flag. Bot comments are ignored; CI results from bots are not. A push to the
-default branch that touches `.pragent.yaml` drops the cached repo config. Agents gained v2
-settings (`profile`, `memory_enabled`, `merge_gate`, `score_threshold`, `path_instructions`,
-`tools`, `chat_enabled`, `autofix`); older agents read back with defaults, and PUTs from older
-clients keep the stored v2 values.
+`/webhooks/github` routes on `X-GitHub-Event` (failing closed on unsigned deliveries
+whenever `BACKEND_API_TOKEN` is set unless `ALLOW_UNSIGNED_WEBHOOKS=1`). `pull_request`
+opened/reopened/synchronize/labeled drive the native structured review engine and merge
+readiness recomputation; `closed`+`merged` extracts candidate repo learnings and updates
+the PR inbox. `pull_request_review`, `pull_request_review_comment`,
+`pull_request_review_thread`, `issue_comment` (on PRs), `check_suite`/`check_run`
+(completed), `status`, default-branch `push`, and App `installation*` events are recorded
+by `backend/events.py` (deduped by `X-GitHub-Delivery`), drive live merge-readiness
+recomputations (`backend/merge/`), and route `@pr-agent` mentions to `backend/chat.py`.
+Bot comments are ignored (CI results from bots are kept). A push to the default branch
+that touches `.pragent.yaml`/`.pragent.yml` drops the cached repo config. Agents support
+v2 settings (`profile`, `memory_enabled`, `merge_gate`, `score_threshold`,
+`path_instructions`, `tools`, `chat_enabled`, `autofix`) with backwards-compatible
+defaults.
 
 ### Env vars
 
@@ -487,6 +556,7 @@ clients keep the stored v2 values.
 | `PORT` / `LOG_LEVEL` | server | `8000` / `INFO` |
 
 Production checklist: set `BACKEND_API_TOKEN` (long random), set `ALLOWED_ORIGINS`
-to your exact origins, set `GITHUB_WEBHOOK_SECRET`, connect the Redis Cloud integration
+to your exact origins, set `GITHUB_WEBHOOK_SECRET` (and `GITHUB_APP_WEBHOOK_SECRET`
+for deployments using a GitHub App), connect the Redis Cloud integration
 (or set `REDIS_URL` / Upstash REST vars), and never commit `.env` (files are git-ignored;
 CI uses Actions secrets instead).

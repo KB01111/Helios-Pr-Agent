@@ -25,9 +25,10 @@
 //   PENDING                 KV binding for parked deliveries            (optional)
 
 // Events the backend acts on. pull_request commit actions drive reviews; the rest feed
-// the per-PR activity log (reviews, threads, CI results) used for merge readiness, the
-// GitHub App installation cache and config invalidation. Anything else is acked here.
-const FORWARDED_EVENTS = new Set([
+// the per-PR activity log (reviews, threads, CI results) used for merge readiness, PR
+// chat/memory learning, the GitHub App installation cache and config invalidation.
+// Anything else is acked here.
+export const FORWARDED_EVENTS = new Set([
   "pull_request",
   "issue_comment",
   "pull_request_review",
@@ -40,6 +41,10 @@ const FORWARDED_EVENTS = new Set([
   "installation",
   "installation_repositories",
 ]);
+// App-level lifecycle events are only ever signed by the GitHub App secret.
+// Never accept a repository webhook secret for them so a repo-secret holder
+// cannot forge installation events for another repository.
+const APP_ONLY_EVENTS = new Set(["installation", "installation_repositories"]);
 // Conversational events from bots are dropped (no reply loops); CI results are not,
 // because check suites and statuses are usually reported by bots.
 const BOT_SKIPPED_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]);
@@ -67,11 +72,27 @@ function hexToBytes(hex) {
 
 /** Constant-time check of X-Hub-Signature-256 (WebCrypto verify is constant-time). */
 export async function verifySignature(secret, rawBody, header) {
-  if (!secret || typeof header !== "string" || !header.startsWith("sha256=")) return false;
+  const trimmed = typeof secret === "string" ? secret.trim() : "";
+  if (!trimmed || typeof header !== "string" || !header.startsWith("sha256=")) return false;
   const sig = hexToBytes(header.slice("sha256=".length));
-  if (!sig) return false;
-  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  if (!sig || sig.byteLength !== 32) return false;
+  const key = await crypto.subtle.importKey("raw", enc.encode(trimmed), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
   return crypto.subtle.verify("HMAC", key, sig, rawBody);
+}
+
+/**
+ * Verify X-Hub-Signature-256 against both GITHUB_WEBHOOK_SECRET and
+ * GITHUB_APP_WEBHOOK_SECRET without short-circuiting so timing does not leak
+ * which secret matched.
+ */
+export async function verifyAnySignature(env, rawBody, header) {
+  const repoSecret = typeof env.GITHUB_WEBHOOK_SECRET === "string" ? env.GITHUB_WEBHOOK_SECRET.trim() : "";
+  const appSecret = typeof env.GITHUB_APP_WEBHOOK_SECRET === "string" ? env.GITHUB_APP_WEBHOOK_SECRET.trim() : "";
+  const [repoOk, appOk] = await Promise.all([
+    repoSecret ? verifySignature(repoSecret, rawBody, header) : Promise.resolve(false),
+    appSecret ? verifySignature(appSecret, rawBody, header) : Promise.resolve(false),
+  ]);
+  return Boolean(repoOk | appOk);
 }
 
 function backendBase(env) {
@@ -190,7 +211,11 @@ export function skipReason(event, payload) {
 }
 
 export async function handleWebhook(request, env, _ctx) {
-  if ((!env.GITHUB_WEBHOOK_SECRET && !env.GITHUB_APP_WEBHOOK_SECRET) || !backendBase(env)) {
+  const hasSecret = Boolean(
+    (typeof env.GITHUB_WEBHOOK_SECRET === "string" && env.GITHUB_WEBHOOK_SECRET.trim()) ||
+    (typeof env.GITHUB_APP_WEBHOOK_SECRET === "string" && env.GITHUB_APP_WEBHOOK_SECRET.trim())
+  );
+  if (!hasSecret || !backendBase(env)) {
     return json({ error: "worker not configured" }, 500);
   }
   const declared = Number(request.headers.get("content-length") || 0);
@@ -198,22 +223,23 @@ export async function handleWebhook(request, env, _ctx) {
   const raw = await readBounded(request, MAX_BODY_BYTES);
   if (raw === null) return json({ error: "payload too large" }, 413);
 
+  const event = request.headers.get("x-github-event") || "";
   const signature = request.headers.get("x-hub-signature-256") || "";
-  // A GitHub App signs with its own secret; repo webhooks with GITHUB_WEBHOOK_SECRET.
-  const repoOk = await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, signature);
-  const appOk = env.GITHUB_APP_WEBHOOK_SECRET
+  // App-only lifecycle events must be signed with GITHUB_APP_WEBHOOK_SECRET.
+  // Other events may come from either the GitHub App or a repo webhook.
+  const sigValid = APP_ONLY_EVENTS.has(event)
     ? await verifySignature(env.GITHUB_APP_WEBHOOK_SECRET, raw, signature)
-    : false;
-  if (!repoOk && !appOk) {
+    : await verifyAnySignature(env, raw, signature);
+  if (!sigValid) {
     return json({ error: "bad signature" }, 401);
   }
-  const event = request.headers.get("x-github-event") || "";
   if (event === "ping") return json({ pong: true });
   if (!FORWARDED_EVENTS.has(event)) return json({ skipped: event || "no-event" }, 202);
 
+  const bodyText = new TextDecoder().decode(raw);
   let payload;
   try {
-    payload = JSON.parse(new TextDecoder().decode(raw));
+    payload = JSON.parse(bodyText);
   } catch {
     return json({ error: "invalid JSON" }, 400);
   }
@@ -221,7 +247,7 @@ export async function handleWebhook(request, env, _ctx) {
   if (skip) return json({ skipped: skip }, 202);
 
   const delivery = request.headers.get("x-github-delivery") || crypto.randomUUID();
-  const item = { body: new TextDecoder().decode(raw), event, delivery, signature };
+  const item = { body: bodyText, event, delivery, signature };
   // Delivered or safely parked => 202. Otherwise fail the webhook so GitHub shows a failed
   // delivery that can be redelivered, instead of a silent 202 for work that was lost.
   if ((await deliver(env, item)) === "lost") return json({ error: "backend unavailable", delivery }, 502);
@@ -267,7 +293,11 @@ export async function sweepBackend(env) {
   const headers = { "user-agent": "helios-edge-worker" };
   if (env.BACKEND_API_TOKEN) headers.authorization = `Bearer ${env.BACKEND_API_TOKEN}`;
   try {
-    const resp = await fetch(`${base}/decisions/sweep`, { method: "POST", headers });
+    const resp = await fetch(`${base}/decisions/sweep`, {
+      method: "POST",
+      headers,
+      signal: AbortSignal.timeout(Number(env.SWEEP_TIMEOUT_MS) || 15000),
+    });
     if (!resp.ok) console.error(`sweep failed: HTTP ${resp.status}`);
     return { swept: resp.ok };
   } catch (err) {

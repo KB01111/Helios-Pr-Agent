@@ -216,19 +216,25 @@ def refresh(force: bool = False) -> None:
     with _lock:
         if not force and now - _last_refresh < _REFRESH_TTL_S:
             return
-        _last_refresh = now
     # Read, decode and apply as one step: an older read must not be applied after a
     # newer one (e.g. a slow refresh finishing after update() has returned).
     with _refresh_lock:
+        if not force:
+            with _lock:
+                if time.monotonic() - _last_refresh < _REFRESH_TTL_S:
+                    return
         try:
             values, errors, broken = _decode(_load_doc())
         except Exception as exc:
             log.warning("runtime settings: could not load (%s); keeping the last applied values", type(exc).__name__)
+            with _lock:
+                _last_refresh = time.monotonic()
             return
         _apply(values)
         with _lock:
             _errors = errors
             _undecryptable = broken
+            _last_refresh = time.monotonic()
 
 
 def webhook_secret_locked() -> bool:
