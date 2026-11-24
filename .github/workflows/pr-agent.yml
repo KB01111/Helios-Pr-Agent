@@ -39,7 +39,7 @@ jobs:
           fi
       - name: PR Agent review
         if: steps.key-check.outputs.skip != 'true'
-        uses: the-pr-agent/pr-agent@dec3e88c029c0a32957bd95aa694cb34d2b256e0
+        uses: the-pr-agent/pr-agent@48edc526e369bc2dc8cd70992661d66a3977621e
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Get free key at https://openrouter.ai/settings/keys
